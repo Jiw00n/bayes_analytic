@@ -1,0 +1,68 @@
+{
+  "version": "0.3.0",
+  "configurations": [
+    {
+      "name": "TVM Debug",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/root/work/venv/bin/python",
+      "args": [
+        "-u",
+        // "/root/work/tvm-ansor/gallery/cuda_singletask.py"
+        "/root/work/tvm-ansor/gallery/tune_network_cuda.py",
+        ">>", 
+        "/root/work/tvm-ansor/gallery/logs/gdb/current.log", 
+        "2>&1"
+      ],
+      "stopAtEntry": false,
+      "cwd": "/root/work/tvm-ansor/gallery",
+      "environment": [
+        {
+          "name": "TVM_HOME",
+          "value": "/root/work/tvm-ansor"
+        },
+        {
+          "name": "PYTHONPATH",
+          "value": "/root/work/tvm-ansor/python"
+        },
+        {
+          "name" : "TVM_LIBRARY_PATH",
+          "value" : "/root/work/tvm-ansor/build"
+        },
+        {
+          "name" : "TVM_LOG_DEBUG",
+          "value" : "DEFAULT=0"
+        },
+        {
+          "name" : "PATH",
+          "value" : "/usr/local/cuda/bin:$PATH"
+        },
+        {
+          "name" : "LD_LIBRARY_PATH",
+          "value" : "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64"
+        },
+        {
+          "name" : "TVM_GDB_MODE",
+          "value" : "1"
+        },
+
+      ],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "디버그 심볼 읽기",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        { 
+          "description": "Enable logging",
+          "text": "set logging file /tmp/gdb.log" 
+        },
+        { 
+          "text": "set logging on" 
+        }
+      ]
+    }
+  ]
+}

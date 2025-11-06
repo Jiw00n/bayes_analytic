@@ -1,0 +1,9 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "compileCommands": "/root/work/tvm-ansor/build-release/compile_commands.json"
+        }
+    ],
+    "version": 4
+}

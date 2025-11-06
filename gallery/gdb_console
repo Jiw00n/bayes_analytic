@@ -1,0 +1,97 @@
+-
+
+-exec call DBG_PrintInferbound(policy, state, false)
+-exec call DBG_PrintState(*state, false, false)
+-exec call DBG_PrintState_Ext(*state, false, false)
+
+-exec call DBG_PrintStage(*state, stage_id, false, true)
+-exec call DBG_PrintStage_Ext(stage)
+
+-exec call DBG_PrintIter_Ext(it)
+-exec call DBG_PrintRef(objref)
+-exec call DBG_PrintObj(obj)
+
+
+
+// -exec call DBG_PrintInferbound(policy, state, false)
+void DBG_PrintInferbound(const SketchPolicyNode* policy, const State* state, bool delete_trivial_loop) {
+  State new_state = policy->search_task->compute_dag.InferBound(*state);
+  PrintState(&std::cout, new_state, delete_trivial_loop);
+}
+
+
+// -exec call DBG_PrintState(*state, false, false)
+void DBG_PrintState(const State& s, bool delete_trivial_loop, bool show_dag) {
+    PrintState(&std::cout, s, delete_trivial_loop, show_dag);
+    std::cout << std::endl;
+}
+
+
+// -exec call DBG_PrintState_Ext(*state, false, false)
+void DBG_PrintState_Ext(const State& s, bool delete_trivial_loop, bool show_dag) {
+  PrintState(&std::cout, s, delete_trivial_loop, show_dag);
+  LOG(INFO) << "trasform_steps : " << s->transform_steps;
+  LOG(INFO) << "attach_map : " << s->attach_map;
+  std::cout << std::endl;
+}
+
+
+
+// -exec call DBG_PrintStage(*state, stage_id, false, true)
+void DBG_PrintStage(const State& s, int stage_id, bool delete_trivial_loop, bool show_dag) {
+    PrintStage(&std::cout, stage_id, s, /*base_indent=*/0, delete_trivial_loop, show_dag);
+    std::cout << std::endl;
+}
+
+
+
+// -exec call DBG_PrintStage_Ext(stage)
+void DBG_PrintStage_Ext(Stage& stage) {
+  LOG(INFO) << "Stage : " << stage->op;
+  LOG(INFO) << "Stage name : " << stage->op->name;
+  
+  for (int i = 0 ; stage->iters.size() ; i++) {
+    const Iterator& it = stage->iters[i];
+    LOG(INFO) << "Iterator" << i << " : ";
+    DBG_PrintIter_Ext(it);
+  }
+  LOG(INFO) << "  compute_at : " << static_cast<int>(stage->compute_at);
+  LOG(INFO) << "  op_type : " << static_cast<int>(stage->op_type);
+  LOG(INFO) << "  auto_unroll_max_step : " << stage->attrs.auto_unroll_max_step;
+  
+}
+
+// -exec call DBG_PrintIter_Ext(it)
+void DBG_PrintIter_Ext(const Iterator& it) {
+  LOG(INFO) << "Iter name : " << it->name;
+
+  if (it->range.defined()) {
+    const PrimExpr& min = it->range->min;
+    const PrimExpr& ext = it->range->extent;
+    // 끝점은 [min, min+extent)
+    LOG(INFO) << "  range : " << min << " to " << (min + ext);
+  } else {
+    LOG(INFO) << "  range : <undefined>";
+  }
+
+  LOG(INFO) << "  iter_kind : " << static_cast<int>(it->iter_kind);
+  LOG(INFO) << "  annotation: " << static_cast<int>(it->annotation);
+
+  if (!it->orig_iters.empty()) {
+    for (const auto& orig_it : it->orig_iters) {
+      LOG(INFO) << "  orig_it.name : " << orig_it->name;
+    }
+  }
+}
+
+// -exec call DBG_PrintRef(objref)
+void DBG_PrintRef(ObjectRef &objref) {
+  LOG(INFO) << objref;
+}
+
+// -exec call DBG_PrintObj(obj)
+void DBG_PrintObj(Object *obj) {
+  auto objref = tvm::runtime::GetRef<ObjectRef>(obj);
+  LOG(INFO) << objref;
+  
+}
