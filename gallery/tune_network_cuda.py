@@ -49,7 +49,7 @@ import pickle
 
 
 import argparse
-parser = argparse.ArgumentParser(description="Ansor CUDA - Task Tuning")
+parser = argparse.ArgumentParser(description="Ansor CUDA")
 args = get_arg(parser)
 
 
@@ -58,7 +58,7 @@ batch_size = args.batch_size
 layout = args.layout
 dtype = "float32"
 
-# tiny_conv_1, tiny_res, resnet_18, resnet_50
+# resnet_18, resnet_50
 network = "resnet_18"
 batch_size = 1
 # layout = "NHWC"

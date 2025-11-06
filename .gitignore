@@ -287,4 +287,4 @@ gallery/logs_*/
 gallery/states/
 gallery/ansor_tasks_pkl/
 gallery/*.cu
-deprecated_backups/
+backups/single
