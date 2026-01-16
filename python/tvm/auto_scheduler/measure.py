@@ -69,6 +69,8 @@ logger = logging.getLogger("auto_scheduler")
 # We use 1e10 instead of sys.float_info.max for better readability in log
 MAX_FLOAT = 1e10
 
+USE_NCU = os.environ.get("USE_NCU", "0") == "1"
+
 
 class BuildFunc:
     """store build_func name and callable to class variable.
@@ -330,7 +332,7 @@ class LocalBuilder(ProgramBuilder):
         If is callable, use it as custom build function, expect lib_format field.
     """
 
-    def __init__(self, timeout=15, n_parallel=multiprocessing.cpu_count(), build_func="default"):
+    def __init__(self, timeout=15000, n_parallel=multiprocessing.cpu_count(), build_func="default"):
         if build_func == "default":
             BuildFunc.name = "default"
             BuildFunc.build_func = tar.tar

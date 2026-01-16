@@ -249,6 +249,7 @@ class XGBModel(PythonBasedModel):
         scores: List[float]
             The predicted scores for all states
         """
+        # breakpoint()
         features = get_per_store_features_from_states(states, task)
         if self.bst is not None and len(self.inputs) > self.num_warmup_sample:
             dtest, pack_ids = feature_to_pack_sum_xgbmatrix(features)

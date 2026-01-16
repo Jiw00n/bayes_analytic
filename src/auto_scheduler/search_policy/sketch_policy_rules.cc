@@ -1022,7 +1022,7 @@ PopulationGenerationRule::ResultKind InitThreadBind::Apply(SketchPolicyNode* pol
       const auto& vthread_it = state->fuse(stage_id, to_fuse);
       // vthread extent가 8보다 클 경우 invalid
       if (GetExtent(vthread_it) > policy->search_task->hardware_params->max_vthread_extent) { // max_vthread_extent : 8
-        // return ResultKind::kInvalid;
+        return ResultKind::kInvalid;
         // LOG(INFO) << "Vthread extent " << GetExtent(vthread_it)
         //           << " is larger than the maximum, invalid.";
       }
@@ -1046,7 +1046,7 @@ PopulationGenerationRule::ResultKind InitThreadBind::Apply(SketchPolicyNode* pol
       // thread extent가 warp size보다 작으면 invalid
       if (check_min_thread_extent &&
           GetExtent(threadidx_it) < policy->search_task->hardware_params->warp_size) {
-        // return ResultKind::kInvalid;
+        return ResultKind::kInvalid;
         // LOG(INFO) << "Thread extent " << GetExtent(threadidx_it)
         //           << " is smaller than warp size, invalid.";
         

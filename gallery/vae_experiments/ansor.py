@@ -1,6 +1,4 @@
 import os
-
-
 ppath = os.environ.get("PYTHONPATH")
 buildpath = os.environ.get("TVM_LIBRARY_PATH")
 gdb_mode = os.environ.get("TVM_GDB_MODE")
@@ -25,17 +23,17 @@ else:
     AssertionError("Set Environment release/debug")
 
 import numpy as np
-from util_manager import PathManager, get_network, get_arg
+from util_manager import PathManager, get_network, get_arg, seed_everything
 import tvm
 from tvm import relay, auto_scheduler
 from tvm.contrib import graph_executor
 import argparse
-from tvm.auto_scheduler.feature import get_per_store_features_from_file
-
 
 
 TARGET = tvm.target.Target("cuda")
 
+
+seed_everything(42)
 
 
 def get_tasks(mod, params, path_manager, verbose=True, get_pkl=True):
@@ -64,10 +62,10 @@ def get_tasks(mod, params, path_manager, verbose=True, get_pkl=True):
 def run_tuning(tasks, task_weights, paths):
     print("="*80)
     print("Begin tuning...")
-    measure_ctx = auto_scheduler.LocalRPCMeasureContext(repeat=1, min_repeat_ms=300, timeout=10000)
+    measure_ctx = auto_scheduler.LocalRPCMeasureContext(repeat=3, min_repeat_ms=300, timeout=10000)
     
 
-    tuner = auto_scheduler.TaskScheduler(tasks, task_weights, tsv_log_path=paths["tsv"])
+    tuner = auto_scheduler.TaskScheduler([tasks[0]], [task_weights[0]], tsv_log_path=paths["tsv"])
     tune_option = auto_scheduler.TuningOptions(
         num_measure_trials=2000,  # change this to 20000 to achieve the best performance
         runner=measure_ctx.runner,
@@ -89,11 +87,9 @@ def build_moudle_compile(paths, mod, params, input_shape, dtype):
             lib = relay.build(mod, target=TARGET, params=params)
             # breakpoint()
 
-    
-    raw_features, raw_normalized_throughputs, task_ids = get_per_store_features_from_file(paths['json'], 10000)
-    
+
     # 어떤 스케줄에 어떤 소스 코드가 매핑되는지 확인해야하는 함수 만들 것
-    cuda_source = lib.lib.imported_modules[0].get_source()
+    # cuda_source = lib.lib.imported_modules[0].get_source()
     # llvm_source = lib.lib.get_source()
     # with open("resnet_18-cuda.cu", "w") as f:
     #     f.write(cuda_source)
@@ -125,7 +121,7 @@ def main_(args):
     dtype = "float32"
 
     # resnet_18, resnet_50
-    network = "resnet_18"
+    network = "resnet_50"
     # batch_size = 1
     # layout = "NHWC"
     
@@ -137,16 +133,15 @@ def main_(args):
 
     # 경로 설정
     # path_manager = PathManager(network, input_shape, args, gdb_mode)
-    # path_manager = PathManager(network, input_shape, args, gdb_mode, json="/root/work/tvm-ansor/gallery/logs_json/resnet_18/resnet_18-B1.json")
-    path_manager = PathManager(network, input_shape, args, gdb_mode, json="/root/work/tvm-ansor/gallery/logs_json/tmp.json")
+    path_manager = PathManager(network, input_shape, args, gdb_mode, json="/root/work/tvm-ansor/gallery/logs_json/resnet_18/resnet_18-B1.json")
 
 
     # task 추출
-    tasks, task_weights = get_tasks(mod, params, path_manager, verbose=False, get_pkl=True)
+    tasks, task_weights = get_tasks(mod, params, path_manager, verbose=True, get_pkl=True)
 
     
     # 튜닝
-    # run_tuning(tasks, task_weights, path_manager.paths)
+    run_tuning(tasks, task_weights, path_manager.paths)
 
 
     # build_module 컴파일

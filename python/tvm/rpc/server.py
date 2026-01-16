@@ -49,6 +49,9 @@ from . import base
 from . import testing
 from .base import TrackerCode
 
+USE_NCU = os.environ.get("USE_NCU", "0") == "1"
+
+
 logger = logging.getLogger("RPCServer")
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(
@@ -498,7 +501,7 @@ class Server(object):
                 raise RuntimeError("Please compile with USE_RPC=1")
         except NameError:
             raise RuntimeError("Please compile with USE_RPC=1")
-        self.proc = PopenWorker()
+        self.proc = PopenWorker(run=USE_NCU)
         # send the function
         self.proc.send(
             _popen_start_rpc_server,

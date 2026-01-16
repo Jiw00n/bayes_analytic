@@ -240,7 +240,8 @@ def build(
             f"or dict of target to IRModule, "
             f"but got {type(inputs)}."
         )
-
+    
+    # import rpdb; rpdb.set_trace()
     if not isinstance(inputs, (dict, container.Map)):
         target = Target.current() if target is None else target
         target = target if target else "llvm"

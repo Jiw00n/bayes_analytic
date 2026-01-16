@@ -33,7 +33,7 @@ from . import _ffi_api
 class BenchmarkResult:
     """Runtimes from benchmarking"""
 
-    def __init__(self, results: Sequence[float]):
+    def __init__(self, results: Sequence[float], repeats=1):
         """Construct a new BenchmarkResult from a sequence of runtimes.
 
         Parameters
@@ -66,17 +66,18 @@ class BenchmarkResult:
             py:meth:`Module.time_evaluator` or `benchmark` was run with `number` > 1.
         """
         self.results = results
-        self.mean = np.mean(self.results)
-        self.std = np.std(self.results)
-        self.median = np.median(self.results)
-        self.min = np.min(self.results)
-        self.max = np.max(self.results)
+        if repeats != 0:
+            self.mean = np.mean(self.results)
+            self.std = np.std(self.results)
+            self.median = np.median(self.results)
+            self.min = np.min(self.results)
+            self.max = np.max(self.results)
+            self.return_str = f"BenchmarkResult(min={self.min}, mean={self.mean}, median={self.median}, max={self.max}, std={self.std}, results={self.results})"
+        else:
+            self.return_str = f"BenchmarkResult(results={self.results})"
 
     def __repr__(self):
-        return (
-            f"BenchmarkResult(min={self.min}, mean={self.mean}, median={self.median}, "
-            f"max={self.max}, std={self.std}, results={self.results})"
-        )
+        return self.return_str
 
     def __str__(self):
         return (
@@ -303,6 +304,8 @@ class Module(object):
         --------
         runtime.Module.export_library : export the module to shared library.
         """
+        # print("Saving module to file:", file_name)
+        # import rpdb; rpdb.set_trace()
         _ffi_api.ModuleSaveToFile(self, file_name, fmt)
 
     def time_evaluator(

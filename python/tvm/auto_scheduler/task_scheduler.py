@@ -360,9 +360,36 @@ class TaskScheduler:
                 f.write(state_str + "\n\n\n")
 
 
-        breakpoint()
-        # file_name = "states/res_50/init_pop_12_dag_0.txt"
-        init_pop = self.search_policies[0].SampleInitPop_Rule_tgt(123)[:1]
+
+
+        ############ 다른 shape, 같은 task면 state가 똑같이 생겼는지 비교 ############
+        # for idx, policy in enumerate(self.search_policies):
+        #     print(idx, len(policy.generate_sketches()))
+
+        # nn_conv2d_add_nn_relu = []
+        # for idx, task in enumerate(self.tasks):
+        #     if "vm_mod_fused_nn_conv2d_add_nn_relu_" in task.desc:
+        #         nn_conv2d_add_nn_relu.append((idx, task))
+        
+        # nn_conv2d_add_nn_relu_init = []
+        # dags = []
+        # for idx, task in nn_conv2d_add_nn_relu:
+        #     # breakpoint()
+        #     init_state = self.search_policies[idx].SampleInitPop_Rule_tgt(123)[0]
+        #     nn_conv2d_add_nn_relu_init.append(init_state)
+        #     dags.append(task.compute_dag)
+        #     # print(task.compute_dag)
+
+        # breakpoint()
+
+
+
+
+
+        ############ evolutionary search 결과 state를 파일로 저장 ############
+        # file_name = "states/res_18/init_pop_123.txt"
+        # os.makedirs(f"{os.path.dirname(file_name)}", exist_ok=True)
+        # init_pop = self.search_policies[0].SampleInitPop_Rule_tgt(123)[:1]
         # with open(file_name, "w") as f:
         #     f.write(f"{self.search_policies[0].search_task.desc}\n")
         #     f.write(f"{self.search_policies[0].search_task.workload_key}\n")
@@ -373,14 +400,19 @@ class TaskScheduler:
         #         log_state(evo, file_name)
 
         # breakpoint()
+
+
+
+        ############ rule마다 적용시켜서 state를 파일로 저장 ############
         # target_rule = [1, 12, 13, 123]
         # target_rule = [1, 12, 13, 123]
         # delete_trivial_loops = [True, False]
         
-        
+        # state_dir_name = "states/res_18"
+        # os.makedirs(f"{os.path.dirname(state_dir_name)}", exist_ok=True)
         # for delete_triv in delete_trivial_loops:
         #     for rule in target_rule:
-        #         file_name = f"states/res_50/init_pop_{str(rule)}.txt"
+        #         file_name = f"{state_dir_name}/init_pop_{str(rule)}.txt"
         #         if delete_triv:
         #             file_name = file_name.replace(".txt", "del.txt")
         #         # if os.path.exists(file_name):
@@ -406,11 +438,19 @@ class TaskScheduler:
 
         # breakpoint()
 
+
+
+
+
+
+
+
         # do a round robin first to warm up
         for idx in range(len(self.tasks)):
             # skip warming up this task if it has been tuned before (restored from the log file)
             if not self.task_cts[idx]:
                 self._tune_task(idx)
+                breakpoint()
         self.best_ct = self.ct
         self.best_score = self.cur_score
 

@@ -105,7 +105,7 @@ class PopenWorker:
         The standard error streams handler specified for the popen process.
     """
 
-    def __init__(self, initializer=None, initargs=(), maximum_uses=None, stdout=None, stderr=None):
+    def __init__(self, initializer=None, initargs=(), maximum_uses=None, stdout=None, stderr=None, run=False):
         self._proc = None
         self._initializer = initializer
         self._initargs = initargs
@@ -113,6 +113,7 @@ class PopenWorker:
         self._remaining_uses = None
         self._stdout = stdout
         self._stderr = stderr
+        self._run = run
 
         if self._initializer is not None and not callable(self._initializer):
             raise TypeError("initializer must be callable for PopenWorker")
@@ -163,8 +164,11 @@ class PopenWorker:
         # connect subprocess with a pair of pipes
         main_read, worker_write = os.pipe()
         worker_read, main_write = os.pipe()
-
-        cmd = [sys.executable, "-m", "tvm.exec.popen_worker"]
+        # import rpdb; rpdb.set_trace()
+        if self._run:
+            cmd = ["ncu", "--target-processes", "all", sys.executable, "-m", "tvm.exec.popen_worker"]
+        else:
+            cmd = [sys.executable, "-m", "tvm.exec.popen_worker"]
         if sys.platform == "win32":
             # pylint: disable=import-outside-toplevel
             import msvcrt
@@ -240,7 +244,6 @@ class PopenWorker:
         if self._proc is not None and self._maximum_uses and self._remaining_uses == 0:
             # Time to recycle the process.
             self.kill()
-
         if self._proc is None:
             self._start()
             # init

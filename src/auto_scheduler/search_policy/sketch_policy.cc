@@ -570,13 +570,14 @@ Array<State> SketchPolicyNode::SampleInitPopulation(const Array<State>& sketches
         const auto state_str = cand_states[i].ToStr();
 
         // GDB
-        // if (pop_scores[i] > -1e10 && explored_state_strs.count(state_str) == 0) {
-        if (explored_state_strs.count(state_str) == 0) {
-          explored_state_strs.insert(state_str);
-          out_states.push_back(std::move(cand_states[i]));
-          unchange_cnt = 0;  // Reset the counter once we found a valid state
-        } else {
-          fail_ct++;
+        if (pop_scores[i] > -1e10 && explored_state_strs.count(state_str) == 0) {
+          if (explored_state_strs.count(state_str) == 0) {
+            explored_state_strs.insert(state_str);
+            out_states.push_back(std::move(cand_states[i]));
+            unchange_cnt = 0;  // Reset the counter once we found a valid state
+          } else {
+            fail_ct++;
+          }
         }
       }
     }

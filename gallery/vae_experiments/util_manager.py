@@ -9,6 +9,22 @@ import json
 from tvm import auto_scheduler
 import re
 import random
+import numpy as np
+import torch
+import time
+
+SEED=42
+def seed_everything(seed=42):
+    # 시드 고정
+    global SEED
+    SEED = seed
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+
 
 def get_network(name, batch_size, layout="NHWC", dtype="float32", num_classes=1000):
     """Get the symbol definition and random weight of a network"""
@@ -84,6 +100,9 @@ def get_network(name, batch_size, layout="NHWC", dtype="float32", num_classes=10
         mod = tvm.IRModule.from_expr(net)
 
     return mod, params, input_shape, output_shape
+
+
+
 
 
 def get_arg(parser):
