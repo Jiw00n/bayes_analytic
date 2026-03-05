@@ -47,6 +47,12 @@ namespace tir {
 using runtime::StorageRank;
 using runtime::StorageScope;
 
+using StorageRewriteScopeGroups = Map<String, Array<Array<String>>>;
+using StorageRewriteReport = Map<String, StorageRewriteScopeGroups>;
+
+// Thread-local report populated by StorageRewrite pass.
+static thread_local StorageRewriteReport g_storage_rewrite_report;
+
 // Find a linear pattern of storage access
 // Used for liveness analysis.
 // Composite scopes(loop/thread_launch/IfThen) is represented by two points:
@@ -380,7 +386,7 @@ class StoragePlanRewriter : public StmtExprMutator {
   using StmtEntry = LinearAccessPatternFinder::StmtEntry;
   using AllocEntry = LinearAccessPatternFinder::AllocEntry;
 
-  Stmt Rewrite(Stmt stmt, bool detect_inplace) {
+  Stmt Rewrite(Stmt stmt, bool detect_inplace, const String& func_name = String("")) {
     detect_inplace_ = detect_inplace;
     // plan the rewrite
     LinearAccessPatternFinder finder;
@@ -389,6 +395,7 @@ class StoragePlanRewriter : public StmtExprMutator {
     this->PlanMemory(finder.linear_seq_, finder.alloc_info_);
     all_buffers_accessed_ = finder.all_buffers_accessed_;
     this->PrepareNewAlloc();
+    // this->CollectMergeReport(func_name);
     // start rewrite
     stmt = operator()(std::move(stmt));
     if (attach_map_.count(nullptr)) {
@@ -1031,6 +1038,58 @@ class StoragePlanRewriter : public StmtExprMutator {
   std::unordered_set<const BufferNode*> all_buffers_accessed_;
   // analyzer
   arith::Analyzer analyzer_;
+
+  void CollectAllocNames(StorageEntry* e, Array<String>* names,
+                         std::unordered_set<std::string>* seen) {
+    for (const AllocateNode* op : e->allocs) {
+      std::string name = op->buffer_var->name_hint;
+      if (seen->insert(name).second) {
+        names->push_back(String(name));
+      }
+    }
+    for (StorageEntry* child : e->merged_children) {
+      CollectAllocNames(child, names, seen);
+    }
+  }
+
+  void CollectMergeReport(const String& func_name) {
+    if (func_name.empty()) {
+      return;
+    }
+
+    Array<Array<String>> shared_groups;
+    Array<Array<String>> local_groups;
+
+    for (auto& kv : attach_map_) {
+      std::vector<StorageEntry*>& vec = kv.second;
+      for (StorageEntry* e : vec) {
+        // Skip entries merged into another entry.
+        if (e->bits_offset != 0) {
+          continue;
+        }
+        if (e->scope.rank != StorageRank::kShared && e->scope.rank != StorageRank::kLocal) {
+          continue;
+        }
+
+        Array<String> names;
+        std::unordered_set<std::string> seen;
+        CollectAllocNames(e, &names, &seen);
+        if (names.empty()) {
+          continue;
+        }
+        if (e->scope.rank == StorageRank::kShared) {
+          shared_groups.push_back(names);
+        } else {
+          local_groups.push_back(names);
+        }
+      }
+    }
+
+    StorageRewriteScopeGroups per_scope;
+    per_scope.Set("shared", shared_groups);
+    per_scope.Set("local", local_groups);
+    g_storage_rewrite_report.Set(func_name, per_scope);
+  }
 };
 
 /* Helper struct containing information on how a buffer is declared and used
@@ -1702,8 +1761,9 @@ namespace transform {
 
 Pass StorageRewrite() {
   auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
+    String func_name = f->GetAttr<String>("global_symbol").value_or(String("main"));
     auto* n = f.CopyOnWrite();
-    n->body = StoragePlanRewriter().Rewrite(std::move(n->body), true);
+    n->body = StoragePlanRewriter().Rewrite(std::move(n->body), true, func_name);
     // Parameters may not be rewritten, but internal allocations may.
     // Vectorization of AllocateConst is currently disabled, as it has
     // indexing issues for types that include padding (e.g. int8x3
@@ -1717,6 +1777,12 @@ Pass StorageRewrite() {
 }
 
 TVM_REGISTER_GLOBAL("tir.transform.StorageRewrite").set_body_typed(StorageRewrite);
+
+TVM_REGISTER_GLOBAL("tir.analysis.clear_storage_rewrite_report")
+    .set_body_typed([]() { g_storage_rewrite_report.clear(); });
+
+TVM_REGISTER_GLOBAL("tir.analysis.get_storage_rewrite_report")
+    .set_body_typed([]() { return g_storage_rewrite_report; });
 
 Pass PointerValueTypeRewrite() {
   auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {

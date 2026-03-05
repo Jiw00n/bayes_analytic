@@ -562,6 +562,8 @@ Array<State> SketchPolicyNode::SampleInitPopulation(const Array<State>& sketches
       // memory on GPU.
       std::vector<float> pop_scores;
       pop_scores.reserve(cand_states.size());
+
+      
       cand_states = search_task->compute_dag.InferBound(cand_states);
       PruneInvalidState(search_task, &cand_states);
       program_cost_model->Predict(search_task, cand_states, &pop_scores);
@@ -570,6 +572,7 @@ Array<State> SketchPolicyNode::SampleInitPopulation(const Array<State>& sketches
         const auto state_str = cand_states[i].ToStr();
 
         // GDB
+        // -inf 빼면 한 15~20% 남음
         if (pop_scores[i] > -1e10 && explored_state_strs.count(state_str) == 0) {
           if (explored_state_strs.count(state_str) == 0) {
             explored_state_strs.insert(state_str);
@@ -578,6 +581,8 @@ Array<State> SketchPolicyNode::SampleInitPopulation(const Array<State>& sketches
           } else {
             fail_ct++;
           }
+        } else {
+          fail_ct++;
         }
       }
     }
@@ -1045,6 +1050,22 @@ TVM_REGISTER_GLOBAL("auto_scheduler.PrintTitle").set_body_typed([](std::string t
 TVM_REGISTER_GLOBAL("auto_scheduler.PreloadCustomSketchRule")
     .set_body_typed([](PackedFunc meet_condition_func, PackedFunc apply_func, String rule_name) {
       return PreloadCustomSketchRule(meet_condition_func, apply_func, rule_name);
+    });
+
+TVM_REGISTER_GLOBAL("auto_scheduler.ReplayStepsPartial")
+    .set_body_typed([](const ComputeDAG& dag, const State& s, int num_steps) {
+      // init_state에서 시작하여 num_steps개의 step만 적용
+      State new_state = dag->init_state;
+      auto* pstate = new_state.CopyOnWrite();
+      
+      int n = std::min(num_steps, (int)s->transform_steps.size());
+      for (int i = 0; i < n; i++) {
+        pstate->transform_steps.push_back(s->transform_steps[i]);
+        StepApplyToState(s->transform_steps[i], &new_state, dag);
+      }
+      
+      // InferBound로 완전한 bound 정보 채움
+      return dag.InferBound(new_state);
     });
 
 }  // namespace auto_scheduler

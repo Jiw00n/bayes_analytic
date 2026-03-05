@@ -117,6 +117,33 @@ def verify_gpu_code(func: PrimFunc, constraints: Dict[str, int]) -> None:
     return _ffi_api.verify_gpu_code(func, constraints)  # type: ignore
 
 
+def clear_storage_rewrite_report() -> None:
+    """Clear the thread-local StorageRewrite merge report."""
+    f = tvm.get_global_func("tir.analysis.clear_storage_rewrite_report", allow_missing=True)
+    if f is not None:
+        f()
+
+
+def get_storage_rewrite_report() -> Dict[str, Dict[str, List[List[str]]]]:
+    """Get the thread-local StorageRewrite merge report.
+
+    Returns
+    -------
+    result : Dict[str, Dict[str, List[List[str]]]]
+        Mapping:
+        {
+            prim_func_name: {
+                "shared": [[alloc_var_name, ...], ...],
+                "local": [[alloc_var_name, ...], ...],
+            }
+        }
+    """
+    f = tvm.get_global_func("tir.analysis.get_storage_rewrite_report", allow_missing=True)
+    if f is None:
+        return {}
+    return f()
+
+
 def get_block_access_region(
     block: Block, buffer_var_map: Dict[Var, Buffer]
 ) -> List[List[BufferRegion]]:

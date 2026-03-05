@@ -203,7 +203,7 @@ class MeasureResult(Object):
         )
 
 
-def recover_measure_input(inp, rebuild_state=False):
+def recover_measure_input(inp, rebuild_state=False, desc=""):
     """
     Recover a deserialized MeasureInput by rebuilding the missing fields.
     1. Rebuid the compute_dag in inp.task
@@ -232,7 +232,9 @@ def recover_measure_input(inp, rebuild_state=False):
         hardware_params=task.hardware_params,
         layout_rewrite_option=task.layout_rewrite_option,
         task_inputs=list(task.task_input_names),
+        desc=desc,
     )
+    # breakpoint()
 
     if rebuild_state:
         new_state = new_task.compute_dag.infer_bound_from_state(inp.state)

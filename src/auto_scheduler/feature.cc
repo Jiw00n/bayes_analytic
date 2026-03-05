@@ -1374,6 +1374,7 @@ void GetPerStoreFeatureName(int max_n_bufs, std::vector<std::string>* ret) {
   // section total : 3
 }
 
+// tir로 lowering, feature 추출
 void GetPerStoreFeaturesWorkerFunc(const SearchTask& task, const State& state, int max_n_bufs,
                                    std::vector<float>* feature, std::atomic<int>* error_ct) {
   auto [sch, tensors] = task->compute_dag.ApplySteps(state->transform_steps);
@@ -1432,6 +1433,8 @@ void GetPerStoreFeaturesWorkerFunc(const SearchTask& task, const State& state, i
     GetPerStoreFeature(prim_func, task->hardware_params->cache_line_bytes, max_n_bufs, feature);
   } catch (Error& e) {
     (*error_ct)++;
+    // LOG(WARNING) << "Failed to extract features for a state. This may be caused by invalid states. "
+    //              << "Error message: " << e.what();
   }
 }
 
@@ -1448,6 +1451,7 @@ void GetPerStoreFeaturesFromStates(const Array<State>& states, const SearchTask&
                           GetPerStoreFeaturesWorkerFunc(task, states[i], max_n_bufs,
                                                         &(*features)[i], &error_ct);
                         });
+  
 }
 
 void GetPerStoreFeaturesFromStates(const Array<State>& states, const std::vector<SearchTask>& tasks,

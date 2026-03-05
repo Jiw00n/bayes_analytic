@@ -1306,57 +1306,97 @@ String ComputeDAG::PrintDAG(bool simple_mode) const {
   return String(ss.str());
 }
 
+// state를 schedule로 바꾸고 TVM의 InferBound API를 이용해서 범위 계산하고 State에 반영
+  // split, fuse 등 변환을 적용해도 bound(범위)는 바로바로 계산하지 않음
 State ComputeDAG::InferBound(const State& state) const {
   ICHECK(state->concrete) << "Only concrete state can be processed to get bound info.";
 
+  // deep copy 남발을 방지하기 위해 : ObjectRef 공유 -> 수정 시 COW 패턴을 강제함
   State ret_state;
   StateNode* pstate;
 
-  if (state->stages.empty()) {
+
+  if (state->stages.empty()) {  // 만약 state의 stages가 비어있는, 즉, state가 불완전한 상태일 수 있음
     // If the input state is incomplete with empty operation stage
     // create a new state from init_state and update it first
-    ret_state = operator->()->init_state;
+
+    // 일단 ObjectRef 공유
+    ret_state = operator->()->init_state;   // == ret_state = this->operator->()->init_state
+                                            // operator->()는 ComputeDAG(ObjectRef)를 가리키는 ComputeDAGNode(Object)의 포인터를 반환
+                                            // ComputeDAGNode의 init_state에 접근하기 위해 operator->() 사용
+
+    // 수정을 위해 COW
     pstate = ret_state.CopyOnWrite();
     pstate->transform_steps = state->transform_steps;
-    for (const auto& step : pstate->transform_steps) {
-      StepApplyToState(step, &ret_state, *this);
+    for (const auto& step : pstate->transform_steps) {  // transform_steps : Array<Step>, step : Step (ObjectRef 타입). step은 Step을 그대로 참조하는 객체
+      StepApplyToState(step, &ret_state, *this);        // ret_state는 수정을 위해 주소로 넘김. 주소로 넘겼으면 함수에서는 포인터로 받아야 함
+                                                        // 참조된 step은 그대로 넘김. 함수에서는 const Step& step로 받기 때문에 수정 불가능
+                                                            // 참조는 단순히 별명이다. 원래 객체처럼 사용 가능하다.
+                                                        // this는 ComputeDAG(ObjectRef 타입)를 가리키는 포인터. *this는 ComputeDAG 객체 자체(역참조된 객체)
     }
   } else {
+    // 일단 ObjectRef 공유
     ret_state = state;
-    pstate = ret_state.CopyOnWrite();
+    // 수정을 위해 COW
+    pstate = ret_state.CopyOnWrite();   // 반환 타입 : StateNode*
+                                        // ObjectRef로부터 COW -> 새로운 Object 생성, ret_state는 새 Object를 가리킴 -> Object 포인터 반환
   }
 
-  Array<te::Stage> stages;
-  StageToAxesMap stage_to_axes;
-  // Replay steps to tvm::Schedule
-  auto [sch, tensors] = ApplySteps(pstate->transform_steps, &stages, &stage_to_axes);
-  (void)tensors;  // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=81767
-  sch = sch.normalize_for_feature_extraction();
-  // Get bound information from TVM schedule
-  Map<IterVar, Range> bounds = te::InferBound(sch);
+  // 여기까지 새로운 StateNode 생성됨
 
-  // Update the state bound information
+  // =============================================================================
+
+  // stage_to_axes : Map<TVM의 stage,   TVM의 IterVar>
+  // bounds        : Map<TVM의 IterVar, TVM의 Range>
+  // stage_to_axes - bounds를 이용해서 Range 값을 찾고 State의 Iterator에 반영
+
+
+  Array<te::Stage> stages;        // TVM Schedule의 Stage 정보 저장하는 배열
+  StageToAxesMap stage_to_axes;   // TVM stage와 IterVar 맵
+                                    // stage_to_axes[stages[i]][j] → “i번째 stage의 j번째 iterator에 해당하는 TVM IterVar”
+  // Ansor의 transform_steps를 적용시켜서 TVM의 Schedule에 replay
+  auto [sch, tensors] = ApplySteps(pstate->transform_steps, &stages, &stage_to_axes);   // 반환 타입 std::pair<te::Schedule, Array<te::Tensor>>
+  (void)tensors;
+
+  // 스케줄을 feature extraction에 맞게 normalize
+  sch = sch.normalize_for_feature_extraction();
+
+
+  // bounds : 각 TVM IterVar와 그 범위 맵. **루프 정보만 모아놓은 맵**
+    // e.g. i_outer -> Range(0, 4) 등
+  Map<IterVar, Range> bounds = te::InferBound(sch);   // TVM의 InferBound API를 이용해서 bounds 얻어오기
+
+  // TVM이 계산한 “실제 루프 반복 범위(bound)”를 Ansor의 State 내부 Iterator에 다시 써넣음
+  // 그러기 위해 stage마다 모든 iterator를 순회하며 stage_to_axes
   for (size_t i = 0; i < pstate->stages.size(); ++i) {
     const Stage& stage = pstate->stages[i];
 
-    if (stage->compute_at == ComputeAtKind::kInlined) {
+    if (stage->compute_at == ComputeAtKind::kInlined) {   // inline된 stage는 loop가 없음
       continue;
     }
 
-    Array<Iterator> new_iters;
+
+    Array<Iterator> new_iters;    // 기존 iterator를 새 range로 교체하고 새 stage를 만들기 위함
     new_iters.reserve(stage->iters.size());
     // Get bound information from schedule
     // the StageToAxesMap is used to find the corresponding IterVar in TVM schedule result
-    for (size_t j = 0; j < stage->iters.size(); ++j) {
-      const Iterator& iter = stage->iters[j];
-      const IterVar& axis = stage_to_axes.at(stages[i])[j];
 
+    // stage마다 iterator 개수만큼 반복
+    for (size_t j = 0; j < stage->iters.size(); ++j) {
+      // Iterator : Ansor의 iterator
+      // IterVar : TVM의 iterator
+      // pstate->stages : Ansor의 stages
+      // stages : TVM의 stages
+      const Iterator& iter = stage->iters[j];               // Ansor의 i번째 stage의 j번째 iterator. 메타 정보만 사용할 예정
+      const IterVar& axis = stage_to_axes.at(stages[i])[j]; // TVM의 i번째 stage의 j번째 IterVar
+
+      // i번째 stage, j번째 IterVar을 bounds(Map<IterVar, Range>)에서 찾고, 그 범위를 Ansor의 Iterator에 반영
       auto find_res = bounds.find(axis);
       if (find_res != bounds.end()) {
         new_iters.push_back(Iterator(iter->name, (*find_res).second, iter->iter_kind,
                                      iter->annotation, &iter->orig_iters));
       } else {
-        LOG(FATAL) << "Infer bound fails";
+        LOG(FATAL) << "Infer bound fails";    // 단순 오류 처리
       }
     }
 
@@ -1364,6 +1404,7 @@ State ComputeDAG::InferBound(const State& state) const {
         i, Stage(stage->op, stage->op_type, new_iters, stage->compute_at, stage->attrs));
   }
 
+  // 수정된 pstate가 포함된 ret_state 반환
   return ret_state;
 }
 

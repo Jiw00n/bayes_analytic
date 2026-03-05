@@ -128,10 +128,10 @@ class PathManager:
 
         dirs["json"] = f"{self.gallery_path}/logs_json/{self.network}"
         dirs["tsv"] = f"{self.gallery_path}/logs_tsv/{self.network}"
+        dirs["tasks_pkl"] = f"{self.gallery_path}/ansor_tasks_pkl"
         os.makedirs(dirs["json"], exist_ok=True)
         os.makedirs(dirs["tsv"], exist_ok=True)
-
-
+        os.makedirs(dirs["tasks_pkl"], exist_ok=True)
 
     def get_paths(self, json, args):
         self.paths = {}
@@ -162,15 +162,15 @@ class PathManager:
 
 
     def tasks_pkl_check(self):
-        self.dirs["tasks_pkl"] = f"{self.gallery_path}/ansor_tasks_pkl"
-        self.paths["tasks_pkl"] = f'{self.dirs["tasks_pkl"]}/{self.network}-{self.inp_shape_str}.pkl'
-
         return os.path.exists(self.paths["tasks_pkl"])
 
 
-    def tasks_pkl_use(self):
+    def tasks_pkl_use(self, pkl_name=None):
         
-
+        tasks_pkl_name = f'{self.network}-{self.inp_shape_str}.pkl'
+        if pkl_name:
+            tasks_pkl_name = pkl_name
+        self.paths["tasks_pkl"] = f'{self.dirs["tasks_pkl"]}/{tasks_pkl_name}'
         if self.tasks_pkl_check():
             print(f'Load tasks from {self.paths["tasks_pkl"]}')
             with open(self.paths["tasks_pkl"], "rb") as f:

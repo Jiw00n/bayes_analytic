@@ -191,8 +191,8 @@ class SimpleObjAllocator : public ObjAllocatorBase<SimpleObjAllocator> {
   };
 };
 
-template <typename T, typename... Args>
-inline ObjectPtr<T> make_object(Args&&... args) {
+template <typename T, typename... Args>   // T : 만들 객체 타입, Args : T의 생성자에 필요한 인자들
+inline ObjectPtr<T> make_object(Args&&... args) {     // 힙에 타입이 T인 객체를 생성, 생성자에 필요한 인자들을 전달하여 객체를 초기화한 후, ObjectPtr<T>로 반환
   return SimpleObjAllocator().make_object<T>(std::forward<Args>(args)...);
 }
 

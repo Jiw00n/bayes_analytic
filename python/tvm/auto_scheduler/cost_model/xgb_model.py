@@ -260,7 +260,7 @@ class XGBModel(PythonBasedModel):
 
         # Predict -inf for invalid states that failed to be lowered.
         for idx, feature in enumerate(features):
-            if feature.min() == feature.max() == 0:
+            if feature.min() == feature.max() == 0: # 영벡터인 경우
                 ret[idx] = float("-inf")
 
         return ret

@@ -31,7 +31,7 @@
         },
         {
           "name" : "TVM_LOG_DEBUG",
-          "value" : "DEFAULT=0"
+          "value" : "DEFAULT=4"
         },
         {
           "name" : "PATH",

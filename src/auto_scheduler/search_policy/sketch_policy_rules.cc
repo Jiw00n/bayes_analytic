@@ -237,6 +237,10 @@ std::vector<std::pair<State, int>> RuleAddCacheWrite::Apply(const SketchPolicyNo
 }
 
 /********** RuleAddRfactor **********/
+// Reduction을 병렬화 가능하도록 Rfactor 적용
+// Rfactor는 reduction 축을 분리해서 새로운 stage로 만들어줌
+// CrossThreadReduction과 비슷. CPU 전용
+
 
 SketchGenerationRule::ConditionKind RuleAddRfactor::MeetCondition(const SketchPolicyNode& policy,
                                                                   const State& state,
@@ -517,14 +521,15 @@ std::vector<std::pair<State, int>> RuleCustomSketch::Apply(const SketchPolicyNod
 
 PopulationGenerationRule::ResultKind InitFillTileSize::Apply(SketchPolicyNode* policy, State* state,
                                                              std::mt19937* rand_gen) const {
+  // 인수분해(factorization) 메모이제이션 객체 생성
   SplitFactorizationMemo split_memo;
   int max_innermost_split_factor =
-      GetIntParam(policy->params, SketchParamKey::max_innermost_split_factor);
+      GetIntParam(policy->params, SketchParamKey::max_innermost_split_factor);    // 가장 안쪽 inner loop의 최대 split factor (곧, extent가 됨)
 
   StateNode* pstate = state->CopyOnWrite();
   // Scan the transformation history and randomly fill tiles size for all SplitStep
   for (size_t step_id = 0; step_id < (*state)->transform_steps.size(); ++step_id) {
-    if (auto ps = (*state)->transform_steps[step_id].as<SplitStepNode>()) {
+    if (auto ps = (*state)->transform_steps[step_id].as<SplitStepNode>()) {   // split step인 경우만
       bool all_defined = true;
       for (const auto& len : ps->lengths) {
         if (!len) {
@@ -537,11 +542,11 @@ PopulationGenerationRule::ResultKind InitFillTileSize::Apply(SketchPolicyNode* p
       }
 
       ICHECK(ps->extent);
-      int extent = GetIntImm(ps->extent.value());
-      const auto& candidate_lens = split_memo.GetFactorizationSchemes(extent, ps->lengths.size(),
+      int extent = GetIntImm(ps->extent.value());    // split step의 extent 값
+      const auto& candidate_lens = split_memo.GetFactorizationSchemes(extent, ps->lengths.size(),     // split step의 extent와 split factor의 개수에 따라 가능한 split factor 조합들을 가져옴
                                                                       max_innermost_split_factor);
       ICHECK(!candidate_lens.empty());
-      const auto& candidate_lengths = candidate_lens[(*rand_gen)() % candidate_lens.size()];
+      const auto& candidate_lengths = candidate_lens[(*rand_gen)() % candidate_lens.size()];    // 가능한 split factor 조합들 중에서 하나를 랜덤하게 선택   
 
       pstate->transform_steps.Set(
           step_id,
@@ -678,6 +683,7 @@ PopulationGenerationRule::ResultKind InitUnroll::Apply(SketchPolicyNode* policy,
       continue;
     }
 
+    // always_unroll_inner가 있는 경우인데, 지정해주지 않는 이상 사용하지 않음
     // Handle always_unroll_inner attr
     if (stage->op->attrs.count(SearchPolicyKey::always_unroll_inner)) {
       const auto& to_unroll_name_set =
@@ -707,7 +713,7 @@ PopulationGenerationRule::ResultKind InitUnroll::Apply(SketchPolicyNode* policy,
       }
     }
 
-    if (HasReduceIter(stage)) {
+    if (HasReduceIter(stage)) {       // reduction stage인 경우
       // Use auto unroll for multi level tiled stage
       int value = auto_unroll_configs[(*rand_gen)() % auto_unroll_configs.size()];
       state->pragma(stage_id, (*state)->stages[stage_id]->iters[0],
@@ -904,7 +910,7 @@ PopulationGenerationRule::ResultKind InitThreadBind::Apply(SketchPolicyNode* pol
         Iterator fused_it;
         *state = FuseAllOuterSpaceIterators(*state, stage_id, &fused_it);
 
-        // warp size 이하면 threadx에 바인딩
+        // fused iteration의 extent가 warp size 이하면 threadx에 바인딩
         if (GetExtent(fused_it) <= policy->search_task->hardware_params->warp_size) {
           state->bind(stage_id, fused_it, IteratorAnnotation::kThreadX);
         } 
@@ -1096,6 +1102,7 @@ PopulationGenerationRule::ResultKind MutateTileSize::Apply(SketchPolicyNode* pol
         continue;
       }
       // 가장 안쪽 tile size가 64보다 작은 것만 후보에 push (max_innermost_split_factor : 64)
+      // 이미 위반한 경우는 mutate 하지 않음
       auto innermost_factor = ps->lengths.back().value_or(max_innermost_split_factor + 1);
       if (GetIntImm(innermost_factor) <= max_innermost_split_factor) {
         split_step_ids.push_back(i);

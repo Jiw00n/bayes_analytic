@@ -450,7 +450,7 @@ class TaskScheduler:
             # skip warming up this task if it has been tuned before (restored from the log file)
             if not self.task_cts[idx]:
                 self._tune_task(idx)
-                breakpoint()
+                # breakpoint()
         self.best_ct = self.ct
         self.best_score = self.cur_score
 

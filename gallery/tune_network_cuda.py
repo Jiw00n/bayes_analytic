@@ -1,5 +1,8 @@
 import os
 
+from tvm.auto_scheduler.search_policy import CustomPrintState
+
+
 
 ppath = os.environ.get("PYTHONPATH")
 buildpath = os.environ.get("TVM_LIBRARY_PATH")
@@ -31,16 +34,16 @@ from tvm import relay, auto_scheduler
 from tvm.contrib import graph_executor
 import argparse
 from tvm.auto_scheduler.feature import get_per_store_features_from_file
-
-
+from tvm.auto_scheduler.search_task import HardwareParams
 
 TARGET = tvm.target.Target("cuda")
 
-
+# HW_PARAM = HardwareParams(num_cores=2147483647, vector_unit_bytes=2147483647, cache_line_bytes=2147483647, max_shared_memory_per_block=2147483647, max_local_memory_per_block=2147483647, max_threads_per_block=2147483647, max_vthread_extent=2147483647, warp_size=32)
 
 def get_tasks(mod, params, path_manager, verbose=True, get_pkl=True):
     if get_pkl:
         tasks, task_weights = path_manager.tasks_pkl_use()
+        # tasks, task_weights = path_manager.tasks_pkl_use("resnet_18-(1,224,224,3)-hw_param.pkl")
     
     if get_pkl is False or tasks is None:
         print("Extract tasks...")
@@ -64,7 +67,7 @@ def get_tasks(mod, params, path_manager, verbose=True, get_pkl=True):
 def run_tuning(tasks, task_weights, paths):
     print("="*80)
     print("Begin tuning...")
-    measure_ctx = auto_scheduler.LocalRPCMeasureContext(repeat=1, min_repeat_ms=300, timeout=10000)
+    measure_ctx = auto_scheduler.LocalRPCMeasureContext(repeat=1, min_repeat_ms=300, timeout=10)
     
 
     tuner = auto_scheduler.TaskScheduler(tasks, task_weights, tsv_log_path=paths["tsv"])
@@ -89,7 +92,9 @@ def build_moudle_compile(paths, mod, params, input_shape, dtype):
             lib = relay.build(mod, target=TARGET, params=params)
             # breakpoint()
 
-    
+    breakpoint()
+
+
     raw_features, raw_normalized_throughputs, task_ids = get_per_store_features_from_file(paths['json'], 10000)
     
     # 어떤 스케줄에 어떤 소스 코드가 매핑되는지 확인해야하는 함수 만들 것
@@ -136,17 +141,37 @@ def main_(args):
 
 
     # 경로 설정
-    # path_manager = PathManager(network, input_shape, args, gdb_mode)
+    path_manager = PathManager(network, input_shape, args, gdb_mode)
     # path_manager = PathManager(network, input_shape, args, gdb_mode, json="/root/work/tvm-ansor/gallery/logs_json/resnet_18/resnet_18-B1.json")
-    path_manager = PathManager(network, input_shape, args, gdb_mode, json="/root/work/tvm-ansor/gallery/logs_json/tmp.json")
+    # path_manager = PathManager(network, input_shape, args, gdb_mode, json="/root/work/tvm-ansor/gallery/logs_json/tmp.json")
 
 
     # task 추출
     tasks, task_weights = get_tasks(mod, params, path_manager, verbose=False, get_pkl=True)
 
+    # breakpoint()
     
     # 튜닝
-    # run_tuning(tasks, task_weights, path_manager.paths)
+    run_tuning(tasks, task_weights, path_manager.paths)
+
+    inputs_ = auto_scheduler.RecordReader(path_manager.paths['json']).read_lines()
+    inputs = []
+    wk_desc_states = ""
+    for i in inputs_[0]:
+        for t in tasks:
+            if i.task.workload_key == t.workload_key:
+                desc = t.desc
+        new_i = auto_scheduler.measure.recover_measure_input(i, True, desc=desc)
+        init_pop_str = CustomPrintState(new_i.state, delete_trivial_loop=True, dag_show=False)
+        # breakpoint()
+        
+        wk_desc_states += desc + "\n"
+        wk_desc_states += new_i.task.workload_key + "\n"
+        wk_desc_states += init_pop_str + "\n\n\n"
+    with open("tmp_states.txt", "w") as f:
+        f.write(wk_desc_states)
+    breakpoint()
+    
 
 
     # build_module 컴파일

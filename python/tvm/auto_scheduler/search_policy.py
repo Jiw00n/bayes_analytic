@@ -279,6 +279,6 @@ class SketchPolicy(SearchPolicy):
         return states
 
 
-
+# dag_show : ...부분에 dag 보이게 할지 여부
 def CustomPrintState(state, delete_trivial_loop=True, dag_show=False):
     return _ffi_api.CustomPrintState_(state, delete_trivial_loop, dag_show)

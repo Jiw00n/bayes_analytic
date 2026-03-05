@@ -205,17 +205,26 @@ void InferRootBound(const Stage& stage, const GraphContext& ctx,
 }
 
 Map<IterVar, Range> InferBound(const Schedule& sch) {
-  // Prepare context
+
+
+  // 1. Context 준비
   GraphContext ctx;
   Array<Operation> roots;
   arith::Analyzer analyzer;
 
-  for (Operation op : sch->outputs) {
-    roots.push_back(sch->stage_map[op]->op);
+  for (Operation op : sch->outputs) {   // outputs : output 관련 ops
+    roots.push_back(sch->stage_map[op]->op);  // output 관련 stage의 op를 roots에 추가
   }
+
+  // Read graph : output op부터 거꾸로 타고 올라가면서 그래프로 표현 (consumer 기준)
+    // output부터 타고 올라가기 때문에 output을 roots로 설정
+  // Feed graph : Read graph를 producer 기준으로 재구성해서 producer->consumer를 표현
   ctx.feed_graph = CreateFeedGraph(CreateReadGraph(roots));
 
+
+  // 2. 스케줄의 메타정보 수집
   for (Stage stage : sch->stages) {
+    // thread bind 맵 저장
     for (auto kv : stage->iter_var_attrs) {
       if (kv.second->bind_thread.defined()) {
         ICHECK(!ctx.bind_map.count(kv.first));
@@ -224,14 +233,20 @@ Map<IterVar, Range> InferBound(const Schedule& sch) {
     }
     ctx.op2stage_[stage->op.get()] = stage;
   }
+  // compute_at 같은 attach 관련 정보 수집
   ctx.attach_path = CreateAttachPath(sch);
-  // Run inference.
-  std::unordered_map<IterVar, Range> ret;
+  
+
+
+  // 3. 스테이지 역순으로 bound 추론
+  std::unordered_map<IterVar, Range> ret;   // IterVar → Range(min, extent) 맵
   for (size_t i = sch->stages.size(); i != 0; --i) {
     const Stage& stage = sch->stages[i - 1];
+
+    // 이 stage의 원래 op 정의에 있는 기본 축 범위 계산
     InferRootBound(stage, ctx, &ret);
 
-    // bind bound of root iter vars.
+    // 계산된 root 범위를 analyzer에 바인딩
     for (auto iv : stage->op->root_iter_vars()) {
       auto it = ret.find(iv);
       if (it != ret.end()) {
@@ -239,13 +254,18 @@ Map<IterVar, Range> InferBound(const Schedule& sch) {
       }
     }
 
-    // pass down to get bound of all iter vars.
+    // 아래 축으로 범위 전파
     PassDownDomain(stage, &ret, &analyzer);
-    for (IterVar iv : stage->env_threads) {
-      ICHECK(iv->dom.defined());
+
+    // thread bind 축은 범위가 정해져 있기 때문에 그대로 추가
+    for (IterVar iv : stage->env_threads) {    // env_threads : thread bind된 IterVar들
+      ICHECK(iv->dom.defined());    // dom == Range(min, extent) : iv가 가질 수 있는 값의 범위
       ret[iv] = iv->dom;
     }
   }
+
+
+  // 4. 정규화
   for (auto it = ret.begin(); it != ret.end(); it++) {
     DataType var_type = it->first->var.dtype();
     it->second = Range::FromMinExtent(
