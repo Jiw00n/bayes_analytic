@@ -8,7 +8,7 @@ schedule_generator — ScheduleGenerator: HW 제약 기반 스케줄 파라미�
   4) max_vthread
   5) max_innermost_split
 """
-from .sym_types import SymExpr, eval_sym_extent, builtins_min
+from .sym_types import ANNOTATION_STR, CA_INLINED, SymExpr, eval_sym_extent, builtins_min
 from .param_manager import SymParamManager
 from .expr_nodes import (
     ExprNode, ConstNode, VarNode, MulNode, AddNode, SubNode,
@@ -32,7 +32,7 @@ class ScheduleGenerator:
 
     ALL_CONSTRAINT_KINDS = (
         'vectorize', 'shared_memory', 'max_threads',
-        'vthread', 'innermost_split',
+        'max_vthread', 'innermost_split',
     )
 
     def __init__(self, sym_state, hw_param=None, enabled_constraints=None):
@@ -120,30 +120,71 @@ class ScheduleGenerator:
         return []
 
     def build_max_threads_constraints(self):
+        axis_items = self._collect_thread_binding_axes()
         limit = self.hw['max_threads_per_block']
-        constraints = []
-        for sid, iid, ext in self.s.get_thread_extents():
-            constraints.append({
-                'stage_id': sid,
-                'iter_id': iid,
-                'sym_extent': ext,
-                'limit': limit,
-                'desc': f"max_threads s{sid}.i{iid} ({self.s.stages[sid].op_name}): "
-                        f"extent ≤ {limit}",
-            })
-        return constraints
+        total_extent = SymExpr.product([item['sym_extent'] for item in axis_items])
+        axis_desc = " * ".join(item['axis_name'] for item in axis_items) if axis_items else "1"
+        return {
+            'items': axis_items,
+            'sym_extent': total_extent,
+            'limit': limit,
+            'desc': f"max_threads_per_block: {axis_desc} ≤ {limit}",
+        }
 
     def check_max_threads(self, sym_map=None):
         if sym_map is None:
             sym_map = self.s.sym_map
-        violations = []
-        for c in self.build_max_threads_constraints():
-            val = eval_sym_extent(c['sym_extent'], sym_map)
-            if isinstance(val, int) and val > c['limit']:
-                violations.append(f"{c['desc']}: actual={val}")
-        return violations
+        c = self.build_max_threads_constraints()
+        if not c['items']:
+            return []
+        parts = []
+        total = 1
+        for item in c['items']:
+            val = eval_sym_extent(item['sym_extent'], sym_map)
+            if not isinstance(val, int):
+                return [f"{c['desc']}: actual={item['axis_name']}={val}"]
+            total *= val
+            parts.append(f"{item['axis_name']}={val}")
+        if total > c['limit']:
+            return [f"{c['desc']}: actual={total} ({' * '.join(parts)})"]
+        return []
 
-    def build_vthread_constraints(self):
+    def _collect_thread_binding_axes(self):
+        axis_items = []
+        for ann in (6, 8, 10, 4):
+            candidates = []
+            for sid, stage in enumerate(self.s.stages):
+                if stage.compute_at == CA_INLINED:
+                    continue
+                for iid, it in enumerate(stage.iters):
+                    if it.annotation != ann or it.extent is None:
+                        continue
+                    candidates.append({
+                        'stage_id': sid,
+                        'iter_id': iid,
+                        'op_name': stage.op_name,
+                        'compute_at': stage.compute_at,
+                        'sym_extent': it.extent,
+                    })
+            if not candidates:
+                continue
+            # Prefer the kernel's non-shared binding when cooperative-fetch stages
+            # mirror the same thread extent on additional stages.
+            candidates.sort(
+                key=lambda item: (
+                    item['op_name'].endswith('.shared'),
+                    item['compute_at'] != 0,
+                    item['stage_id'],
+                    item['iter_id'],
+                )
+            )
+            chosen = dict(candidates[0])
+            chosen['axis_name'] = ANNOTATION_STR[ann]
+            chosen['candidate_count'] = len(candidates)
+            axis_items.append(chosen)
+        return axis_items
+
+    def build_max_vthread_constraints(self):
         limit = self.hw['max_vthread_extent']
         constraints = []
         for sid, iid, ext in self.s.get_vthread_extents():
@@ -157,11 +198,11 @@ class ScheduleGenerator:
             })
         return constraints
 
-    def check_vthread(self, sym_map=None):
+    def check_max_vthread(self, sym_map=None):
         if sym_map is None:
             sym_map = self.s.sym_map
         violations = []
-        for c in self.build_vthread_constraints():
+        for c in self.build_max_vthread_constraints():
             val = eval_sym_extent(c['sym_extent'], sym_map)
             if isinstance(val, int) and val > c['limit']:
                 violations.append(f"{c['desc']}: actual={val}")
@@ -199,8 +240,8 @@ class ScheduleGenerator:
             violations.extend(self.check_shared_memory(sym_map))
         if 'max_threads' in self._enabled:
             violations.extend(self.check_max_threads(sym_map))
-        if 'vthread' in self._enabled:
-            violations.extend(self.check_vthread(sym_map))
+        if 'max_vthread' in self._enabled:
+            violations.extend(self.check_max_vthread(sym_map))
         if 'innermost_split' in self._enabled:
             violations.extend(self.check_innermost_split(sym_map))
         return violations
@@ -271,15 +312,16 @@ class ScheduleGenerator:
 
         # (c) max_threads
         if 'max_threads' in self._enabled:
-            for c in self.build_max_threads_constraints():
+            c = self.build_max_threads_constraints()
+            if c['items']:
                 tree = parse_expr_tree(str(c['sym_extent']))
                 _add_constraint(tree, c['limit'], 'max_threads', c['desc'], is_upper=True)
 
-        # (d) vthread
-        if 'vthread' in self._enabled:
-            for c in self.build_vthread_constraints():
+        # (d) max_vthread
+        if 'max_vthread' in self._enabled:
+            for c in self.build_max_vthread_constraints():
                 tree = parse_expr_tree(str(c['sym_extent']))
-                _add_constraint(tree, c['limit'], 'vthread', c['desc'], is_upper=True)
+                _add_constraint(tree, c['limit'], 'max_vthread', c['desc'], is_upper=True)
 
         # 변수 할당 순서
         self._compute_var_order()
