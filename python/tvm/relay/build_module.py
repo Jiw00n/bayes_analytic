@@ -376,7 +376,7 @@ def build(
         lowered_ir_mods = bld_mod.get_irmodule()            # (tvm.ir.container.Map) device : IRModule
         executor_codegen_metadata = bld_mod.get_executor_codegen_metadata()
 
-        breakpoint()
+        # breakpoint()
         if executor.name == "aot":
             executor_factory = _executor_factory.AOTExecutorFactoryModule(
                 ir_mod,

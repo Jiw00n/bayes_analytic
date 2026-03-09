@@ -58,7 +58,7 @@ def get_tasks(mod, params, path_manager, verbose=True, get_pkl=True):
             # breakpoint()
     
     print(f"Total tasks length : {len(tasks)}")
-    # breakpoint()
+    breakpoint()
     return tasks, task_weights
 
 

@@ -47,7 +47,7 @@ def get_network(name, batch_size, layout="NHWC", dtype="float32", num_classes=10
 
     elif name.startswith("resnet3d_"):
         n_layer = int(name.split("_")[1])
-        mod, params = testing.resnet.get_workload(
+        mod, params = testing.resnet_3d.get_workload(
             num_layers=n_layer,
             batch_size=batch_size,
             layout=layout,

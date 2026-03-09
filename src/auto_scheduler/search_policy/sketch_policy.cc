@@ -1028,6 +1028,20 @@ TVM_REGISTER_GLOBAL("auto_scheduler.SketchPolicyEvolutionarySearch")
       return states;
     });
 
+TVM_REGISTER_GLOBAL("auto_scheduler.SketchPolicySampleInitialPopulationBySketches")
+    .set_body_typed([](SketchPolicy policy) {
+      const Array<State>& sketches = policy->GenerateSketches();
+      Array<State> init_population;
+
+      for (const auto& sketch : sketches) {
+        Array<State> init_pop = policy->SampleInitPopulation({sketch});
+        init_population.push_back(init_pop[0]);
+      }
+      
+      return init_population;
+    });
+
+
 TVM_REGISTER_GLOBAL("auto_scheduler.SketchPolicySampleInitPop_Rule_tgt")
 .set_body_typed([](SketchPolicy policy, int target_rule) {
   const Array<State>& sketches = policy->GenerateSketches();

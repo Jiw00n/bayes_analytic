@@ -288,3 +288,11 @@ gallery/states/
 gallery/ansor_tasks_pkl/
 gallery/*.cu
 backups/single
+
+src_felix/
+python_felix/
+
+gallery/*.txt
+
+gallery/dataset/
+gallery/constrained_gen/verify_batches/
