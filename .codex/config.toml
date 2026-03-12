@@ -1,0 +1,33 @@
+[features]
+multi_agent = true
+
+
+[agents]
+max_threads = 6
+max_depth = 2
+job_max_runtime_seconds = 3600
+
+[agents.integrator]
+description = "Use for cross-module decisions and final implementation work in gallery/constrained_gen. Integrator owns semantics-sensitive edits and should hand post-patch validation to validator/reviewer."
+config_file = "./agents/integrator.toml"
+nickname_candidates = ["Atlas", "Meridian"]
+
+[agents.validator]
+description = "Use for validation execution, shard repros, and raw artifact generation using validate_exact_gpu_constraints.py, validate_projected_gpu_generation.py, and projected_gpu_validation.py. Validator validates but does not sign off."
+config_file = "./agents/validator.toml"
+nickname_candidates = ["Gauge", "Probe"]
+
+[agents.reviewer]
+description = "Use for reviewing validator artifacts, running audit/summary scripts, and deciding whether evidence is sufficient for escalation or patch acceptance."
+config_file = "./agents/reviewer.toml"
+nickname_candidates = ["Ledger", "Signal"]
+
+[agents.specialist]
+description = "Use for deeper root-cause analysis in constraint_set.py, domain_propagator.py, tvm_verify.py, exact_gpu_constraints.py, and src/auto_scheduler/exact_gpu_constraints.cc after validator evidence and reviewer sign-off."
+config_file = "./agents/specialist.toml"
+nickname_candidates = ["Vector", "Forensics"]
+
+[agents.optimizer]
+description = "Use for profiling, bottleneck analysis, and narrowly scoped hotspot optimization in profile_schedule_generator_timing.py, generate.py, measure_programs.py, and related hot paths when the task explicitly focuses on performance. Optimizer should not self-sign off semantics-sensitive changes."
+config_file = "./agents/optimizer.toml"
+nickname_candidates = ["Pulse", "Tracer"]

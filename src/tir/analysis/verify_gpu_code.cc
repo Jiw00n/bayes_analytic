@@ -322,6 +322,14 @@ bool VerifyGPUCode(const PrimFunc& func, Map<String, PrimExpr> constraints) {
 }
 
 TVM_REGISTER_GLOBAL("tir.analysis.verify_gpu_code").set_body_typed(VerifyGPUCode);
+TVM_REGISTER_GLOBAL("tir.analysis.verify_gpu_code_errors")
+    .set_body_typed([](PrimFunc func, Map<String, PrimExpr> constraints) {
+      Array<String> errors;
+      for (const auto& err : VerifyGPUCode_(func, constraints)) {
+        errors.push_back(err);
+      }
+      return errors;
+    });
 
 namespace transform {
 

@@ -32,6 +32,7 @@ from .expr_nodes import (
 )
 from .schedule_generator import ScheduleGenerator
 from .tvm_verify import (
-    lower_with_gpu_passes, verify_gpu_module, params_to_state,
+    lower_with_gpu_passes, verify_gpu_module, verify_gpu_func_errors,
+    verify_gpu_module_errors, params_to_state, params_to_lowered_gpu_module,
     GPU_PASSES, GPU_VERIFY_CONSTRAINTS,
 )

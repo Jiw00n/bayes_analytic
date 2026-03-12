@@ -24,6 +24,7 @@
 #include "message_passing.h"
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/arith/var_context.h>
 #include <tvm/tir/expr.h>
 
 namespace tvm {
@@ -102,7 +103,7 @@ void PassUpThreadBinding(const Stage& stage, std::unordered_map<IterVar, bool>* 
 }
 
 void PassDownDomain(const Stage& stage, std::unordered_map<IterVar, Range>* p_state,
-                    arith::Analyzer* actx, bool allow_missing) {
+                    arith::Analyzer* actx, bool allow_missing, arith::VarContext* vcontext) {
   auto ceil_div = [actx](const PrimExpr& a, const PrimExpr& b) {
     if (actx->CanProve(indexmod(a, b) == 0)) {
       return actx->Simplify(indexdiv(a, b));
@@ -147,19 +148,37 @@ void PassDownDomain(const Stage& stage, std::unordered_map<IterVar, Range>* p_st
                    : minimum_or_later(range_parent->extent, factor_or_nparts);
       };
       if (r->factor.defined()) {
+        bool no_tighten =
+            dominating_thread[r->inner] || allow_missing || is_zero(range_parent->extent);
+        PrimExpr inner_extent;
+        PrimExpr outer_extent;
+        if (vcontext) {
+          std::tie(inner_extent, outer_extent) =
+              vcontext->GetSplitSizes(range_parent->extent, r->factor, no_tighten);
+        } else {
+          inner_extent = cast(range_parent->extent.dtype(),
+                              resolve_min_extent_for_split(r->inner, r->factor));
+          outer_extent = ceil_div(range_parent->extent, r->factor);
+        }
         Update(p_state, r->inner,
-               Range::FromMinExtent(0, cast(range_parent->extent.dtype(),
-                                            resolve_min_extent_for_split(r->inner, r->factor))),
-               actx);
-        Update(p_state, r->outer,
-               Range::FromMinExtent(0, ceil_div(range_parent->extent, r->factor)), actx);
+               Range::FromMinExtent(0, inner_extent), actx);
+        Update(p_state, r->outer, Range::FromMinExtent(0, outer_extent), actx);
       } else {
+        bool no_tighten =
+            dominating_thread[r->outer] || allow_missing || is_zero(range_parent->extent);
+        PrimExpr outer_extent;
+        PrimExpr inner_extent;
+        if (vcontext) {
+          std::tie(outer_extent, inner_extent) =
+              vcontext->GetSplitSizes(range_parent->extent, r->nparts, no_tighten);
+        } else {
+          outer_extent = cast(range_parent->extent.dtype(),
+                              resolve_min_extent_for_split(r->outer, r->nparts));
+          inner_extent = ceil_div(range_parent->extent, r->nparts);
+        }
         Update(p_state, r->outer,
-               Range::FromMinExtent(0, cast(range_parent->extent.dtype(),
-                                            resolve_min_extent_for_split(r->outer, r->nparts))),
-               actx);
-        Update(p_state, r->inner,
-               Range::FromMinExtent(0, ceil_div(range_parent->extent, r->nparts)), actx);
+               Range::FromMinExtent(0, outer_extent), actx);
+        Update(p_state, r->inner, Range::FromMinExtent(0, inner_extent), actx);
       }
     } else if (const FuseNode* r = rel.as<FuseNode>()) {
       if (!state.count(r->outer) || !state.count(r->inner)) {
@@ -168,7 +187,11 @@ void PassDownDomain(const Stage& stage, std::unordered_map<IterVar, Range>* p_st
       }
       const Range& range_outer = state.at(r->outer);
       const Range& range_inner = state.at(r->inner);
-      state[r->fused] = Range::FromMinExtent(0, range_outer->extent * range_inner->extent);
+      PrimExpr fused_extent = range_outer->extent * range_inner->extent;
+      if (vcontext) {
+        fused_extent = vcontext->DefineConstShorthand(fused_extent);
+      }
+      state[r->fused] = Range::FromMinExtent(0, fused_extent);
     } else if (const RebaseNode* r = rel.as<RebaseNode>()) {
       if (!state.count(r->parent)) {
         ICHECK(allow_missing);

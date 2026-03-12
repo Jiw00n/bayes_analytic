@@ -4,6 +4,7 @@ sym_types — 기본 심볼릭 타입: SymExpr, SymIter, SymStage, eval_sym_exte
 import math
 
 builtins_min = min
+builtins_max = max
 
 # ── Annotation 문자열 매핑 (C++ IteratorAnnotationString 동일) ──
 ANNOTATION_STR = {
@@ -118,6 +119,22 @@ class SymExpr:
         if isinstance(a_val, int) and isinstance(b_val, int):
             return SymExpr(builtins_min(a_val, b_val))
         return SymExpr(f"min({a_val},{b_val})")
+
+    @staticmethod
+    def max(items):
+        """max(items...) — all concrete면 int max, 아니면 symbolic max string."""
+        vals = []
+        for item in items:
+            if item is None:
+                continue
+            vals.append(item.val if isinstance(item, SymExpr) else item)
+        if not vals:
+            return SymExpr(0)
+        if len(vals) == 1:
+            return SymExpr(vals[0])
+        if all(isinstance(val, int) for val in vals):
+            return SymExpr(builtins_max(vals))
+        return SymExpr("max(" + ",".join(str(val) for val in vals) + ")")
 
 
 class SymIter:

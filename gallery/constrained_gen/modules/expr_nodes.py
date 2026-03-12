@@ -6,6 +6,7 @@ expr_nodes — ExprNode 트리 클래스 + parse_expr_tree 파서.
 """
 
 builtins_min = min
+from itertools import product
 
 
 class ExprNode:
@@ -218,6 +219,340 @@ class SumNode(ExprNode):
         return " + ".join(str(c) for c in self.children)
 
 
+class MaxNode(ExprNode):
+    """여러 자식의 최댓값."""
+
+    __slots__ = ("children",)
+
+    def __init__(self, children):
+        self.children = list(children)
+
+    def interval(self, domains):
+        if not self.children:
+            return (0, 0)
+        intervals = [child.interval(domains) for child in self.children]
+        return (
+            max(interval[0] for interval in intervals),
+            max(interval[1] for interval in intervals),
+        )
+
+    def evaluate(self, assignment):
+        if not self.children:
+            return 0
+        return max(child.evaluate(assignment) for child in self.children)
+
+    def variables(self):
+        vars_in = set()
+        for child in self.children:
+            vars_in |= child.variables()
+        return vars_in
+
+    def __repr__(self):
+        if not self.children:
+            return "0"
+        return "max(" + ", ".join(str(child) for child in self.children) + ")"
+
+
+def _safe_int_expr(expr):
+    try:
+        return int(expr)
+    except TypeError as err:
+        raise TypeError(f"Expected concrete integer expression, got {expr}") from err
+
+
+def _maybe_int_expr(expr):
+    try:
+        return int(expr)
+    except TypeError:
+        return None
+
+
+class PrimExprNode(ExprNode):
+    """TVM PrimExpr wrapper."""
+
+    __slots__ = ("expr", "_var_map")
+
+    def __init__(self, expr):
+        self.expr = expr
+        self._var_map = {}
+        self._rebuild_var_map()
+
+    def _rebuild_var_map(self):
+        import tvm
+
+        var_map = {}
+
+        def visit(node):
+            if isinstance(node, tvm.tir.Var):
+                var_map.setdefault(str(node.name), node)
+
+        tvm.tir.stmt_functor.post_order_visit(self.expr, visit)
+        self._var_map = var_map
+
+    def __getstate__(self):
+        return {"expr": self.expr}
+
+    def __setstate__(self, state):
+        self.expr = state["expr"]
+        self._var_map = {}
+        self._rebuild_var_map()
+
+    def interval(self, domains):
+        import tvm
+
+        analyzer = tvm.arith.Analyzer()
+        if not self._var_map:
+            val = _safe_int_expr(analyzer.simplify(self.expr))
+            return (val, val)
+
+        dom_map = {}
+        for name, var in self._var_map.items():
+            dom = domains.get(name)
+            if dom is None:
+                lo = hi = 1
+            elif isinstance(dom, int):
+                lo = hi = dom
+            else:
+                lo, hi = int(dom[0]), int(dom[-1])
+            dom_map[var] = tvm.arith.IntervalSet(lo, hi)
+
+        interval = analyzer.int_set(self.expr, dom_map)
+        lo = _maybe_int_expr(analyzer.simplify(interval.min_value))
+        hi = _maybe_int_expr(analyzer.simplify(interval.max_value))
+        if lo is None or hi is None:
+            return (0, 1 << 60)
+        return (lo, hi)
+
+    def evaluate(self, assignment):
+        import tvm
+
+        expr = self.expr
+        if self._var_map:
+            subst = {var: assignment.get(name, 1) for name, var in self._var_map.items()}
+            expr = tvm.tir.stmt_functor.substitute(expr, subst)
+        return _safe_int_expr(tvm.arith.Analyzer().simplify(expr))
+
+    def variables(self):
+        return set(self._var_map.keys())
+
+    def __repr__(self):
+        return str(self.expr)
+
+
+class ProjectedExprNode(ExprNode):
+    """Display/variables use projected expression, evaluation uses exact expression."""
+
+    __slots__ = ("display", "exact")
+
+    def __init__(self, display, exact):
+        self.display = display
+        self.exact = exact
+
+    def interval(self, domains):
+        return self.display.interval(domains)
+
+    def evaluate(self, assignment):
+        return self.exact.evaluate(assignment)
+
+    def variables(self):
+        return self.display.variables()
+
+    def __repr__(self):
+        return str(self.display)
+
+
+class BoundedMaxNode(ExprNode):
+    """Exact max over bounded auxiliary vars."""
+
+    __slots__ = ("child", "bound_vars")
+
+    def __init__(self, child, bound_vars):
+        self.child = child
+        self.bound_vars = dict(bound_vars)
+
+    def interval(self, domains):
+        return self.child.interval(domains)
+
+    def evaluate(self, assignment):
+        return self.child.evaluate(assignment)
+
+    def variables(self):
+        vars_in = set(self.child.variables()) - set(self.bound_vars.keys())
+        for lo_expr, hi_expr in self.bound_vars.values():
+            vars_in |= lo_expr.variables()
+            vars_in |= hi_expr.variables()
+        return vars_in
+
+    def __repr__(self):
+        if not self.bound_vars:
+            return str(self.child)
+        bounds = ", ".join(
+            f"{name} in [{lo_expr}, {hi_expr}]"
+            for name, (lo_expr, hi_expr) in self.bound_vars.items()
+        )
+        return f"max_{{{bounds}}}({self.child})"
+
+
+class CaseSplitNode(ExprNode):
+    """Selector equality case table over child ExprNode values."""
+
+    __slots__ = ("selectors", "cases", "default", "_case_map", "extra_domains")
+
+    def __init__(self, selectors, cases, default=None, extra_domains=None):
+        self.selectors = list(selectors)
+        self.cases = [
+            {"values": tuple(case["values"]), "expr": case["expr"]}
+            for case in cases
+        ]
+        self.default = default if default is not None else ConstNode(1 << 60)
+        self._case_map = {case["values"]: case["expr"] for case in self.cases}
+        self.extra_domains = {}
+        if extra_domains:
+            for name, bounds in extra_domains.items():
+                lo, hi = bounds
+                if not isinstance(lo, ExprNode):
+                    lo = ConstNode(lo)
+                if not isinstance(hi, ExprNode):
+                    hi = ConstNode(hi)
+                self.extra_domains[name] = (lo, hi)
+
+    def _augment_domains(self, domains):
+        full = dict(domains)
+        for name, (lo_expr, hi_expr) in self.extra_domains.items():
+            if name in full:
+                continue
+            lo_vars = lo_expr.variables()
+            hi_vars = hi_expr.variables()
+            if all(not isinstance(full.get(var), list) for var in lo_vars):
+                lo = lo_expr.evaluate(full)
+            else:
+                lo = lo_expr.interval(full)[0]
+            if all(not isinstance(full.get(var), list) for var in hi_vars):
+                hi = hi_expr.evaluate(full)
+            else:
+                hi = hi_expr.interval(full)[1]
+            if hi < lo:
+                hi = lo
+            full[name] = [lo, hi]
+        return full
+
+    def _case_feasible(self, values, domains):
+        for selector, target in zip(self.selectors, values):
+            lo, hi = selector.interval(domains)
+            if target < lo or target > hi:
+                return False
+        return True
+
+    def feasible_case_values(self, domains):
+        if not self.cases:
+            return []
+        if not self.selectors:
+            return [case["values"] for case in self.cases]
+        return [
+            case["values"]
+            for case in self.cases
+            if self._case_feasible(case["values"], domains)
+        ]
+
+    def interval_with_feasible_cases(self, domains, feasible_case_values):
+        if not self.cases:
+            return self.default.interval(domains)
+
+        if not self.selectors:
+            expr = self._case_map.get(tuple())
+            if expr is not None:
+                return expr.interval(domains)
+            intervals = [case["expr"].interval(domains) for case in self.cases]
+        else:
+            intervals = [
+                self._case_map[values].interval(domains)
+                for values in feasible_case_values
+                if values in self._case_map
+            ]
+
+        if not intervals:
+            return self.default.interval(domains)
+        lo = builtins_min(interval[0] for interval in intervals)
+        hi = max(interval[1] for interval in intervals)
+        return (lo, hi)
+
+    def interval(self, domains):
+        domains = self._augment_domains(domains)
+        feasible_case_values = self.feasible_case_values(domains)
+        return self.interval_with_feasible_cases(domains, feasible_case_values)
+
+    def evaluate(self, assignment):
+        full = self._augment_domains(dict(assignment))
+        relevant_vars = self.variables()
+        enum_items = []
+        total = 1
+        for name in sorted(relevant_vars):
+            dom = full.get(name)
+            if not isinstance(dom, list):
+                continue
+            lo, hi = int(dom[0]), int(dom[-1])
+            width = hi - lo + 1
+            if width <= 0:
+                return self.default.evaluate(assignment)
+            total *= width
+            if total > 100000:
+                _, hi_val = self.interval(assignment)
+                return hi_val
+            enum_items.append((name, range(lo, hi + 1)))
+
+        if not enum_items:
+            values = tuple(selector.evaluate(full) for selector in self.selectors)
+            expr = self._case_map.get(values)
+            if expr is not None:
+                return expr.evaluate(full)
+            return self.default.evaluate(full)
+
+        best = None
+        names = [name for name, _ in enum_items]
+        ranges = [rng for _, rng in enum_items]
+        for combo in product(*ranges):
+            concrete = dict(full)
+            for name, value in zip(names, combo):
+                concrete[name] = value
+            values = tuple(selector.evaluate(concrete) for selector in self.selectors)
+            expr = self._case_map.get(values, self.default)
+            val = expr.evaluate(concrete)
+            best = val if best is None else max(best, val)
+
+        if best is None:
+            return self.default.evaluate(full)
+        return best
+
+    def variables(self):
+        vars_in = set()
+        for selector in self.selectors:
+            vars_in |= selector.variables()
+        for case in self.cases:
+            vars_in |= case["expr"].variables()
+        for lo_expr, hi_expr in self.extra_domains.values():
+            vars_in |= lo_expr.variables()
+            vars_in |= hi_expr.variables()
+        vars_in |= self.default.variables()
+        return vars_in
+
+    def __repr__(self):
+        if not self.selectors and len(self.cases) == 1 and self.cases[0]["values"] == tuple():
+            return str(self.cases[0]["expr"])
+
+        selector_texts = [str(selector) for selector in self.selectors]
+        parts = []
+        for case in self.cases:
+            if selector_texts:
+                pred = " and ".join(
+                    f"({selector_text}=={target})"
+                    for selector_text, target in zip(selector_texts, case["values"])
+                )
+            else:
+                pred = "default"
+            parts.append(f"[{pred}] => {case['expr']}")
+        return "CaseSplit(" + "; ".join(parts) + ")"
+
+
 # ─────────────────────────────────────────────────────────────
 #  파서
 # ─────────────────────────────────────────────────────────────
@@ -230,43 +565,41 @@ def parse_expr_tree(sym_expr_str):
       - a*b (곱)
       - (expr)
       - min(a,b)
+      - max(a,b,...)
       - ceil(a/(b))
       - a - b, a + b (스텐실 패턴)
 
     Returns: ExprNode
     """
     s = sym_expr_str.strip()
-    return _parse_add_sub(s, 0)[0]
+    node, pos = _parse_add_sub(s, 0)
+    pos = _skip_spaces(s, pos)
+    if pos != len(s):
+        raise ValueError(
+            f"Unsupported trailing expression segment in '{sym_expr_str}': '{s[pos:]}'"
+        )
+    return node
+
+
+def _skip_spaces(s, pos):
+    while pos < len(s) and s[pos] == ' ':
+        pos += 1
+    return pos
 
 
 def _parse_add_sub(s, pos):
     """+ / - 파싱 (가장 낮은 우선순위)."""
     left, pos = _parse_mul(s, pos)
-    while pos < len(s):
+    while True:
+        pos = _skip_spaces(s, pos)
+        if pos >= len(s):
+            break
         if s[pos] == '+':
             right, pos = _parse_mul(s, pos + 1)
             left = AddNode(left, right)
         elif s[pos] == '-' and pos > 0:
             right, pos = _parse_mul(s, pos + 1)
             left = SubNode(left, right)
-        elif s[pos] in ' ':
-            j = pos
-            while j < len(s) and s[j] == ' ':
-                j += 1
-            if j < len(s) and s[j] == '+':
-                j2 = j + 1
-                while j2 < len(s) and s[j2] == ' ':
-                    j2 += 1
-                right, pos = _parse_mul(s, j2)
-                left = AddNode(left, right)
-            elif j < len(s) and s[j] == '-':
-                j2 = j + 1
-                while j2 < len(s) and s[j2] == ' ':
-                    j2 += 1
-                right, pos = _parse_mul(s, j2)
-                left = SubNode(left, right)
-            else:
-                break
         else:
             break
     return left, pos
@@ -275,14 +608,17 @@ def _parse_add_sub(s, pos):
 def _parse_mul(s, pos):
     """* 파싱."""
     left, pos = _parse_atom(s, pos)
-    while pos < len(s) and s[pos] == '*':
+    while True:
+        pos = _skip_spaces(s, pos)
+        if pos >= len(s) or s[pos] != '*':
+            break
         right, pos = _parse_atom(s, pos + 1)
         left = MulNode(left, right)
     return left, pos
 
 
 def _parse_atom(s, pos):
-    """원자: 정수, 변수, 괄호, min(...), ceil(...)."""
+    """원자: 정수, 변수, 괄호, min(...), max(...), ceil(...)."""
     while pos < len(s) and s[pos] == ' ':
         pos += 1
 
@@ -305,11 +641,29 @@ def _parse_atom(s, pos):
             pos += 1
         return MinNode(a, b), pos
 
+    if s[pos:pos+4] == 'max(':
+        pos += 4
+        children = []
+        while pos < len(s):
+            child, pos = _parse_add_sub(s, pos)
+            children.append(child)
+            while pos < len(s) and s[pos] == ' ':
+                pos += 1
+            if pos < len(s) and s[pos] == ',':
+                pos += 1
+                continue
+            if pos < len(s) and s[pos] == ')':
+                pos += 1
+            break
+        return MaxNode(children), pos
+
     if s[pos:pos+5] == 'ceil(':
         pos += 5
         a, pos = _parse_add_sub(s, pos)
+        pos = _skip_spaces(s, pos)
         if pos < len(s) and s[pos] == '/':
             pos += 1
+        pos = _skip_spaces(s, pos)
         if pos < len(s) and s[pos] == '(':
             b, pos = _parse_add_sub(s, pos + 1)
             if pos < len(s) and s[pos] == ')':
@@ -323,8 +677,10 @@ def _parse_atom(s, pos):
     if s[pos:pos+10] == 'math.ceil(':
         pos += 10
         a, pos = _parse_add_sub(s, pos)
+        pos = _skip_spaces(s, pos)
         if pos < len(s) and s[pos] == '/':
             pos += 1
+        pos = _skip_spaces(s, pos)
         if pos < len(s) and s[pos] == '(':
             b, pos = _parse_add_sub(s, pos + 1)
             if pos < len(s) and s[pos] == ')':

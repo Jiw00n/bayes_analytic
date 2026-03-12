@@ -28,7 +28,6 @@
 
 #include <unordered_set>
 
-#include "../../arith/ir_mutator_with_analyzer.h"
 #include "ir_utils.h"
 
 namespace tvm {
@@ -175,16 +174,12 @@ class VarTouchedAnalysis : public StmtVisitor {
 
 // Inject virtual thread loop
 // rewrite the buffer access pattern when necessary.
-class VTInjector : public arith::IRMutatorWithAnalyzer {
+class VTInjector : public StmtExprMutator {
  public:
-  using IRMutatorWithAnalyzer::VisitExpr_;
-  using IRMutatorWithAnalyzer::VisitStmt_;
-
   // constructor
-  VTInjector(arith::Analyzer* analyzer, Var var, int num_threads,
-             const std::unordered_set<const VarNode*>& touched_var, bool allow_share)
-      : IRMutatorWithAnalyzer(analyzer),
-        var_(var),
+  VTInjector(Var var, PrimExpr num_threads, const std::unordered_set<const VarNode*>& touched_var,
+             bool allow_share)
+      : var_(var),
         num_threads_(num_threads),
         touched_var_(touched_var),
         allow_share_(allow_share) {}
@@ -210,7 +205,7 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
     return GetRef<PrimExpr>(op);
   }
   PrimExpr RewriteIndex(PrimExpr index, PrimExpr alloc_extent) const {
-    return analyzer_->Simplify(index + var_ * alloc_extent);
+    return index + var_ * alloc_extent;
   }
   // Expression.
   PrimExpr VisitExpr_(const CallNode* op) final {
@@ -258,7 +253,7 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
     auto it = alloc_remap_.find(node->buffer->data.get());
     if (it != alloc_remap_.end()) {
       ICHECK_EQ(node->indices.size(), 1)
-          << "InjectVirtualThread expects rewritten allocations to be flat memory.";
+          << "InjectVirtualThread expects rewritten buffer accesses to be flat memory.";
       auto writer = node.CopyOnWrite();
       writer->buffer = GetRemappedBuffer(node->buffer, it->second);
       writer->indices = {RewriteIndex(node->indices[0], it->second)};
@@ -276,7 +271,7 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
 
     ICHECK_EQ(buf->shape.size(), 1) << "Expected buffers being rewritten to already be flattened.";
     auto writer = buf.CopyOnWrite();
-    writer->shape = {buf->shape[0] * alloc_extent};
+    writer->shape = {buf->shape[0] * num_threads_};
 
     buf_remap_[key] = buf;
     return buf;
@@ -378,17 +373,21 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
   }
   // Allocate
   Stmt VisitStmt_(const AllocateNode* op) final {
-    Allocate node = GetRef<Allocate>(op);
-
     PrimExpr condition = this->VisitExpr(op->condition);
-
-    Array<PrimExpr> extents =
-        op->extents.Map([this](const PrimExpr& extent) { return this->VisitExpr(extent); });
-
     if (visit_touched_var_ && !vt_loop_injected_) {
       return InjectVTLoop(GetRef<Stmt>(op), true);
     }
 
+    bool changed = false;
+    Array<PrimExpr> extents;
+    for (size_t i = 0; i < op->extents.size(); ++i) {
+      PrimExpr new_ext = this->VisitExpr(op->extents[i]);
+      if (visit_touched_var_ && !vt_loop_injected_) {
+        return InjectVTLoop(GetRef<Stmt>(op), true);
+      }
+      if (!new_ext.same_as(op->extents[i])) changed = true;
+      extents.push_back(new_ext);
+    }
     visit_touched_var_ = false;
 
     // Rewrite the buffer if its shape or any value stored in it
@@ -396,15 +395,12 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
     // then the buffer is always rewritten, even if separate virtual
     // threads only read from the buffer.
     if (touched_var_.count(op->buffer_var.get()) || !allow_share_) {
-      // place v on highest dimension.
-
-      // TODO(Lunderberg): Move pass to apply before
-      // StorageFlatten/FlattenBuffer.  Would rewrite the Buffer to
-      // add the injected virtual thread as the first index.
-      ICHECK_EQ(extents.size(), 1)
-          << "InjectVirtualThread expects rewritten allocations to be flat memory.";
-      PrimExpr stride = extents[0];
+      PrimExpr stride = make_const(DataType::Int(32), 1);
+      for (const PrimExpr& extent : extents) {
+        stride = stride * extent;
+      }
       extents = {stride * num_threads_};
+      changed = true;
 
       // Mark the buffer var as touched.  BufferLoad/BufferStore should
       // access locations at `current_index + stride*vthread_var`.
@@ -414,8 +410,7 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
     // Mutate the body.  Depends on alloc_remap_.
     auto body = this->VisitStmt(op->body);
 
-    if (extents.same_as(op->extents) && body.same_as(op->body) &&
-        condition.same_as(op->condition)) {
+    if (!changed && body.same_as(op->body) && condition.same_as(op->condition)) {
       return GetRef<Stmt>(op);
     } else {
       return Allocate(op->buffer_var, op->dtype, extents, condition, body);
@@ -436,19 +431,20 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
     vt_loop_injected_ = false;
     visit_touched_var_ = false;
     // only unroll if number of vthreads are small
-    if (max_loop_depth_ == 0 && num_threads_ < 16) {
+    const auto* nthreads_const = num_threads_.as<IntImmNode>();
+    if (max_loop_depth_ == 0 && nthreads_const && nthreads_const->value < 16) {
       // do unrolling if it is inside innermost content.
       Array<Stmt> seq;
-      for (int i = 0; i < num_threads_; ++i) {
+      for (int i = 0; i < nthreads_const->value; ++i) {
         seq.push_back(Substitute(stmt, {{var_, make_const(var_.dtype(), i)}}));
       }
       return SeqStmt::Flatten(seq);
     } else {
       // insert a for loop
       Var idx(var_->name_hint + ".s", var_->dtype);
-      stmt = Substitute(stmt, {{var_, idx}});
-      return For(idx, make_zero(idx.dtype()), make_const(idx.dtype(), num_threads_),
-                 ForKind::kSerial, stmt);
+      Map<Var, PrimExpr> values{{var_, idx}};
+      stmt = Substitute(stmt, values);
+      return For(idx, make_zero(idx.dtype()), num_threads_, ForKind::kSerial, stmt);
     }
   }
 
@@ -456,7 +452,7 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
   // vthread variable
   Var var_;
   // the threads/lanes
-  int num_threads_;
+  PrimExpr num_threads_;
   // whether the loop is already injected.
   bool vt_loop_injected_{false};
   // whether current expression get touched.
@@ -486,10 +482,9 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
   std::unordered_map<const BufferNode*, Buffer> buf_remap_;
 };
 
-class VirtualThreadInjector : public arith::IRMutatorWithAnalyzer {
+class VirtualThreadInjector : public StmtMutator {
  public:
-  using IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
-  using IRMutatorWithAnalyzer::VisitStmt_;
+  using StmtMutator::VisitStmt_;
 
   Stmt VisitStmt_(const AttrStmtNode* op) final {
     Stmt stmt = StmtMutator::VisitStmt_(op);
@@ -497,10 +492,9 @@ class VirtualThreadInjector : public arith::IRMutatorWithAnalyzer {
     if (op->attr_key == attr::virtual_thread) {
       IterVar iv = Downcast<IterVar>(op->node);
       bool allow_share = std::string(iv->thread_tag).substr(0, 7) == "vthread";
-      int nthread = static_cast<int>(op->value.as<IntImmNode>()->value);
       VarTouchedAnalysis vs;
       auto touched = vs.TouchedVar(op->body, iv->var.get());
-      VTInjector injector(analyzer_, iv->var, nthread, touched, allow_share);
+      VTInjector injector(iv->var, op->value, touched, allow_share);
       return injector(op->body);
     } else {
       return stmt;
@@ -517,10 +511,7 @@ namespace transform {
 Pass InjectVirtualThread() {
   auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
     auto* n = f.CopyOnWrite();
-
-    arith::Analyzer analyzer;
-
-    n->body = VirtualThreadInjector(&analyzer)(std::move(n->body));
+    n->body = VirtualThreadInjector()(std::move(n->body));
     n->body = ConvertSSA(std::move(n->body));
     return f;
   };

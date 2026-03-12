@@ -204,7 +204,7 @@ void InferRootBound(const Stage& stage, const GraphContext& ctx,
   stage->op->GatherBound(stage->op, tmap, rmap);
 }
 
-Map<IterVar, Range> InferBound(const Schedule& sch) {
+Map<IterVar, Range> InferBound(const Schedule& sch, arith::VarContext* vcontext) {
 
 
   // 1. Context 준비
@@ -255,7 +255,7 @@ Map<IterVar, Range> InferBound(const Schedule& sch) {
     }
 
     // 아래 축으로 범위 전파
-    PassDownDomain(stage, &ret, &analyzer);
+    PassDownDomain(stage, &ret, &analyzer, false, vcontext);
 
     // thread bind 축은 범위가 정해져 있기 때문에 그대로 추가
     for (IterVar iv : stage->env_threads) {    // env_threads : thread bind된 IterVar들
@@ -276,7 +276,11 @@ Map<IterVar, Range> InferBound(const Schedule& sch) {
   return Map<IterVar, Range>(ret.begin(), ret.end());
 }
 
-TVM_REGISTER_GLOBAL("schedule.InferBound").set_body_typed(InferBound);
+Map<IterVar, Range> InferBound(const Schedule& sch) { return InferBound(sch, nullptr); }
+
+TVM_REGISTER_GLOBAL("schedule.InferBound").set_body_typed([](Schedule sch) {
+  return InferBound(sch);
+});
 
 }  // namespace te
 }  // namespace tvm

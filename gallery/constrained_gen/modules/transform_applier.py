@@ -20,6 +20,23 @@ class TransformApplier:
     def __init__(self, sym_state):
         self.s = sym_state
 
+    @staticmethod
+    def _clamp_positive_split_extent(sym_ext, tosplit_extent):
+        """Split extent clamp for strictly-positive extents.
+
+        Split factors and loop extents in this path are positive. When either
+        side is the concrete constant 1, the clamped extent is also exactly 1,
+        so avoid materializing symbolic forms like min(sp_i_j,1).
+        """
+        if sym_ext is None or tosplit_extent is None:
+            return sym_ext if tosplit_extent is None else tosplit_extent
+
+        sym_val = sym_ext.val if isinstance(sym_ext, SymExpr) else sym_ext
+        clamp_val = tosplit_extent.val if isinstance(tosplit_extent, SymExpr) else tosplit_extent
+        if sym_val == 1 or clamp_val == 1:
+            return SymExpr(1)
+        return SymExpr.min(sym_ext, tosplit_extent)
+
     def apply_steps(self, state):
         """모든 transform steps를 순차 적용."""
         self.s._state = state
@@ -388,7 +405,7 @@ class TransformApplier:
                 name = f"{orig_iter.name}.{len(lengths) - i}"
                 sym_ext = sym_lengths[li]
                 if tosplit_extent is not None:
-                    sym_ext = SymExpr.min(sym_ext, tosplit_extent)
+                    sym_ext = self._clamp_positive_split_extent(sym_ext, tosplit_extent)
                 outs.append(SymIter(name, sym_ext, annotation=0, iter_kind=orig_iter.iter_kind))
                 if tosplit_extent is not None:
                     tosplit_extent = SymExpr.ceildiv(tosplit_extent, sym_ext)
@@ -402,7 +419,7 @@ class TransformApplier:
                 name = f"{orig_iter.name}.{i}"
                 sym_ext = sym_lengths[i]
                 if tosplit_extent is not None:
-                    sym_ext = SymExpr.min(sym_ext, tosplit_extent)
+                    sym_ext = self._clamp_positive_split_extent(sym_ext, tosplit_extent)
                 outs.append(SymIter(name, sym_ext, annotation=0, iter_kind=orig_iter.iter_kind))
                 if tosplit_extent is not None:
                     tosplit_extent = SymExpr.ceildiv(tosplit_extent, sym_ext)
@@ -474,7 +491,7 @@ class TransformApplier:
             name = f"{orig_iter.name}.{len(extracted) - i}"
             sym_ext = sym_lengths[li]
             if tosplit_extent is not None:
-                sym_ext = SymExpr.min(sym_ext, tosplit_extent)
+                sym_ext = self._clamp_positive_split_extent(sym_ext, tosplit_extent)
             outs.append(SymIter(name, sym_ext, annotation=0, iter_kind=orig_iter.iter_kind))
             if tosplit_extent is not None:
                 tosplit_extent = SymExpr.ceildiv(tosplit_extent, sym_ext)

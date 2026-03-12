@@ -11,6 +11,8 @@ from tvm.auto_scheduler.measure_record import load_record_from_string, dump_reco
 
 # ─── ScheduleToModule + GPU passes ───
 _s2m = tvm.get_global_func("driver.schedule_to_module")
+_verify_gpu_code = tvm.get_global_func("tir.analysis.verify_gpu_code")
+_verify_gpu_code_errors = tvm.get_global_func("tir.analysis.verify_gpu_code_errors")
 
 GPU_PASSES = tvm.transform.Sequential(
     [
@@ -48,12 +50,37 @@ def verify_gpu_module(mod, constraints=None):
     """Lowered IRModule에 대해 tir.analysis.verify_gpu_code로 GPU 제약 확인."""
     if constraints is None:
         constraints = GPU_VERIFY_CONSTRAINTS
-    verify_fn = tvm.get_global_func("tir.analysis.verify_gpu_code")
     for _, f in mod.functions.items():
         if isinstance(f, tvm.tir.PrimFunc):
-            if not verify_fn(f, constraints):
+            if not _verify_gpu_code(f, constraints):
                 return False
     return True
+
+
+def verify_gpu_func_errors(func, constraints=None):
+    """PrimFunc 하나에 대해 verify_gpu_code의 상세 violation 문자열을 반환."""
+    if constraints is None:
+        constraints = GPU_VERIFY_CONSTRAINTS
+    return [str(err) for err in _verify_gpu_code_errors(func, constraints)]
+
+
+def verify_gpu_module_errors(mod, constraints=None):
+    """Lowered IRModule 전체에 대해 verify_gpu_code violation 문자열을 반환."""
+    if constraints is None:
+        constraints = GPU_VERIFY_CONSTRAINTS
+    errors = []
+    for gv, func in mod.functions.items():
+        if not isinstance(func, tvm.tir.PrimFunc):
+            continue
+        func_errors = verify_gpu_func_errors(func, constraints)
+        if len(func_errors) <= 1:
+            errors.extend(func_errors)
+            continue
+        prefix = f"{gv.name_hint}: "
+        errors.extend(
+            [msg if msg.startswith(prefix) else f"{prefix}{msg}" for msg in func_errors]
+        )
+    return errors
 
 
 def params_to_state(task, base_inp, base_res, params):
@@ -80,3 +107,8 @@ def params_to_state(task, base_inp, base_res, params):
     patched_str = json.dumps(record)
     new_inp, _ = load_record_from_string(patched_str)
     return new_inp.state
+
+
+def params_to_lowered_gpu_module(task, base_inp, base_res, params):
+    """Concrete params를 적용해 GPU verify pass까지 거친 IRModule을 반환."""
+    return lower_with_gpu_passes(task, params_to_state(task, base_inp, base_res, params))
