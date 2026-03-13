@@ -18,6 +18,7 @@
 ## Findings
 
 - Confirmed issue kinds:
+- Likely root-cause ownership: `<integrator-owned|specialist-owned|inconclusive>`
 - Representative examples:
 - Missing or weak evidence:
 

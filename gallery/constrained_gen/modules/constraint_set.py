@@ -539,9 +539,50 @@ class ConstraintSet:
         if isinstance(node, PrimExprNode):
             text = str(node).replace("T.min(", "min(").replace("T.max(", "max(")
             try:
-                return parse_expr_tree(text)
+                node = parse_expr_tree(text)
             except ValueError:
                 return None
+        return self._normalize_legal_product_tree(node)
+
+    def _normalize_legal_product_tree(self, node):
+        g = self.gen
+        if isinstance(node, MinNode):
+            left = self._normalize_legal_product_tree(node.left)
+            right = self._normalize_legal_product_tree(node.right)
+            if isinstance(left, VarNode) and left.name in g._vthread_clamped_sp_names:
+                return left
+            if isinstance(right, VarNode) and right.name in g._vthread_clamped_sp_names:
+                return right
+            return MinNode(left, right)
+        if isinstance(node, MulNode):
+            return MulNode(
+                self._normalize_legal_product_tree(node.left),
+                self._normalize_legal_product_tree(node.right),
+            )
+        if isinstance(node, AddNode):
+            return AddNode(
+                self._normalize_legal_product_tree(node.left),
+                self._normalize_legal_product_tree(node.right),
+            )
+        if isinstance(node, SubNode):
+            return SubNode(
+                self._normalize_legal_product_tree(node.left),
+                self._normalize_legal_product_tree(node.right),
+            )
+        if isinstance(node, CeilDivNode):
+            return CeilDivNode(
+                self._normalize_legal_product_tree(node.left),
+                self._normalize_legal_product_tree(node.right),
+            )
+        if isinstance(node, ScaleMulNode):
+            return ScaleMulNode(
+                self._normalize_legal_product_tree(node.child),
+                node.scale,
+            )
+        if isinstance(node, SumNode):
+            return SumNode([self._normalize_legal_product_tree(child) for child in node.children])
+        if isinstance(node, MaxNode):
+            return MaxNode([self._normalize_legal_product_tree(child) for child in node.children])
         return node
 
     def _extract_product_form_vars(self, node):
@@ -768,7 +809,7 @@ class ConstraintSet:
                 continue
             for factor in self._flatten_mul_nodes(tree):
                 if isinstance(factor, MinNode) and isinstance(factor.left, VarNode):
-                    if re.fullmatch(r"sp_\\d+_\\d+", factor.left.name):
+                    if re.fullmatch(r"sp_\d+_\d+", factor.left.name):
                         names.add(factor.left.name)
         return names
 
@@ -1286,13 +1327,19 @@ class ConstraintSet:
         if 'max_vthread' in g._enabled:
             c = self.build_max_vthread_constraints()
             for item in c['items']:
+                product_meta = self._extract_product_form_meta(item['tree'])
+                display_text = str(item['sym_extent'])
+                if product_meta is not None and int(product_meta['scale']) == 1:
+                    factors = list(product_meta['factors'])
+                    if factors:
+                        display_text = " * ".join(factors)
                 _add_constraint(
                     item['tree'],
                     item['limit'],
                     'max_vthread',
                     item['desc'],
                     is_upper=True,
-                    display_text=str(item['sym_extent']),
+                    display_text=display_text,
                     alias_entries=item.get('alias_entries'),
                 )
 

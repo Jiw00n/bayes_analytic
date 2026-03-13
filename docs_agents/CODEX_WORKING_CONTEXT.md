@@ -141,6 +141,7 @@ This is the main script for confirming whether generated schedules survive concr
   - owns cross-module decisions
   - owns final edits in `modules/schedule_generator.py` and `modules/param_sampler.py`
   - may edit `modules/var_order_planner.py` when generator logic requires it
+  - is not the default first investigator for reviewer-confirmed issues that remain inside specialist-owned symbolic or lowering paths
 - `validator`
   - owns `validate_exact_gpu_constraints.py`
   - owns `validate_projected_gpu_generation.py`
@@ -153,10 +154,12 @@ This is the main script for confirming whether generated schedules survive concr
   - owns `analyze_exact_case_dedupe_generalization.py`
   - owns `select_representative_projected_sketches.py`
   - reviews validator artifacts before escalation
+  - classifies likely root-cause ownership as integrator-owned, specialist-owned, or inconclusive
 - `specialist`
   - owns deeper root-cause analysis after validator reproduces an issue and reviewer confirms it
   - covers both projected/pruning false-reject investigation and exact-vs-concrete lowering mismatch analysis
   - works in `modules/constraint_set.py`, `modules/domain_propagator.py`, `modules/tvm_verify.py`, `modules/exact_gpu_constraints.py`, and `src/auto_scheduler/exact_gpu_constraints.cc`
+  - is the default next investigation owner for reviewer-confirmed issues in those paths
 - `optimizer`
   - optional role for explicit profiling and performance work
   - owns `profile_schedule_generator_timing.py`, `generate.py`, and `measure_programs.py` for performance investigation
@@ -167,6 +170,7 @@ This is the main script for confirming whether generated schedules survive concr
 - verify claims against current code before planning
 - do not let two active sessions edit the same file at the same time
 - only activate the optimizer role when the task explicitly focuses on profiling or performance
+- if reviewer confirms a reproduced issue and the suspected root-cause path stays inside `constraint_set.py`, `domain_propagator.py`, `tvm_verify.py`, `exact_gpu_constraints.py`, or `src/auto_scheduler/exact_gpu_constraints.cc`, spawn `specialist` before routing implementation planning to `integrator` unless the required fix is obviously isolated to `schedule_generator.py` or `param_sampler.py`
 - if a change affects both symbolic pruning semantics and concrete lowering semantics, route the decision through the `integrator` session
 - prefer the smallest reproducible validation shard before any broad rerun
 - require validator artifacts before reviewer sign-off

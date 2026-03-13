@@ -61,6 +61,7 @@ struct SketchParamKey {
     static constexpr const char* min_population = "sample_init_min_population";
     /*! \brief The maximum percentage of measured states in the initial sampling. */
     static constexpr const char* use_measured_ratio = "sample_init_use_measured_ratio";
+    static constexpr const char* no_invalid = "sample_init_no_invalid";
   };
 
   struct EvolutionarySearch {
@@ -138,7 +139,12 @@ class SketchPolicyNode : public SearchPolicyNode {
    */
   Array<State> EvolutionarySearch(const Array<State>& init_populations, int out_size);
 
+  // Init 적용. invalid 검사 없음
+  Array<State> ApplyInitRules(const Array<State>& sketches);
+
+  // 디버깅용
   Array<State> SampleInitPop_Rule_tgt(const Array<State>& sketches, int target_rule);
+
 
 
   static constexpr const char* _type_key = "auto_scheduler.SketchPolicy";

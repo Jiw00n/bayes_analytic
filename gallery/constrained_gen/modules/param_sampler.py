@@ -5,6 +5,61 @@ class ParamSampler:
     def __init__(self, gen):
         self.gen = gen
 
+    def _try_assign_initial_fixed_vars(self, var_order, domains, group_remaining, result):
+        g = self.gen
+        innermost_limit = g.hw['max_innermost_split_factor']
+        progress = True
+
+        while progress:
+            progress = False
+            for name in var_order:
+                if name in result:
+                    continue
+
+                dom = domains.get(name)
+                if isinstance(dom, list):
+                    lo, hi = int(dom[0]), int(dom[1])
+                    if lo != hi:
+                        continue
+                    fixed_value = lo
+                else:
+                    fixed_value = int(dom)
+
+                parts = name.split("_")
+                step_idx = int(parts[1])
+                extent = g._sp_extents.get(step_idx)
+
+                if extent is None:
+                    g.s.sym_map[name] = fixed_value
+                    domains[name] = fixed_value
+                    result[name] = fixed_value
+                    progress = True
+                    continue
+
+                pos = int(parts[2])
+                group_names = g._sp_groups.get(step_idx, [])
+                if any(prev_name not in result for prev_name in group_names[:pos]):
+                    continue
+
+                remaining = group_remaining.get(step_idx, extent)
+                candidates = g.pm._divisors(remaining)
+                if name in g._innermost_names:
+                    candidates = [c for c in candidates if c <= innermost_limit]
+                if fixed_value not in candidates:
+                    continue
+
+                g.s.sym_map[name] = fixed_value
+                domains[name] = fixed_value
+                result[name] = fixed_value
+                group_remaining[step_idx] = (remaining + fixed_value - 1) // fixed_value
+
+                constraint_indices = g._var_constraints.get(name, [])
+                if constraint_indices:
+                    g.domain_propagator.propagate_domain(name, domains)
+                progress = True
+
+        return [name for name in var_order if name not in result]
+
     def _randomize_params_with_order(
         self,
         var_order,
@@ -42,8 +97,15 @@ class ParamSampler:
             for step_idx, ext in g._sp_extents.items():
                 group_remaining[step_idx] = ext
 
+            effective_var_order = self._try_assign_initial_fixed_vars(
+                var_order,
+                domains,
+                group_remaining,
+                result,
+            )
+
             ok = True
-            for name in var_order:
+            for name in effective_var_order:
                 parts = name.split("_")
                 step_idx = int(parts[1])
 

@@ -867,6 +867,7 @@ PopulationGenerationRule::ResultKind InitThreadBind::Apply(SketchPolicyNode* pol
 
   // 현재 state에 대해 bound(유효 범위)를 추론, 새 state로 갱신
   *state = policy->search_task->compute_dag.InferBound(*state);
+  bool no_invalid = static_cast<bool>(GetIntParam(policy->params, SketchParamKey::SampleInitPopulation::no_invalid));
 
   for (int stage_id = (*state)->stages.size() - 1; stage_id >= 0; --stage_id) {
     const Stage& stage = (*state)->stages[stage_id];
@@ -1027,7 +1028,7 @@ PopulationGenerationRule::ResultKind InitThreadBind::Apply(SketchPolicyNode* pol
       }
       const auto& vthread_it = state->fuse(stage_id, to_fuse);
       // vthread extent가 8보다 클 경우 invalid
-      if (GetExtent(vthread_it) > policy->search_task->hardware_params->max_vthread_extent) { // max_vthread_extent : 8
+      if (GetExtent(vthread_it) > policy->search_task->hardware_params->max_vthread_extent && !no_invalid) { // max_vthread_extent : 8
         return ResultKind::kInvalid;
         // LOG(INFO) << "Vthread extent " << GetExtent(vthread_it)
         //           << " is larger than the maximum, invalid.";
@@ -1051,7 +1052,7 @@ PopulationGenerationRule::ResultKind InitThreadBind::Apply(SketchPolicyNode* pol
 
       // thread extent가 warp size보다 작으면 invalid
       if (check_min_thread_extent &&
-          GetExtent(threadidx_it) < policy->search_task->hardware_params->warp_size) {
+          GetExtent(threadidx_it) < policy->search_task->hardware_params->warp_size && !no_invalid) {
         return ResultKind::kInvalid;
         // LOG(INFO) << "Thread extent " << GetExtent(threadidx_it)
         //           << " is smaller than warp size, invalid.";

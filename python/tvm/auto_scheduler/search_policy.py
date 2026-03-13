@@ -191,6 +191,7 @@ class SketchPolicy(SearchPolicy):
         "max_innermost_split_factor": 64,
         "max_vectorize_size": 16,
         "disable_change_compute_location": 0,
+        "sample_init_no_invalid": 0,
     }
 
     def __init__(
@@ -209,6 +210,7 @@ class SketchPolicy(SearchPolicy):
                 if key not in params:
                     params[key] = value
 
+        self.params = params
         self.__init_handle_by_constructor__(
             _ffi_api.SketchPolicy,
             task,
@@ -274,6 +276,29 @@ class SketchPolicy(SearchPolicy):
         states = _ffi_api.SketchPolicyEvolutionarySearch(self, init_populations, out_size)
         return states
     
+    def apply_init_rules(self, sketches):
+        """Apply init rules to the given sketches.
+        This python interface is mainly used for debugging and testing.
+        The actual search is all done in c++.
+
+        Parameters
+        ----------
+        sketches: List[State]
+            The input sketches
+
+        Returns
+        -------
+        states: List[State]
+            The generated states after applying init rules
+        """
+        states = _ffi_api.SketchPolicyApplyInitRules(self, sketches)
+        return states
+    
+    def generate_concrete_sketches(self):
+        sketches = _ffi_api.SketchPolicyGenerateSketches(self)
+        states = _ffi_api.SketchPolicyApplyInitRules(self, sketches)
+        return states
+
     def SampleInitPop_Rule_tgt(self, target_rule):
         states = _ffi_api.SketchPolicySampleInitPop_Rule_tgt(self, target_rule)
         return states

@@ -78,16 +78,19 @@ Every durable note must include:
   - sufficient for specialist escalation
   - insufficient, needs another validator pass
   - no issue confirmed
+- classify likely root-cause ownership as integrator-owned, specialist-owned, or inconclusive
 
 ### Specialist
 
 - write a root-cause note before proposing a broad fix
 - distinguish confirmed root cause from plausible hypothesis
+- treat reviewer-confirmed, escalation-sufficient issues in specialist-owned paths as the default investigation queue
 
 ### Integrator
 
 - write a decision note when accepting a cross-module change, rejecting a proposed direction, or closing an investigation
 - if a non-trivial patch was applied, say whether validator/reviewer follow-up has already happened or is still required
+- do not act as the first-pass investigator for reviewer-confirmed issues in specialist-owned paths unless the needed fix is clearly isolated to `schedule_generator.py` or `param_sampler.py`
 
 ### Optimizer
 

@@ -24,8 +24,9 @@ The main thread should:
 - keep requirements and final decisions in the main context
 - delegate validation execution to `validator`
 - delegate validation review to `reviewer`
-- delegate root-cause analysis to `specialist`
-- use `integrator` when a cross-module implementation or final edit ownership decision is needed
+- delegate root-cause analysis in specialist-owned paths to `specialist`
+- avoid using `integrator` as the default first investigator for reviewer-confirmed issues in `constraint_set.py`, `domain_propagator.py`, `tvm_verify.py`, `exact_gpu_constraints.py`, or `src/auto_scheduler/exact_gpu_constraints.cc`
+- use `integrator` when a cross-module implementation or final edit ownership decision is needed after the root-cause path is clear
 - use `optimizer` only when the task explicitly focuses on profiling or bottleneck reduction
 - avoid doing implementation, validation, and review in the same session when multi-agent orchestration is available
 
@@ -39,6 +40,7 @@ Use prompts like:
 Work on gallery/constrained_gen.
 Keep the main thread focused on decisions and summaries.
 Delegate raw validation execution to validator, validation review to reviewer, and deep root-cause analysis to specialist.
+Do not send reviewer-confirmed specialist-owned failures straight to integrator for first-pass investigation.
 Use integrator only if a final cross-module edit plan or implementation is needed.
 Wait for all delegated work, then summarize the result and next action.
 ```
@@ -49,7 +51,8 @@ For a concrete issue:
 Investigate whether hybrid acceptance is letting invalid schedules through in gallery/constrained_gen.
 Spawn validator to reproduce on the smallest meaningful shard.
 Then spawn reviewer to inspect the validator artifacts and decide whether the evidence is sufficient.
-If reviewer confirms a real issue, spawn specialist to analyze the root cause.
+If reviewer confirms a real issue and the likely root-cause path is specialist-owned, spawn specialist before asking integrator for the implementation plan.
+Use integrator only for the final implementation decision or cross-module edits after the root cause is narrowed.
 Keep final decisions in the main thread.
 ```
 
@@ -73,6 +76,7 @@ Keep final acceptance in the main thread.
 - Do not use `optimizer` for cleanup-only or speculative tuning tasks.
 - Treat `optimizer -> integrator -> validator -> reviewer` as the default chain for non-trivial performance work.
 - Treat `validator -> reviewer -> specialist -> integrator -> validator -> reviewer` as the default chain for correctness bugs that need a fix.
+- If `reviewer` marks a reproduced issue as specialist-owned and escalation-sufficient, `specialist` should be the default next worker instead of `integrator`.
 
 ## Fallback Mode
 

@@ -23,6 +23,7 @@ When opening a new Codex session:
   - multi-session roles, startup prompts, slow-session refresh workflow
 - `CLI_MULTI_AGENT_SETUP.md`
   - project-local Codex multi-agent roles and orchestrator workflow
+  - defines when `specialist` should be used before `integrator`
 - `HANDOFF_WORKFLOW.md`
   - durable documentation rules, naming scheme, and required note contents
   - patch follow-up expectations for validator and reviewer

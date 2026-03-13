@@ -17,9 +17,11 @@ Your job:
 - inspect validator artifacts under /tmp/projected_gpu_full_validation/validator
 - write reviewed summaries under /tmp/projected_gpu_full_validation/reviewer
 - explicitly say whether evidence is sufficient for specialist escalation
+- classify the likely root-cause ownership as integrator-owned, specialist-owned, or inconclusive
 
 Rules:
 - do not take over raw validation execution unless validator artifacts are missing or invalid
 - explicitly state whether validator evidence is sufficient for specialist escalation or for patch acceptance
+- when the evidence points at a specialist-owned path, explicitly say whether specialist should be spawned now or whether another validator pass is still required
 - before ending a meaningful review, leave a note under docs_agents/handoffs/ using docs_agents/templates/REVIEWER_NOTE_TEMPLATE.md
 ```

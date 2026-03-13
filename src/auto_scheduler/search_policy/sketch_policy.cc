@@ -809,6 +809,59 @@ Array<MeasureInput> SketchPolicyNode::PickStatesWithEpsGreedy(const Array<State>
 }
 
 
+Array<State> SketchPolicyNode::ApplyInitRules(const Array<State>& sketches) {
+  // Use this population as the parallel degree to do sampling
+  // int population = GetIntParam(params, SketchParamKey::EvolutionarySearch::population);
+  auto tic_begin = std::chrono::high_resolution_clock::now();
+
+  int fail_ct = 0;
+  Array<State> out_states;
+
+  for (const auto& s : sketches) {
+    int attempt_idx = 0;
+    while(true) {
+      std::mt19937 rand_gen = std::mt19937(rand_gen());
+      State tmp_s = s;
+      bool valid = true;
+      for (const auto& rule : init_rules) {
+        if (rule->Apply(this, &tmp_s, &rand_gen) ==
+            PopulationGenerationRule::ResultKind::kInvalid) {
+          valid = false;
+          break;
+        }
+      }
+      if (valid) {
+        tmp_s = search_task->compute_dag.InferBound(tmp_s);
+        if (tmp_s.defined()) {
+          out_states.push_back(std::move(tmp_s));
+          break;
+        }
+        else {
+          fail_ct++;
+          attempt_idx++;
+          valid = false;
+        }
+      }
+      else {
+        attempt_idx++;
+        tmp_s = s;
+      }
+    }
+  }
+
+
+
+  double duration = std::chrono::duration_cast<std::chrono::duration<double>>(
+                        std::chrono::high_resolution_clock::now() - tic_begin)
+                        .count();
+  StdCout(verbose) << "Sample Initial Population\t#s: " << out_states.size()
+                   << "\tfail_ct: " << fail_ct << "\tTime elapsed: " << std::fixed
+                   << std::setprecision(2) << duration << std::endl;
+  return out_states;
+}
+
+
+
 Array<State> SketchPolicyNode::SampleInitPop_Rule_tgt(const Array<State>& sketches, int target_rule) {
   // Use this population as the parallel degree to do sampling
   int population = 1;
@@ -1021,6 +1074,13 @@ TVM_REGISTER_GLOBAL("auto_scheduler.SketchPolicySampleInitialPopulation")
       Array<State> init_population = policy->SampleInitPopulation(sketches);
       return init_population;
     });
+
+TVM_REGISTER_GLOBAL("auto_scheduler.SketchPolicyApplyInitRules")
+    .set_body_typed([](SketchPolicy policy, Array<State> sketches) {
+      Array<State> valid_concrete_states = policy->ApplyInitRules(sketches);
+      return valid_concrete_states;
+    });
+
 
 TVM_REGISTER_GLOBAL("auto_scheduler.SketchPolicyEvolutionarySearch")
     .set_body_typed([](SketchPolicy policy, Array<State> init_population, int out_size) {

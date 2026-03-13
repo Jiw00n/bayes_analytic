@@ -28,6 +28,7 @@ Use this as the main session in your editor.
 - reads current working docs and current code
 - decides whether a proposed fix belongs in sampler, facade, projected constraints, or lowering
 - owns final edits when multiple modules are involved
+- is not the default first investigator for reviewer-confirmed issues that stay inside specialist-owned symbolic or lowering paths
 - hands post-patch regression or correctness checks to `validator`
 - expects `reviewer` to say whether the validator evidence is sufficient
 
@@ -38,6 +39,7 @@ You are the integrator for gallery/constrained_gen.
 Read AGENTS.md first, then read docs_agents/CODEX_WORKING_CONTEXT.md.
 Your job is to make final decisions and own edits in modules/schedule_generator.py and modules/param_sampler.py when coordination is needed.
 Verify code paths first and treat current code as the only source of truth.
+Do not take first-pass investigation ownership for reviewer-confirmed failures in constraint_set.py, domain_propagator.py, tvm_verify.py, modules/exact_gpu_constraints.py, or src/auto_scheduler/exact_gpu_constraints.cc.
 ```
 
 ### `validator`
@@ -65,6 +67,7 @@ Use this to inspect validation artifacts and decide whether the evidence is stro
 - reviews validator outputs instead of re-owning the same execution loop
 - runs audit or summary scripts over representative or full-shard artifacts
 - produces issue summaries and escalation notes for the integrator or specialist
+- classifies likely root-cause ownership as integrator-owned, specialist-owned, or inconclusive
 
 Suggested opening prompt:
 
@@ -74,6 +77,7 @@ Read AGENTS.md first.
 Then read docs_agents/CODEX_WORKING_CONTEXT.md.
 Focus on audit_non_pruning_correctness.py, refresh_all_sketches_non_pruning_validation.py, analyze_exact_case_dedupe_generalization.py, and select_representative_projected_sketches.py.
 Review validator artifacts under /tmp/projected_gpu_full_validation/validator, write reviewed summaries under /tmp/projected_gpu_full_validation/reviewer, and say explicitly whether the evidence is sufficient for specialist escalation.
+Also classify whether the likely root-cause belongs to integrator-owned generator code, specialist-owned symbolic or lowering code, or is still inconclusive.
 ```
 
 ### `specialist`
@@ -83,6 +87,7 @@ Use this when the issue needs deeper technical analysis beyond straightforward v
 - covers projected upper bounds that are too conservative
 - covers projected/pruning false rejects
 - covers exact symbolic lowering vs concrete lowering mismatch
+- is the default next investigation owner once reviewer confirms a reproduced issue in those paths
 
 Suggested opening prompt:
 
@@ -92,6 +97,7 @@ Read AGENTS.md first.
 Then read docs_agents/CODEX_WORKING_CONTEXT.md.
 Focus on the relevant root-cause path in modules/constraint_set.py, modules/domain_propagator.py, modules/tvm_verify.py, modules/exact_gpu_constraints.py, and src/auto_scheduler/exact_gpu_constraints.cc.
 Produce a minimal repro before suggesting edits, and hand cross-module API decisions back to the integrator. Treat reviewer sign-off as the default gate before deep investigation.
+If reviewer has already marked the issue escalation-sufficient in one of those paths, treat specialist as the default next worker rather than waiting for integrator to investigate first.
 ```
 
 ### `optimizer` (optional)
@@ -128,8 +134,8 @@ Use these default chains unless the task is trivial:
   - `reviewer` decides whether the evidence is sufficient
 - Correctness bug:
   - `validator` reproduces
-  - `reviewer` confirms evidence
-  - `specialist` analyzes root cause when needed
+  - `reviewer` confirms evidence and classifies likely root-cause ownership
+  - `specialist` analyzes root cause for escalation-sufficient specialist-owned paths
   - `integrator` owns final implementation
   - `validator` re-runs the narrow shard
   - `reviewer` signs off on evidence quality

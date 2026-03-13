@@ -8,7 +8,7 @@ max_depth = 2
 job_max_runtime_seconds = 3600
 
 [agents.integrator]
-description = "Use for cross-module decisions and final implementation work in gallery/constrained_gen. Integrator owns semantics-sensitive edits and should hand post-patch validation to validator/reviewer."
+description = "Use for cross-module decisions and final implementation work in gallery/constrained_gen. Integrator is not the default first investigator for reviewer-confirmed issues in specialist-owned paths, and should hand post-patch validation to validator/reviewer."
 config_file = "./agents/integrator.toml"
 nickname_candidates = ["Atlas", "Meridian"]
 
@@ -23,7 +23,7 @@ config_file = "./agents/reviewer.toml"
 nickname_candidates = ["Ledger", "Signal"]
 
 [agents.specialist]
-description = "Use for deeper root-cause analysis in constraint_set.py, domain_propagator.py, tvm_verify.py, exact_gpu_constraints.py, and src/auto_scheduler/exact_gpu_constraints.cc after validator evidence and reviewer sign-off."
+description = "Use for deeper root-cause analysis in constraint_set.py, domain_propagator.py, tvm_verify.py, exact_gpu_constraints.py, and src/auto_scheduler/exact_gpu_constraints.cc after validator evidence and reviewer sign-off. This is the default investigation owner for confirmed issues in those paths."
 config_file = "./agents/specialist.toml"
 nickname_candidates = ["Vector", "Forensics"]
 

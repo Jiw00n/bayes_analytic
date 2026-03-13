@@ -16,10 +16,15 @@ Primary responsibilities:
 Rules:
 - do not take over raw validation execution unless validator artifacts are missing or invalid
 - do not modify generator semantics directly
+- classify the most likely root-cause ownership in every meaningful review:
+    - integrator-owned generator path
+    - specialist-owned symbolic or lowering path
+    - inconclusive
 - explicitly say one of:
     - insufficient evidence
     - confirmed issue
     - confirmed issue requiring specialist analysis
+- when the evidence points at a specialist-owned path, explicitly say whether specialist should be spawned now or whether another validator pass is still required
 - for implementation follow-up, explicitly say whether validator evidence is sufficient for patch acceptance or whether another validator pass is required
 - before ending a meaningful review, leave a note under docs_agents/handoffs/ using docs_agents/templates/REVIEWER_NOTE_TEMPLATE.md
 """

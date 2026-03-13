@@ -266,75 +266,75 @@ def build_network_keys():
     network_keys = []
 
     # resnet_18 and resnet_50
-    for batch_size in [1]:
+    for batch_size in [1, 4, 8]:
         for image_size in [224, 240, 256]:
             for layer in [18, 50]:
                 network_keys.append((f'resnet_{layer}',
                                     [(batch_size, 3, image_size, image_size)]))
 
     # mobilenet_v2
-    for batch_size in [1]:
+    for batch_size in [1, 4, 8]:
         for image_size in [224, 240, 256]:
             for name in ['mobilenet_v2', 'mobilenet_v3']:
                 network_keys.append((f'{name}',
                                     [(batch_size, 3, image_size, image_size)]))
 
     # wide-resnet
-    for batch_size in [1]:
+    for batch_size in [1, 4, 8]:
         for image_size in [224, 240, 256]:
             for layer in [50]:
                 network_keys.append((f'wide_resnet_{layer}',
                                     [(batch_size, 3, image_size, image_size)]))
 
     # resnext
-    for batch_size in [1]:
+    for batch_size in [1, 4, 8]:
         for image_size in [224, 240, 256]:
             for layer in [50]:
                 network_keys.append((f'resnext_{layer}',
                                     [(batch_size, 3, image_size, image_size)]))
 
     # inception-v3
-    for batch_size in [1]:
+    for batch_size in [1, 2, 4]:
         for image_size in [299]:
             network_keys.append((f'inception_v3',
                                 [(batch_size, 3, image_size, image_size)]))
 
     # densenet
-    for batch_size in [1]:
+    for batch_size in [1, 2, 4]:
         for image_size in [224, 240, 256]:
             network_keys.append((f'densenet_121',
                                 [(batch_size, 3, image_size, image_size)]))
 
     # resnet3d
-    for batch_size in [1]:
+    for batch_size in [1, 2, 4]:
         for image_size in [112, 128, 144]:
             for layer in [18]:
                 network_keys.append((f'resnet3d_{layer}',
                                     [(batch_size, 3, image_size, image_size, 16)]))
 
     # bert
-    for batch_size in [1]:
+    for batch_size in [1, 2, 4]:
         for seq_length in [64, 128, 256]:
             for scale in ['tiny', 'base', 'medium', 'large']:
                 network_keys.append((f'bert_{scale}',
                                     [(batch_size, seq_length)]))
 
     # gpt2
-    for batch_size in [1]:
+    for batch_size in [1, 2, 4]:
         for seq_length in [64, 128, 256]:
             for scale in ['tiny', 'base', 'medium']:
                 network_keys.append((f'gpt2_{scale}',
                                     [(batch_size, seq_length)]))
 
     # llama
-    for batch_size in [1]:
+    for batch_size in [1, 2, 4]:
         for seq_length in [64, 128, 256]:
             for scale in ['tiny', 'base', 'medium']:
                 network_keys.append((f'llama_{scale}',
                                     [(batch_size, seq_length)]))
 
     # dcgan
-    for batch_size in [1]:
+    for batch_size in [1, 4, 8]:
         for image_size in [64]:
             network_keys.append((f'dcgan',
                                 [(batch_size, 3, image_size, image_size)]))

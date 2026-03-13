@@ -66,6 +66,7 @@ The project-local Codex role config lives under `.codex/`.
   - Sole owner of `gallery/constrained_gen/modules/param_sampler.py`.
   - May also edit `gallery/constrained_gen/modules/var_order_planner.py` when generator logic requires it.
   - Accepts or rejects cross-cutting proposals from other sessions.
+  - Is not the default first investigator for reviewer-confirmed issues that stay inside specialist-owned symbolic or lowering paths.
 
 - `validator`
   - Owns validation execution and raw artifact production.
@@ -79,11 +80,13 @@ The project-local Codex role config lives under `.codex/`.
   - Works in `gallery/constrained_gen/audit_non_pruning_correctness.py`, `gallery/constrained_gen/refresh_all_sketches_non_pruning_validation.py`, `gallery/constrained_gen/analyze_exact_case_dedupe_generalization.py`, and `gallery/constrained_gen/select_representative_projected_sketches.py`.
   - Reviews validator-produced artifacts before an issue is treated as established.
   - Produces concise issue summaries, mismatch counts, and escalation notes for the integrator or specialist.
+  - Must classify whether the likely root-cause is integrator-owned, specialist-owned, or still inconclusive.
 
 - `specialist`
   - Owns deeper root-cause analysis after validator reproduces an issue and reviewer confirms the evidence is sufficient.
   - Covers both projected/pruning false rejects and exact-vs-concrete lowering mismatches.
   - Works in `gallery/constrained_gen/modules/constraint_set.py`, `gallery/constrained_gen/modules/domain_propagator.py`, `gallery/constrained_gen/modules/tvm_verify.py`, `gallery/constrained_gen/modules/exact_gpu_constraints.py`, and `src/auto_scheduler/exact_gpu_constraints.cc`.
+  - Becomes the default next investigation owner once reviewer confirms a reproduced issue in those paths.
   - Escalates cross-cutting API decisions back to the integrator.
 
 - `optimizer`
@@ -99,6 +102,7 @@ The project-local Codex role config lives under `.codex/`.
 - Do not implement perf-only or cleanup-only changes in the current phase.
 - If a change touches both symbolic pruning and concrete lowering semantics, stop and hand the decision to the integrator.
 - If a validator run does not include a reproducer, treat the report as incomplete.
+- If reviewer confirms a reproduced issue and the suspected root-cause path is specialist-owned, spawn `specialist` before asking `integrator` for the implementation plan unless the required change is clearly isolated to `schedule_generator.py` or `param_sampler.py`.
 - Validator records raw validation outputs under `/tmp/projected_gpu_full_validation/validator/...`.
 - Reviewer records reviewed summaries under `/tmp/projected_gpu_full_validation/reviewer/...`.
 - Optimizer records profiling artifacts under `/tmp/projected_gpu_full_validation/optimizer/...`.
@@ -136,6 +140,7 @@ The project-local Codex role config lives under `.codex/`.
 - If an optimization touches cross-module APIs, acceptance semantics, or exact/concrete correctness behavior, hand implementation ownership back to `integrator`.
 - `validator` validates; it does not provide final approval.
 - `reviewer` approves evidence; it does not silently replace validator execution except when validator artifacts are missing or unusable.
+- `integrator` should not absorb the first-pass investigation of reviewer-confirmed issues in specialist-owned paths just because it can edit cross-module code.
 - If multi-agent orchestration is unavailable and one session must do multiple roles, record that explicitly in the handoff note as `single-session validation only`.
 
 ## Documentation contract

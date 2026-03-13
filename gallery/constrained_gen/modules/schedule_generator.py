@@ -46,13 +46,14 @@ class ScheduleGenerator:
         'max_vthread', 'innermost_split', 'split_structure',
     )
     VAR_ORDER_PHASE_FAMILIES = (
-        ('pure_product_max_threads', 'pure-product upper bound: max_threads'),
-        ('pure_product_max_vthread', 'pure-product upper bound: max_vthread'),
-        ('split_structure_max_threads', 'split_structure: max_threads-linked'),
-        ('split_structure_max_vthread', 'split_structure: max_vthread-linked'),
-        ('scaled_product_upper_bound', 'scaled-product upper bound'),
-        ('non_product_direct_arm', 'non-product direct-arm'),
-        ('non_product_gate_vars', 'non-product gate-vars'),
+        ('execution_max_threads_pure_product', 'execution: max_threads pure-product'),
+        ('execution_max_vthread_pure_product', 'execution: max_vthread pure-product'),
+        ('execution_block_split_structure', 'execution: block extent split_structure'),
+        ('execution_non_product_direct_arm', 'execution: non-product direct-arm'),
+        ('execution_non_product_gate_vars', 'execution: non-product gate-vars'),
+        ('memory_split_structure', 'memory: shared-memory-linked split_structure'),
+        ('instruction_scaled_product_upper_bound', 'instruction: vectorize scaled-product'),
+        ('instruction_non_product_min', 'instruction: vectorize non-product(min)'),
     )
     _FORMAT_WRAP_LIMIT = 100
 
@@ -64,6 +65,7 @@ class ScheduleGenerator:
         task=None,
         base_input=None,
         base_result=None,
+        base_state=None,
     ):
         self.s = sym_state
         self.hw = dict(self.DEFAULT_HW_PARAM)
@@ -73,6 +75,7 @@ class ScheduleGenerator:
         self._task = task
         self._base_input = base_input
         self._base_result = base_result
+        self._base_state = base_state
 
         # 활성 제약 종류
         if enabled_constraints is None:
@@ -196,11 +199,10 @@ class ScheduleGenerator:
         return params
 
     def has_concrete_final_context(self):
-        return (
-            self._task is not None
-            and self._base_input is not None
-            and self._base_result is not None
-        )
+        if self._task is None:
+            return False
+        has_record_context = self._base_input is not None and self._base_result is not None
+        return has_record_context or self._base_state is not None
 
     def get_concrete_final_result(self, sym_map=None):
         if not self.has_concrete_final_context():
@@ -217,17 +219,25 @@ class ScheduleGenerator:
 
         from .tvm_verify import (
             lower_with_gpu_passes,
-            params_to_state,
+            params_to_state_from_record,
+            params_to_state_from_state,
             verify_gpu_module_errors,
         )
 
         try:
-            state = params_to_state(
-                self._task,
-                self._base_input,
-                self._base_result,
-                params,
-            )
+            if self._base_input is not None and self._base_result is not None:
+                state = params_to_state_from_record(
+                    self._task,
+                    self._base_input,
+                    self._base_result,
+                    params,
+                )
+            else:
+                state = params_to_state_from_state(
+                    self._task,
+                    self._base_state,
+                    params,
+                )
             mod = lower_with_gpu_passes(self._task, state)
             violations = verify_gpu_module_errors(mod)
             ok = not violations
@@ -353,9 +363,12 @@ class ScheduleGenerator:
             if include_eval:
                 lhs_val = self._evaluate_display_lhs_value(constraint, sym_map)
                 rhs_val = self._evaluate_display_rhs_value(constraint, sym_map)
-                lines.append(
-                    f"  eval: {lhs_val} {instantiated_record['op']} {rhs_val}"
-                )
+                if lhs_val is None or rhs_val is None:
+                    lines.append("  eval: (partial)")
+                else:
+                    lines.append(
+                        f"  eval: {lhs_val} {instantiated_record['op']} {rhs_val}"
+                    )
         return "\n".join(lines)
 
     def _format_constraint_record_lines(self, record, include_aliases=True, include_vars=False, indent=""):
@@ -553,14 +566,40 @@ class ScheduleGenerator:
             return constraint['rhs']
         if isinstance(rhs, int):
             return rhs
-        return eval_sym_extent(SymExpr(str(rhs)), sym_map)
+        return ScheduleGenerator._evaluate_text_expr(rhs, sym_map)
 
     @staticmethod
     def _evaluate_display_lhs_value(constraint, sym_map):
         display_text = constraint.get('display_text')
         if display_text is None:
-            return constraint['tree'].evaluate(sym_map)
-        return eval_sym_extent(SymExpr(str(display_text)), sym_map)
+            vars_in = constraint['tree'].variables()
+            if any(sym_map.get(name) is None for name in vars_in):
+                return None
+            try:
+                return constraint['tree'].evaluate(sym_map)
+            except Exception:
+                return None
+        return ScheduleGenerator._evaluate_text_expr(display_text, sym_map)
+
+    @staticmethod
+    def _evaluate_text_expr(text, sym_map):
+        normalized = " ".join(str(text).split())
+        try:
+            tree = parse_expr_tree(normalized)
+        except ValueError:
+            tree = None
+        if tree is not None:
+            vars_in = tree.variables()
+            if any(sym_map.get(name) is None for name in vars_in):
+                return None
+            try:
+                return tree.evaluate(sym_map)
+            except Exception:
+                return None
+        evaluated = eval_sym_extent(SymExpr(normalized), sym_map)
+        if isinstance(evaluated, str) and evaluated.startswith("EVAL_FAIL("):
+            return None
+        return evaluated
 
     def _format_stage_iter_extent_lines(self, stage_id, iter_id, extent, indent=""):
         stage = self.s.stages[stage_id]

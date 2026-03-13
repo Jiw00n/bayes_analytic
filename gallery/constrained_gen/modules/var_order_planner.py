@@ -49,6 +49,14 @@ class VarOrderPlanner:
         if 'max_vthread' in g._enabled:
             max_vthread_items = g.constraint_set.build_max_vthread_constraints()['items']
 
+        vectorize_items = []
+        if 'vectorize' in g._enabled:
+            vectorize_items = g.constraint_set.build_vectorize_constraints()['items']
+
+        shared_vars = set()
+        if 'shared_memory' in g._enabled:
+            shared_vars = set(g.constraint_set.build_shared_memory_constraints()['tree'].variables())
+
         (
             scope_infos,
             max_thread_items_by_scope,
@@ -59,119 +67,159 @@ class VarOrderPlanner:
             max_vthread_items,
         )
         if not scope_infos:
-            return []
+            scope_infos = [{
+                'grid_index': 0,
+                'grid_scope': tuple(),
+                'grid_scope_label': f"grid_0: {g.constraint_set._format_block_scope(tuple())}",
+                'is_main_compute_anchor': True,
+            }]
+            max_thread_items_by_scope = {}
+            thread_axis_items_by_scope = {}
+            vthread_items_by_scope = {}
 
         thread_owned_vars = self._build_scope_owned_vars(scope_infos, thread_axis_items_by_scope)
         vthread_owned_vars = self._build_scope_owned_vars(scope_infos, vthread_items_by_scope)
-        scoped_vars = {}
-        for scope_info in scope_infos:
-            scope = scope_info['grid_scope']
-            combined = []
-            g.constraint_set._append_unique_vars(combined, thread_owned_vars.get(scope, []))
-            g.constraint_set._append_unique_vars(combined, vthread_owned_vars.get(scope, []))
-            scoped_vars[scope] = combined
-
-        split_assignments = self._build_split_structure_phase_assignments(
-            scope_infos,
-            thread_owned_vars,
-            vthread_owned_vars,
-        )
         initial_domains = self._build_initial_domains()
         family_labels = dict(g.VAR_ORDER_PHASE_FAMILIES)
         phase_entries = []
+        anchor_scope = next(
+            (info['grid_scope'] for info in scope_infos if info.get('is_main_compute_anchor')),
+            scope_infos[0]['grid_scope'],
+        )
+
+        vectorize_vars = []
+        for item in vectorize_items:
+            g.constraint_set._append_unique_vars(
+                vectorize_vars,
+                g.constraint_set._ordered_unique_tree_variables(item['tree']),
+            )
+        vectorize_var_set = set(vectorize_vars)
+        shared_step_indices = self._collect_step_indices_for_vars(shared_vars)
 
         for scope_info in scope_infos:
             scope = scope_info['grid_scope']
             max_thread_scope_items = max_thread_items_by_scope.get(scope, [])
             max_vthread_scope_items = vthread_items_by_scope.get(scope, [])
-            all_scope_items = max_thread_scope_items + max_vthread_scope_items
+            execution_items = max_thread_scope_items + max_vthread_scope_items
+            execution_owned = []
+            g.constraint_set._append_unique_vars(execution_owned, thread_owned_vars.get(scope, []))
+            g.constraint_set._append_unique_vars(execution_owned, vthread_owned_vars.get(scope, []))
+            execution_owned_set = set(execution_owned)
 
-            phase_entries.append(
-                self._make_phase_entry(
-                    scope_info,
-                    'pure_product_max_threads',
-                    family_labels['pure_product_max_threads'],
-                    self._collect_scoped_product_phase_vars(
-                        max_thread_scope_items,
-                        set(thread_owned_vars.get(scope, [])),
-                        want_scale=1,
-                    ),
-                )
+            thread_pure = self._collect_scoped_product_phase_vars(
+                max_thread_scope_items,
+                set(thread_owned_vars.get(scope, [])),
+                want_scale=1,
             )
-            phase_entries.append(
-                self._make_phase_entry(
-                    scope_info,
-                    'pure_product_max_vthread',
-                    family_labels['pure_product_max_vthread'],
-                    self._collect_scoped_product_phase_vars(
-                        max_vthread_scope_items,
-                        set(vthread_owned_vars.get(scope, [])),
-                        want_scale=1,
-                    ),
-                )
+            vthread_pure = self._collect_scoped_product_phase_vars(
+                max_vthread_scope_items,
+                set(vthread_owned_vars.get(scope, [])),
+                want_scale=1,
             )
-            phase_entries.append(
-                self._make_phase_entry(
-                    scope_info,
-                    'split_structure_max_threads',
-                    family_labels['split_structure_max_threads'],
-                    self._collect_split_phase_vars(
-                        split_assignments,
-                        scope,
-                        'split_structure_max_threads',
-                    ),
+            has_execution_pure_product = bool(thread_pure or vthread_pure)
+
+            if has_execution_pure_product:
+                phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'execution_max_threads_pure_product',
+                        family_labels['execution_max_threads_pure_product'],
+                        thread_pure,
+                    )
                 )
-            )
-            phase_entries.append(
-                self._make_phase_entry(
-                    scope_info,
-                    'split_structure_max_vthread',
-                    family_labels['split_structure_max_vthread'],
-                    self._collect_split_phase_vars(
-                        split_assignments,
-                        scope,
-                        'split_structure_max_vthread',
-                    ),
+                phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'execution_max_vthread_pure_product',
+                        family_labels['execution_max_vthread_pure_product'],
+                        vthread_pure,
+                    )
                 )
-            )
-            phase_entries.append(
-                self._make_phase_entry(
-                    scope_info,
-                    'scaled_product_upper_bound',
-                    family_labels['scaled_product_upper_bound'],
-                    self._collect_scoped_product_phase_vars(
-                        all_scope_items,
-                        set(scoped_vars.get(scope, [])),
-                        want_scale='non_unit',
-                    ),
+                phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'execution_block_split_structure',
+                        family_labels['execution_block_split_structure'],
+                        self._collect_split_phase_vars_for_steps(
+                            self._collect_step_indices_for_vars(execution_owned_set),
+                            inner_first=True,
+                        ),
+                    )
                 )
-            )
-            phase_entries.append(
-                self._make_phase_entry(
-                    scope_info,
-                    'non_product_direct_arm',
-                    family_labels['non_product_direct_arm'],
-                    self._collect_non_product_phase_vars(
-                        all_scope_items,
-                        set(scoped_vars.get(scope, [])),
-                        initial_domains,
-                        want_gate=False,
-                    ),
+            else:
+                phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'execution_non_product_direct_arm',
+                        family_labels['execution_non_product_direct_arm'],
+                        self._collect_non_product_phase_vars(
+                            execution_items,
+                            execution_owned_set,
+                            initial_domains,
+                            want_gate=False,
+                        ),
+                    )
                 )
-            )
-            phase_entries.append(
-                self._make_phase_entry(
-                    scope_info,
-                    'non_product_gate_vars',
-                    family_labels['non_product_gate_vars'],
-                    self._collect_non_product_phase_vars(
-                        all_scope_items,
-                        set(scoped_vars.get(scope, [])),
-                        initial_domains,
-                        want_gate=True,
-                    ),
+                phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'execution_non_product_gate_vars',
+                        family_labels['execution_non_product_gate_vars'],
+                        self._collect_non_product_phase_vars(
+                            execution_items,
+                            execution_owned_set,
+                            initial_domains,
+                            want_gate=True,
+                        ),
+                    )
                 )
-            )
+
+            if scope == anchor_scope:
+                phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'memory_split_structure',
+                        family_labels['memory_split_structure'],
+                        self._collect_split_phase_vars_for_steps(
+                            shared_step_indices,
+                            inner_first=True,
+                        ),
+                    )
+                )
+                vector_scaled = self._collect_scoped_product_phase_vars(
+                    vectorize_items,
+                    vectorize_var_set,
+                    want_scale='non_unit',
+                )
+                phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'instruction_scaled_product_upper_bound',
+                        family_labels['instruction_scaled_product_upper_bound'],
+                        vector_scaled,
+                    )
+                )
+                vector_non_product = []
+                for item in vectorize_items:
+                    meta = g.constraint_set._extract_product_form_meta(item['tree'])
+                    if meta is not None and int(meta['scale']) != 1:
+                        continue
+                    g.constraint_set._append_unique_vars(
+                        vector_non_product,
+                        [
+                            name
+                            for name in g.constraint_set._ordered_unique_tree_variables(item['tree'])
+                            if name in vectorize_var_set and name not in vector_scaled
+                        ],
+                    )
+                phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'instruction_non_product_min',
+                        family_labels['instruction_non_product_min'],
+                        vector_non_product,
+                    )
+                )
 
         return phase_entries
 
@@ -291,10 +339,11 @@ class VarOrderPlanner:
                 continue
             if want_scale == 'non_unit' and scale == 1:
                 continue
-            filtered = [
-                name for name in g.constraint_set._ordered_unique_tree_variables(item['tree'])
-                if name in candidate_var_names
-            ]
+            filtered = []
+            for name in meta['factors']:
+                if name not in candidate_var_names or name in filtered:
+                    continue
+                filtered.append(name)
             if filtered:
                 g.constraint_set._append_unique_vars(ordered, filtered)
         return ordered
@@ -425,11 +474,22 @@ class VarOrderPlanner:
                 g.constraint_set._append_unique_vars(ordered, phase_vars)
         return ordered
 
-    def _collect_split_phase_vars(self, assignments, scope, family):
+    def _collect_step_indices_for_vars(self, var_names):
+        g = self.gen
+        target = set(var_names)
+        step_indices = []
+        for step_idx, names in sorted(g._sp_groups.items()):
+            if any(name in target for name in names):
+                step_indices.append(step_idx)
+        return step_indices
+
+    def _collect_split_phase_vars_for_steps(self, step_indices, inner_first=False):
         g = self.gen
         ordered = []
-        for step_idx in assignments.get((scope, family), []):
-            g.constraint_set._append_unique_vars(ordered, g._sp_groups.get(step_idx, []))
+        for step_idx in step_indices:
+            group = list(g._sp_groups.get(step_idx, []))
+            group.sort(key=lambda name: int(name.split("_")[2]), reverse=inner_first)
+            g.constraint_set._append_unique_vars(ordered, group)
         return ordered
 
     def _compute_legacy_var_order(self):
