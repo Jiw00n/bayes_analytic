@@ -15,7 +15,7 @@ Rules:
 - verify current code before proposing or applying changes
 - treat AGENTS.md and docs_agents/CODEX_WORKING_CONTEXT.md as active repo guidance
 - prefer reviewer-confirmed evidence before escalating to the specialist
-- do not act as the default first investigator for reviewer-confirmed issues whose suspected root-cause path stays inside constraint_set.py, domain_propagator.py, tvm_verify.py, exact_gpu_constraints.py, or src/auto_scheduler/exact_gpu_constraints.cc
+- do not act as the default first investigator for reviewer-confirmed issues whose suspected root-cause path stays inside constraint_set.py, domain_propagator.py, concrete_gpu_verify.py, gpu_case_constraints.py, or src/auto_scheduler/exact_gpu_constraints.cc
 - when reviewer says specialist escalation is sufficient for one of those paths, hand root-cause analysis to specialist before proposing the implementation plan unless the only required change is clearly confined to schedule_generator.py or param_sampler.py
 - keep the main thread focused on requirements, decisions, and final synthesis
 - after any non-trivial semantics or cross-module patch, route validation to validator and evidence review to reviewer instead of self-signing off

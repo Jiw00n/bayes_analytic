@@ -35,10 +35,12 @@ class SymExpr:
     연산(ceil div, mul 등)을 문자열로 합성.
     """
     def __init__(self, val):
+        """값(정수 또는 심볼릭 문자열)으로 SymExpr를 만든다."""
         self.val = val
 
     @property
     def is_concrete(self):
+        """값이 정수면 True, 심볼릭이면 False."""
         return isinstance(self.val, int)
 
     def __repr__(self):
@@ -54,6 +56,7 @@ class SymExpr:
 
     @staticmethod
     def ceildiv(a, b):
+        """올림 나눗셈; 둘 다 정수면 정수, 아니면 ceil(a/b) 심볼 문자열."""
         if isinstance(a, SymExpr): a = a.val
         if isinstance(b, SymExpr): b = b.val
         if isinstance(a, int) and isinstance(b, int):
@@ -86,6 +89,7 @@ class SymExpr:
 
     @staticmethod
     def mul(a, b):
+        """곱셈; 둘 다 정수면 정수, 아니면 심볼릭 곱 문자열."""
         if isinstance(a, SymExpr): a = a.val
         if isinstance(b, SymExpr): b = b.val
         if isinstance(a, int) and isinstance(b, int):
@@ -102,6 +106,7 @@ class SymExpr:
 
     @staticmethod
     def product(items):
+        """여러 항목을 순서대로 곱한 SymExpr를 반환한다."""
         result = SymExpr(1)
         for item in items:
             result = SymExpr.mul(result, item)
@@ -109,7 +114,7 @@ class SymExpr:
 
     @staticmethod
     def min(a, b):
-        """min(a, b) — both concrete → int min, otherwise symbolic min string."""
+        """두 값의 최소; 둘 다 정수면 정수, 아니면 min(...,...) 심볼 문자열."""
         if a is None or b is None:
             return a if b is None else b
         if isinstance(a, SymExpr): a_val = a.val
@@ -122,7 +127,7 @@ class SymExpr:
 
     @staticmethod
     def max(items):
-        """max(items...) — all concrete면 int max, 아니면 symbolic max string."""
+        """여러 항목의 최대; 전부 정수면 정수, 아니면 max(...,...) 심볼 문자열."""
         vals = []
         for item in items:
             if item is None:
@@ -140,12 +145,14 @@ class SymExpr:
 class SymIter:
     """Iterator (C++ Iterator 대응)"""
     def __init__(self, name, extent, annotation=0, iter_kind=0):
+        """심볼릭 이터레이터(이름, extent, 어노테이션, iter_kind)를 만든다."""
         self.name = name
         self.extent = extent         # SymExpr or None
         self.annotation = annotation # int
         self.iter_kind = iter_kind   # int
 
     def clone(self):
+        """이 SymIter의 복사본을 반환한다."""
         return SymIter(self.name,
                        SymExpr(self.extent.val) if self.extent else None,
                        self.annotation, self.iter_kind)
@@ -162,6 +169,7 @@ class SymStage:
     """Stage (C++ Stage 대응)"""
     def __init__(self, op_name, op_type, iters, compute_at=CA_ROOT,
                  auto_unroll_max_step=None, storage_offset=0, dtype="float32"):
+        """심볼릭 스테이지(op명, 타입, 이터 목록, compute_at 등)를 만든다."""
         self.op_name = op_name
         self.op_type = op_type
         self.iters = list(iters)
@@ -173,6 +181,7 @@ class SymStage:
         self.dtype = dtype
 
     def clone(self):
+        """이 SymStage의 복사본을 반환한다."""
         cloned = SymStage(
             self.op_name,
             self.op_type,
@@ -196,7 +205,7 @@ class SymStage:
 
 
 def eval_sym_extent(expr, sym_map):
-    """SymExpr의 문자열을 sym_map으로 치환하여 eval로 계산."""
+    """심볼 extent 문자열을 sym_map으로 치환한 뒤 계산해 정수 또는 실패 시 문자열을 반환한다."""
     if expr is None:
         return None
     s_val = str(expr)

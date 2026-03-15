@@ -34,11 +34,14 @@ Use concrete code paths before proposing changes.
 - `gallery/constrained_gen/modules/param_sampler.py`
 - `gallery/constrained_gen/modules/constraint_set.py`
 - `gallery/constrained_gen/modules/domain_propagator.py`
-- `gallery/constrained_gen/modules/projected_gpu_validation.py`
-- `gallery/constrained_gen/validate_exact_gpu_constraints.py`
-- `gallery/constrained_gen/validate_projected_gpu_generation.py`
-- `gallery/constrained_gen/modules/tvm_verify.py`
+- `gallery/constrained_gen/modules/gpu_projection_constraints.py`
+- `gallery/constrained_gen/modules/gpu_projection_diagnostics.py`
+- `gallery/constrained_gen/validate.py`
+- `gallery/constrained_gen/generate_programs.py`
+- `gallery/constrained_gen/measure_programs.py`
+- `gallery/constrained_gen/modules/concrete_gpu_verify.py`
 - `src/auto_scheduler/exact_gpu_constraints.cc`
+- `src/auto_scheduler/projected_gpu_constraints.cc`
 
 ## Current codebase caveat
 
@@ -70,7 +73,7 @@ The project-local Codex role config lives under `.codex/`.
 
 - `validator`
   - Owns validation execution and raw artifact production.
-  - Works in `gallery/constrained_gen/validate_exact_gpu_constraints.py`, `gallery/constrained_gen/validate_projected_gpu_generation.py`, and `gallery/constrained_gen/modules/projected_gpu_validation.py`.
+  - Works in `gallery/constrained_gen/validate.py`, `gallery/constrained_gen/generate_programs.py`, `gallery/constrained_gen/measure_programs.py`, and `gallery/constrained_gen/modules/gpu_projection_diagnostics.py` when producing raw execution artifacts and repro outputs.
   - Reproduces issues before proposing fixes.
   - Writes raw validation artifacts under `/tmp/projected_gpu_full_validation/validator/...`.
   - Should not modify generator semantics directly.
@@ -85,7 +88,7 @@ The project-local Codex role config lives under `.codex/`.
 - `specialist`
   - Owns deeper root-cause analysis after validator reproduces an issue and reviewer confirms the evidence is sufficient.
   - Covers both projected/pruning false rejects and exact-vs-concrete lowering mismatches.
-  - Works in `gallery/constrained_gen/modules/constraint_set.py`, `gallery/constrained_gen/modules/domain_propagator.py`, `gallery/constrained_gen/modules/tvm_verify.py`, `gallery/constrained_gen/modules/exact_gpu_constraints.py`, and `src/auto_scheduler/exact_gpu_constraints.cc`.
+  - Works in `gallery/constrained_gen/modules/constraint_set.py`, `gallery/constrained_gen/modules/domain_propagator.py`, `gallery/constrained_gen/modules/concrete_gpu_verify.py`, `gallery/constrained_gen/modules/gpu_projection_constraints.py`, `gallery/constrained_gen/modules/gpu_case_constraints.py`, `src/auto_scheduler/projected_gpu_constraints.cc`, and `src/auto_scheduler/exact_gpu_constraints.cc`.
   - Becomes the default next investigation owner once reviewer confirms a reproduced issue in those paths.
   - Escalates cross-cutting API decisions back to the integrator.
 
@@ -132,10 +135,12 @@ The project-local Codex role config lives under `.codex/`.
   - `gallery/constrained_gen/modules/param_sampler.py`
   - `gallery/constrained_gen/modules/constraint_set.py`
   - `gallery/constrained_gen/modules/domain_propagator.py`
-  - `gallery/constrained_gen/modules/tvm_verify.py`
-  - `gallery/constrained_gen/modules/exact_gpu_constraints.py`
+  - `gallery/constrained_gen/modules/concrete_gpu_verify.py`
+  - `gallery/constrained_gen/modules/gpu_projection_constraints.py`
+  - `gallery/constrained_gen/modules/gpu_case_constraints.py`
+  - `src/auto_scheduler/projected_gpu_constraints.cc`
   - `src/auto_scheduler/exact_gpu_constraints.cc`
-  - validation entry points under `gallery/constrained_gen/validate_*.py`
+  - execution entry points `gallery/constrained_gen/validate.py`, `gallery/constrained_gen/generate_programs.py`, and `gallery/constrained_gen/measure_programs.py`
 - `optimizer` may patch only narrowly scoped, measured hotspots.
 - If an optimization touches cross-module APIs, acceptance semantics, or exact/concrete correctness behavior, hand implementation ownership back to `integrator`.
 - `validator` validates; it does not provide final approval.
@@ -179,8 +184,9 @@ Role-specific documentation rules:
 
 ## Validation workflow
 
-- For checker mismatches, start from `gallery/constrained_gen/validate_exact_gpu_constraints.py`.
-- For generation failures, start from `gallery/constrained_gen/validate_projected_gpu_generation.py`.
+- For checker mismatches, start from `gallery/constrained_gen/validate.py`.
+- For generation failures, start from `gallery/constrained_gen/generate_programs.py`.
+- For measurement failures or unusable measurement outcomes, start from `gallery/constrained_gen/measure_programs.py`.
 - For prefix-domain triage, use `gallery/constrained_gen/refresh_all_sketches_prefix_through_split_structure.py`.
 - For a proposed fix, validate the narrow reproducer first, then run the smallest meaningful shard, then decide whether a full sweep is justified.
 

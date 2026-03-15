@@ -108,10 +108,12 @@ This is required in particular for edits touching:
 - `gallery/constrained_gen/modules/param_sampler.py`
 - `gallery/constrained_gen/modules/constraint_set.py`
 - `gallery/constrained_gen/modules/domain_propagator.py`
-- `gallery/constrained_gen/modules/tvm_verify.py`
-- `gallery/constrained_gen/modules/exact_gpu_constraints.py`
+- `gallery/constrained_gen/modules/concrete_gpu_verify.py`
+- `gallery/constrained_gen/modules/gpu_projection_constraints.py`
+- `gallery/constrained_gen/modules/gpu_case_constraints.py`
+- `src/auto_scheduler/projected_gpu_constraints.cc`
 - `src/auto_scheduler/exact_gpu_constraints.cc`
-- validation entry points under `gallery/constrained_gen/validate_*.py`
+- execution entry points `gallery/constrained_gen/validate.py`, `gallery/constrained_gen/generate_programs.py`, and `gallery/constrained_gen/measure_programs.py`
 
 If a single session had to both implement and validate because multi-agent orchestration was unavailable, state that explicitly in the note as `single-session validation only`.
 

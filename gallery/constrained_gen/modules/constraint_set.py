@@ -16,8 +16,8 @@ from .expr_nodes import (
     VarNode,
     parse_expr_tree,
 )
-from .exact_gpu_constraints import (
-    build_exact_constraint_nodes,
+from .gpu_case_constraints import build_exact_constraint_nodes
+from .gpu_projection_constraints import (
     build_projected_constraint_nodes,
     build_projected_gpu_context,
     build_projected_shared_memory_constraint_node,
@@ -27,9 +27,14 @@ from .exact_gpu_constraints import (
 
 class ConstraintSet:
     def __init__(self, gen):
+        """ScheduleGenerator를 받아 제약 묶음·검사 로직을 담당한다."""
         self.gen = gen
 
-    def build_vectorize_constraints(self):
+    # ------------------------------------------------------------------
+    # Constraint-family bundle builders
+    # ------------------------------------------------------------------
+
+    def _build_vectorize_constraints(self):
         g = self.gen
         if g._vectorize_constraint_bundle is not None:
             return g._vectorize_constraint_bundle
@@ -52,34 +57,30 @@ class ConstraintSet:
         }
         return g._vectorize_constraint_bundle
 
-    def check_vectorize(self, sym_map=None):
+    # ------------------------------------------------------------------
+    # Constraint-family pruning checks
+    # ------------------------------------------------------------------
+
+    def _check_vectorize(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
-        c = self.build_vectorize_constraints()
+        c = self._build_vectorize_constraints()
         violations = []
         params = g._normalize_concrete_params(sym_map)
-        exact_total = None
-        exact_checked = False
         concrete_result = None
         for item in c['items']:
             val = item['tree'].evaluate(sym_map)
             if val > item['limit']:
                 if params is not None:
                     if concrete_result is None:
-                        concrete_result = g.get_concrete_final_result(params)
+                        concrete_result = g._get_concrete_final_result(params)
                     if concrete_result is not None and bool(concrete_result.get('ok')):
-                        continue
-                    if not exact_checked:
-                        self._ensure_exact_gpu_constraints()
-                        exact_total = self._exact_upper_bound(g._exact_gpu['vector_node'], params)
-                        exact_checked = True
-                    if exact_total is not None and exact_total <= item['limit']:
                         continue
                 violations.append(f"{item['desc']}: actual={val}")
         return violations
 
-    def check_vectorize_exact(self, sym_map=None):
+    def _check_vectorize_exact(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
@@ -94,7 +95,7 @@ class ConstraintSet:
             ]
         return []
 
-    def build_shared_memory_constraints(self):
+    def _build_shared_memory_constraints(self):
         g = self.gen
         if g._shared_memory_constraint_bundle is not None:
             return g._shared_memory_constraint_bundle
@@ -106,26 +107,22 @@ class ConstraintSet:
         }
         return g._shared_memory_constraint_bundle
 
-    def check_shared_memory(self, sym_map=None):
+    def _check_shared_memory(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
-        c = self.build_shared_memory_constraints()
+        c = self._build_shared_memory_constraints()
         total = c['tree'].evaluate(sym_map)
         if total > c['limit']:
             params = g._normalize_concrete_params(sym_map)
             if params is not None:
-                concrete_result = g.get_concrete_final_result(params)
+                concrete_result = g._get_concrete_final_result(params)
                 if concrete_result is not None and bool(concrete_result.get('ok')):
-                    return []
-                self._ensure_exact_gpu_constraints()
-                exact_total = self._exact_upper_bound(g._exact_gpu['shared_node'], params)
-                if exact_total is not None and exact_total <= c['limit']:
                     return []
             return [f"{c['desc']}: actual={total}"]
         return []
 
-    def check_shared_memory_exact(self, sym_map=None):
+    def _check_shared_memory_exact(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
@@ -140,7 +137,7 @@ class ConstraintSet:
             ]
         return []
 
-    def build_max_threads_constraints(self):
+    def _build_max_threads_constraints(self):
         g = self.gen
         if g._max_threads_constraint_bundle is not None:
             return g._max_threads_constraint_bundle
@@ -163,17 +160,15 @@ class ConstraintSet:
         }
         return g._max_threads_constraint_bundle
 
-    def check_max_threads(self, sym_map=None):
+    def _check_max_threads(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
-        c = self.build_max_threads_constraints()
+        c = self._build_max_threads_constraints()
         if not c['items']:
             return []
         violations = []
         params = g._normalize_concrete_params(sym_map)
-        exact_total = None
-        exact_checked = False
         concrete_result = None
         for item in c['items']:
             val = item['tree'].evaluate(sym_map)
@@ -183,25 +178,19 @@ class ConstraintSet:
             if val > item['limit']:
                 if item['axis_name'] == 'threads per block' and params is not None:
                     if concrete_result is None:
-                        concrete_result = g.get_concrete_final_result(params)
+                        concrete_result = g._get_concrete_final_result(params)
                     if concrete_result is not None and bool(concrete_result.get('ok')):
-                        continue
-                    if not exact_checked:
-                        self._ensure_exact_gpu_constraints()
-                        exact_total = self._exact_upper_bound(g._exact_gpu['max_threads_node'], params)
-                        exact_checked = True
-                    if exact_total is not None and exact_total <= item['limit']:
                         continue
                 violations.append(f"{item['desc']}: actual={val}")
         return violations
 
-    def check_max_threads_exact(self, sym_map=None):
+    def _check_max_threads_exact(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
 
         violations = []
-        for item in self.build_max_threads_constraints()['items']:
+        for item in self._build_max_threads_constraints()['items']:
             if item['axis_name'] == 'threads per block':
                 continue
             val = item['tree'].evaluate(sym_map)
@@ -813,7 +802,7 @@ class ConstraintSet:
                         names.add(factor.left.name)
         return names
 
-    def build_max_vthread_constraints(self):
+    def _build_max_vthread_constraints(self):
         g = self.gen
         if g._max_vthread_constraint_bundle is not None:
             return g._max_vthread_constraint_bundle
@@ -824,34 +813,26 @@ class ConstraintSet:
         }
         return g._max_vthread_constraint_bundle
 
-    def check_max_vthread(self, sym_map=None):
+    def _check_max_vthread(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
-        c = self.build_max_vthread_constraints()
+        c = self._build_max_vthread_constraints()
         violations = []
         params = g._normalize_concrete_params(sym_map)
-        exact_total = None
-        exact_checked = False
         concrete_result = None
         for item in c['items']:
             val = item['tree'].evaluate(sym_map)
             if val > item['limit']:
                 if params is not None:
                     if concrete_result is None:
-                        concrete_result = g.get_concrete_final_result(params)
+                        concrete_result = g._get_concrete_final_result(params)
                     if concrete_result is not None and bool(concrete_result.get('ok')):
-                        continue
-                    if not exact_checked:
-                        self._ensure_exact_gpu_constraints()
-                        exact_total = self._exact_upper_bound(g._exact_gpu['max_vthread_node'], params)
-                        exact_checked = True
-                    if exact_total is not None and exact_total <= item['limit']:
                         continue
                 violations.append(f"{item['desc']}: actual={val}")
         return violations
 
-    def check_max_vthread_exact(self, sym_map=None):
+    def _check_max_vthread_exact(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
@@ -866,7 +847,7 @@ class ConstraintSet:
             ]
         return []
 
-    def build_innermost_split_constraints(self):
+    def _build_innermost_split_constraints(self):
         g = self.gen
         limit = g.hw['max_innermost_split_factor']
         sp_groups = g.pm._build_sp_groups()
@@ -881,7 +862,7 @@ class ConstraintSet:
             })
         return constraints
 
-    def build_split_structure_constraints(self):
+    def _build_split_structure_constraints(self):
         g = self.gen
         if g._split_structure_constraint_bundle is not None:
             return g._split_structure_constraint_bundle
@@ -936,23 +917,23 @@ class ConstraintSet:
         )
         return g._split_structure_constraint_bundle
 
-    def check_innermost_split(self, sym_map=None):
+    def _check_innermost_split(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
         violations = []
-        for c in self.build_innermost_split_constraints():
+        for c in self._build_innermost_split_constraints():
             val = sym_map.get(c['sym_name'])
             if val is not None and isinstance(val, int) and val > c['limit']:
                 violations.append(f"{c['desc']}: actual={val}")
         return violations
 
-    def check_split_structure(self, sym_map=None):
+    def _check_split_structure(self, sym_map=None):
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
         violations = []
-        for c in self.build_split_structure_constraints():
+        for c in self._build_split_structure_constraints():
             val = c['tree'].evaluate(sym_map)
             if val > c['limit']:
                 actual = sym_map.get(c['sym_name'])
@@ -961,24 +942,30 @@ class ConstraintSet:
                 )
         return violations
 
+    # ------------------------------------------------------------------
+    # Deprecated
+    # ------------------------------------------------------------------
+
     def check_all_pruning(self, sym_map=None):
+        """projected/심볼릭 pruning 제약만 검사해 위반 문자열 목록을 반환한다."""
         g = self.gen
         violations = []
         if 'vectorize' in g._enabled:
-            violations.extend(self.check_vectorize(sym_map))
+            violations.extend(self._check_vectorize(sym_map))
         if 'shared_memory' in g._enabled:
-            violations.extend(self.check_shared_memory(sym_map))
+            violations.extend(self._check_shared_memory(sym_map))
         if 'max_threads' in g._enabled:
-            violations.extend(self.check_max_threads(sym_map))
+            violations.extend(self._check_max_threads(sym_map))
         if 'max_vthread' in g._enabled:
-            violations.extend(self.check_max_vthread(sym_map))
+            violations.extend(self._check_max_vthread(sym_map))
         if 'innermost_split' in g._enabled:
-            violations.extend(self.check_innermost_split(sym_map))
+            violations.extend(self._check_innermost_split(sym_map))
         if 'split_structure' in g._enabled:
-            violations.extend(self.check_split_structure(sym_map))
+            violations.extend(self._check_split_structure(sym_map))
         return violations
 
     def check_all_exact(self, sym_map=None):
+        """exact GPU 케이스 제약까지 검사해 위반 문자열 목록을 반환한다."""
         g = self.gen
         if sym_map is None:
             sym_map = g.s.sym_map
@@ -1003,7 +990,7 @@ class ConstraintSet:
                 )
 
         if 'max_threads' in g._enabled:
-            for item in self.build_max_threads_constraints()['items']:
+            for item in self._build_max_threads_constraints()['items']:
                 if item['axis_name'] == 'threads per block':
                     continue
                 val = item['tree'].evaluate(sym_map)
@@ -1029,9 +1016,9 @@ class ConstraintSet:
                 )
 
         if 'innermost_split' in g._enabled:
-            violations.extend(self.check_innermost_split(sym_map))
+            violations.extend(self._check_innermost_split(sym_map))
         if 'split_structure' in g._enabled:
-            violations.extend(self.check_split_structure(sym_map))
+            violations.extend(self._check_split_structure(sym_map))
         return violations
 
     @staticmethod
@@ -1209,7 +1196,12 @@ class ConstraintSet:
         if 'max_vthread' in requested and 'max_vthread_node' not in g._projected_gpu:
             g._projected_gpu['max_vthread_node'] = projected['max_vthread_node']
 
+    # ------------------------------------------------------------------
+    # Preprocess pipeline
+    # ------------------------------------------------------------------
+
     def preprocess(self):
+        """제약 묶음·변수별 제약 인덱스·변수 순서·phase 정보를 한 번에 계산해 제너레이터에 채운다."""
         g = self.gen
         sp_groups = g.pm._build_sp_groups()
         sp_extents = g.pm._build_sp_extents(sp_groups)
@@ -1288,7 +1280,7 @@ class ConstraintSet:
                     g._var_constraints.setdefault(v, []).append(idx)
 
         if 'vectorize' in g._enabled:
-            c = self.build_vectorize_constraints()
+            c = self._build_vectorize_constraints()
             for item in c['items']:
                 _add_constraint(
                     item['tree'],
@@ -1300,7 +1292,7 @@ class ConstraintSet:
                 )
 
         if 'shared_memory' in g._enabled:
-            sm = self.build_shared_memory_constraints()
+            sm = self._build_shared_memory_constraints()
             _add_constraint(
                 sm['tree'],
                 sm['limit'],
@@ -1311,7 +1303,7 @@ class ConstraintSet:
             )
 
         if 'max_threads' in g._enabled:
-            c = self.build_max_threads_constraints()
+            c = self._build_max_threads_constraints()
             g._preferred_thread_vars = self._collect_preferred_thread_vars(c['items'])
             for item in c['items']:
                 _add_constraint(
@@ -1325,7 +1317,7 @@ class ConstraintSet:
                 )
 
         if 'max_vthread' in g._enabled:
-            c = self.build_max_vthread_constraints()
+            c = self._build_max_vthread_constraints()
             for item in c['items']:
                 product_meta = self._extract_product_form_meta(item['tree'])
                 display_text = str(item['sym_extent'])
@@ -1344,7 +1336,7 @@ class ConstraintSet:
                 )
 
         if 'split_structure' in g._enabled:
-            for c in self.build_split_structure_constraints():
+            for c in self._build_split_structure_constraints():
                 _add_constraint(
                     c['tree'],
                     c['limit'],

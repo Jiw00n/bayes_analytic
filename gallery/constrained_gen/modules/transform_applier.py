@@ -18,6 +18,7 @@ class TransformApplier:
     """
 
     def __init__(self, sym_state):
+        """적용 대상 SymbolicState를 받아 보관한다."""
         self.s = sym_state
 
     @staticmethod

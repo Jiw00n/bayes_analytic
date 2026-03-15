@@ -54,16 +54,50 @@ The main split in the current code is:
 
 It owns:
 
-- public checker API such as `check_all_pruning()`, `check_all_exact()`, `check_all_hybrid()`, and `check_all_final()`
-- concrete final validation through `get_concrete_final_result()`
+- the workflow-level public API:
+  - `from_task_state()`
+  - `get_full_var_order_entries()`
+  - `get_param_candidates()`
+  - `propagate_param_assignment()`
+  - `get_constraints_under_assignment()`
+  - `randomize_params()`
+  - `randomize_params_prefix()`
+  - `params_to_state()`
+  - `check_all_pruning()`
+  - `check_all_exact()`
+  - `check_all_hybrid()`
+  - `check_all_final()`
+- concrete-final helpers still used by in-repo diagnostics
 - coordination across helper components
+- an internal same-module inspector helper that owns formatting/simplification utilities
 
 It delegates most implementation work to:
 
 - `modules/constraint_set.py`
 - `modules/var_order_planner.py`
 - `modules/domain_propagator.py`
+- `modules/gpu_projection_constraints.py`
 - `modules/param_sampler.py`
+- `modules/symbolic_state_bridge.py`
+- the internal `_ScheduleGeneratorInspector` helper inside `modules/schedule_generator.py`
+
+Naming note:
+
+- `modules/symbolic_state_bridge.py` is the owning name for symbolic-state construction and parameter bookkeeping (no shim; param_manager was removed)
+
+Current internal boundaries worth preserving:
+
+- `ConstraintSet` reads through `preprocess()`, `check_all_pruning()`, and `check_all_exact()`; per-family build/check helpers are internal.
+- `VarOrderPlanner` builds phase-first order first and only then appends legacy fallback vars.
+- `ParamSampler` separates sampling-state initialization, per-variable sampling, final validation, and prefix-report assembly behind its internal helpers.
+- `DomainPropagator` should read in staged sections: domain views, constraint analysis, upper-bound propagation, and candidate filtering.
+
+Current observability contract:
+
+- assignment-style reports use nested `assignment`, `domains`, and `constraints` objects
+- `domains` is shaped as `{all, fixed, remaining}`
+- `constraints` is shaped as `{text, leftover, resolved_false, resolved_true_count}`
+- phase reports use `phase_*` field names plus `param_names` / `param_entries`
 
 ### Sampling acceptance semantics
 
@@ -74,8 +108,8 @@ Current code path:
 
 `check_all_hybrid()` currently:
 
-- runs `check_all_exact()`
-- then, when concrete final context exists, runs concrete final validation through `get_concrete_final_result()`
+- first tries concrete final validation through the generator's concrete-final helper when concrete context exists
+- falls back to `check_all_exact()` only when concrete final context is unavailable
 
 Full sampling acceptance semantics must be checked from code, not inferred from notes or memory.
 
@@ -99,41 +133,72 @@ The planner prefers a main compute anchor scope when ordering grid scopes.
 
 ### Exact-vs-concrete validation
 
-Use `validate_exact_gpu_constraints.py` when checking whether symbolic pruning or exact checks disagree with concrete final validation.
-
-It compares:
-
-- `gen.check_all_pruning(params)`
-- `gen.check_all_final(params)`
-- `gen.get_concrete_final_result(params)`
-
-This is the main script for finding:
-
-- false accepts
-- false rejects
-- final checker mismatches
-
-### Generation validation
-
-Use `validate_projected_gpu_generation.py` when checking the output of random generation.
+Use `validate.py` as the main narrow validation harness for the active concrete-sketch -> symbolic generator workflow.
 
 It currently:
 
-- builds a `ScheduleGenerator`
-- calls `gen.randomize_params(...)`
-- lowers sampled params through `params_to_state(...)` and `lower_with_gpu_passes(...)`
-- verifies the lowered module
+- builds a `ScheduleGenerator` from a concrete sketch
+- inspects var-order output through `get_full_var_order_entries()`
+- runs `gen.randomize_params_prefix(...)`
+- runs `gen.randomize_params(...)`
+- checks `gen.check_all_pruning(params)`, `gen.check_all_exact(params)`, and `gen.check_all_final(params)`
 
-This is the main script for confirming whether generated schedules survive concrete GPU verification.
+This is the main script for finding:
+
+- narrow workflow regressions
+- checker mismatches
+- observability/report-shape breakage
+
+### Generation validation
+
+Use `generate_programs.py` when checking the current constrained record-generation path.
+
+It currently:
+
+- iterates selected tasks from `load_and_register_tasks()`
+- generates concrete sketches with `SketchPolicy(...).generate_concrete_sketches()`
+- constructs `ScheduleGenerator` from each sketch
+- samples params, checks final acceptance, converts params to concrete state, and saves records
+
+This is the main script for confirming whether the active generation path can produce valid saved records.
+
+Important current behavior:
+
+- the active `generate_programs.py` runtime path does not gate acceptance on `check_all_exact()`
+- active generation depends on projected pruning plus concrete final validation
+- exact symbolic checks remain available for validation and diagnostics, not for the normal generation accept/reject path
+
+### Measurement validation
+
+Use `measure_programs.py` when checking whether generated constrained-gen records can be measured and saved through the repo's standard measurement path.
+
+It currently:
+
+- reads generated record files from one file or a directory
+- rebuilds `MeasureInput` objects from saved states
+- runs the standard TVM measurement path
+- writes measured records and reports usable-vs-error outcomes
 
 ### Shared validation helpers
 
-`modules/projected_gpu_validation.py` contains common helpers for:
+`modules/legacy_record_sketch_io.py` is the legacy helper path for:
 
 - loading sketch records
-- building a `ScheduleGenerator`
+- reading saved sketch dumps
+- decoding saved sketch lines with a caller-supplied workload-key map
+
+This is a legacy helper path, not the intended public API location.
+
+`modules/gpu_projection_diagnostics.py` is the diagnostics-side module for:
+
 - collecting projection diagnostics
 - collecting exact-lowering differential data
+
+`modules/gpu_projection_constraints.py` is the projected-pruning owner for:
+
+- pre-vectorize symbolic lowering context
+- projected vectorize/shared-memory pruning nodes
+- projection of exact case nodes back into pruning nodes when diagnostics still request it
 
 ## Role Boundaries For The Current Phase
 
@@ -143,9 +208,9 @@ This is the main script for confirming whether generated schedules survive concr
   - may edit `modules/var_order_planner.py` when generator logic requires it
   - is not the default first investigator for reviewer-confirmed issues that remain inside specialist-owned symbolic or lowering paths
 - `validator`
-  - owns `validate_exact_gpu_constraints.py`
-  - owns `validate_projected_gpu_generation.py`
-  - owns `modules/projected_gpu_validation.py`
+  - owns `validate.py`
+  - owns `modules/gpu_projection_diagnostics.py`
+  - uses `generate_programs.py` and `measure_programs.py` as execution harnesses when a reproducer needs the current generation or measurement path
   - produces raw validation artifacts and repro outputs
   - should not change generator semantics directly
 - `reviewer`
@@ -158,7 +223,7 @@ This is the main script for confirming whether generated schedules survive concr
 - `specialist`
   - owns deeper root-cause analysis after validator reproduces an issue and reviewer confirms it
   - covers both projected/pruning false-reject investigation and exact-vs-concrete lowering mismatch analysis
-  - works in `modules/constraint_set.py`, `modules/domain_propagator.py`, `modules/tvm_verify.py`, `modules/exact_gpu_constraints.py`, and `src/auto_scheduler/exact_gpu_constraints.cc`
+  - works in `modules/constraint_set.py`, `modules/domain_propagator.py`, `modules/concrete_gpu_verify.py`, `modules/gpu_projection_constraints.py`, `modules/gpu_case_constraints.py`, `src/auto_scheduler/projected_gpu_constraints.cc`, and `src/auto_scheduler/exact_gpu_constraints.cc`
   - is the default next investigation owner for reviewer-confirmed issues in those paths
 - `optimizer`
   - optional role for explicit profiling and performance work
@@ -170,13 +235,13 @@ This is the main script for confirming whether generated schedules survive concr
 - verify claims against current code before planning
 - do not let two active sessions edit the same file at the same time
 - only activate the optimizer role when the task explicitly focuses on profiling or performance
-- if reviewer confirms a reproduced issue and the suspected root-cause path stays inside `constraint_set.py`, `domain_propagator.py`, `tvm_verify.py`, `exact_gpu_constraints.py`, or `src/auto_scheduler/exact_gpu_constraints.cc`, spawn `specialist` before routing implementation planning to `integrator` unless the required fix is obviously isolated to `schedule_generator.py` or `param_sampler.py`
+- if reviewer confirms a reproduced issue and the suspected root-cause path stays inside `constraint_set.py`, `domain_propagator.py`, `concrete_gpu_verify.py`, `gpu_projection_constraints.py`, `gpu_case_constraints.py`, `src/auto_scheduler/projected_gpu_constraints.cc`, or `src/auto_scheduler/exact_gpu_constraints.cc`, spawn `specialist` before routing implementation planning to `integrator` unless the required fix is obviously isolated to `schedule_generator.py` or `param_sampler.py`
 - if a change affects both symbolic pruning semantics and concrete lowering semantics, route the decision through the `integrator` session
 - prefer the smallest reproducible validation shard before any broad rerun
 - require validator artifacts before reviewer sign-off
 - require reviewer sign-off before specialist escalation when the issue is not already obvious from a minimal reproducer
 - if a session cites prior notes or memory, require it to cite the current file and function it checked
-- require validator follow-up after meaningful edits in `schedule_generator.py`, `param_sampler.py`, `constraint_set.py`, `domain_propagator.py`, `tvm_verify.py`, `exact_gpu_constraints.py`, `src/auto_scheduler/exact_gpu_constraints.cc`, or validation entry points
+- require validator follow-up after meaningful edits in `schedule_generator.py`, `param_sampler.py`, `constraint_set.py`, `domain_propagator.py`, `concrete_gpu_verify.py`, `gpu_projection_constraints.py`, `gpu_case_constraints.py`, `src/auto_scheduler/projected_gpu_constraints.cc`, `src/auto_scheduler/exact_gpu_constraints.cc`, or the current execution entry points (`validate.py`, `generate_programs.py`, `measure_programs.py`)
 - for explicit performance work, default to:
   - optimizer measures
   - integrator owns semantics-sensitive implementation

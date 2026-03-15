@@ -13,7 +13,7 @@ config_file = "./agents/integrator.toml"
 nickname_candidates = ["Atlas", "Meridian"]
 
 [agents.validator]
-description = "Use for validation execution, shard repros, and raw artifact generation using validate_exact_gpu_constraints.py, validate_projected_gpu_generation.py, and projected_gpu_validation.py. Validator validates but does not sign off."
+description = "Use for validation execution, shard repros, and raw artifact generation using validate_exact_gpu_constraints.py, validate_projected_gpu_generation.py, and gpu_projection_diagnostics.py. Validator validates but does not sign off."
 config_file = "./agents/validator.toml"
 nickname_candidates = ["Gauge", "Probe"]
 
@@ -23,7 +23,7 @@ config_file = "./agents/reviewer.toml"
 nickname_candidates = ["Ledger", "Signal"]
 
 [agents.specialist]
-description = "Use for deeper root-cause analysis in constraint_set.py, domain_propagator.py, tvm_verify.py, exact_gpu_constraints.py, and src/auto_scheduler/exact_gpu_constraints.cc after validator evidence and reviewer sign-off. This is the default investigation owner for confirmed issues in those paths."
+description = "Use for deeper root-cause analysis in constraint_set.py, domain_propagator.py, concrete_gpu_verify.py, gpu_case_constraints.py, and src/auto_scheduler/exact_gpu_constraints.cc after validator evidence and reviewer sign-off. This is the default investigation owner for confirmed issues in those paths."
 config_file = "./agents/specialist.toml"
 nickname_candidates = ["Vector", "Forensics"]
 

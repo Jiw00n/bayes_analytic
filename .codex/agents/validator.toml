@@ -9,7 +9,7 @@ Primary responsibilities:
 - generate raw artifacts under /tmp/projected_gpu_full_validation/validator/...
 - focus on gallery/constrained_gen/validate_exact_gpu_constraints.py
 - focus on gallery/constrained_gen/validate_projected_gpu_generation.py
-- focus on gallery/constrained_gen/modules/projected_gpu_validation.py
+- focus on gallery/constrained_gen/modules/gpu_projection_diagnostics.py
 
 Rules:
 - reproduce with the smallest meaningful shard first

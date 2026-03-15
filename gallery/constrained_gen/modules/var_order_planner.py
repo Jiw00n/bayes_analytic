@@ -3,13 +3,24 @@ from .expr_nodes import AddNode, CeilDivNode, ConstNode, MaxNode, MinNode, MulNo
 
 class VarOrderPlanner:
     def __init__(self, gen):
+        """ScheduleGenerator를 받아 변수 할당 순서와 phase 구간을 계산한다."""
         self.gen = gen
 
-    def compute_var_order(self):
-        g = self.gen
-        legacy_order = self._compute_legacy_var_order()
-        phase_entries = self._build_var_order_phase_entries()
+    # ------------------------------------------------------------------
+    # Public workflow entry and legacy fallback merge
+    # ------------------------------------------------------------------
 
+    def compute_var_order(self):
+        """phase 우선 순서를 구한 뒤 legacy fallback을 붙여 제너레이터에 var_order를 저장한다."""
+        g = self.gen
+        phase_entries = self._build_var_order_phase_entries()
+        normalized_entries, ordered, seen = self._build_phase_first_order(phase_entries)
+        self._append_legacy_fallback_vars(ordered, seen, self._compute_legacy_var_order())
+
+        g._var_order_phase_entries = normalized_entries
+        g._var_order = ordered
+
+    def _build_phase_first_order(self, phase_entries):
         ordered = []
         seen = set()
         normalized_entries = []
@@ -29,33 +40,37 @@ class VarOrderPlanner:
                 'grid_scope_label': entry['grid_scope_label'],
                 'vars': phase_vars,
             })
+        return normalized_entries, ordered, seen
 
+    @staticmethod
+    def _append_legacy_fallback_vars(ordered, seen, legacy_order):
         for name in legacy_order:
             if name in seen:
                 continue
             seen.add(name)
             ordered.append(name)
 
-        g._var_order_phase_entries = normalized_entries
-        g._var_order = ordered
+    # ------------------------------------------------------------------
+    # Phase-order construction
+    # ------------------------------------------------------------------
 
     def _build_var_order_phase_entries(self):
         g = self.gen
         max_thread_items = []
         if 'max_threads' in g._enabled:
-            max_thread_items = g.constraint_set.build_max_threads_constraints()['items']
+            max_thread_items = g.constraint_set._build_max_threads_constraints()['items']
 
         max_vthread_items = []
         if 'max_vthread' in g._enabled:
-            max_vthread_items = g.constraint_set.build_max_vthread_constraints()['items']
+            max_vthread_items = g.constraint_set._build_max_vthread_constraints()['items']
 
         vectorize_items = []
         if 'vectorize' in g._enabled:
-            vectorize_items = g.constraint_set.build_vectorize_constraints()['items']
+            vectorize_items = g.constraint_set._build_vectorize_constraints()['items']
 
         shared_vars = set()
         if 'shared_memory' in g._enabled:
-            shared_vars = set(g.constraint_set.build_shared_memory_constraints()['tree'].variables())
+            shared_vars = set(g.constraint_set._build_shared_memory_constraints()['tree'].variables())
 
         (
             scope_infos,
@@ -110,6 +125,7 @@ class VarOrderPlanner:
                 max_thread_scope_items,
                 set(thread_owned_vars.get(scope, [])),
                 want_scale=1,
+                order_by_step_idx=True,
             )
             vthread_pure = self._collect_scoped_product_phase_vars(
                 max_vthread_scope_items,
@@ -266,6 +282,10 @@ class VarOrderPlanner:
             })
         return scope_infos, max_thread_items_by_scope, thread_axis_items_by_scope, vthread_items_by_scope
 
+    # ------------------------------------------------------------------
+    # Phase variable collection and legacy fallback heuristics
+    # ------------------------------------------------------------------
+
     def _build_scope_owned_vars(self, scope_infos, items_by_scope):
         g = self.gen
         owned = {}
@@ -280,40 +300,6 @@ class VarOrderPlanner:
             owned[scope] = ordered
         return owned
 
-    def _build_split_structure_phase_assignments(self, scope_infos, thread_owned_vars, vthread_owned_vars):
-        g = self.gen
-        assignments = {}
-        for scope_info in scope_infos:
-            scope = scope_info['grid_scope']
-            assignments[(scope, 'split_structure_max_threads')] = []
-            assignments[(scope, 'split_structure_max_vthread')] = []
-
-        ownership = {}
-        ownership_priority = {}
-        for scope_info in scope_infos:
-            scope = scope_info['grid_scope']
-            for name in thread_owned_vars.get(scope, []):
-                ownership.setdefault(name, (scope, 'split_structure_max_threads'))
-                ownership_priority.setdefault(name, (scope_info['grid_index'], 0))
-            for name in vthread_owned_vars.get(scope, []):
-                ownership.setdefault(name, (scope, 'split_structure_max_vthread'))
-                ownership_priority.setdefault(name, (scope_info['grid_index'], 1))
-
-        for step_idx, names in sorted(g._sp_groups.items()):
-            target = None
-            target_priority = None
-            for name in names:
-                if name not in ownership:
-                    continue
-                cur_priority = ownership_priority[name]
-                if target is None or cur_priority < target_priority:
-                    target = ownership[name]
-                    target_priority = cur_priority
-            if target is None:
-                continue
-            assignments[target].append(step_idx)
-        return assignments
-
     @staticmethod
     def _make_phase_entry(scope_info, family, family_label, vars_in_phase):
         return {
@@ -325,7 +311,13 @@ class VarOrderPlanner:
             'vars': list(vars_in_phase),
         }
 
-    def _collect_scoped_product_phase_vars(self, items, candidate_var_names, want_scale):
+    def _collect_scoped_product_phase_vars(
+        self,
+        items,
+        candidate_var_names,
+        want_scale,
+        order_by_step_idx=False,
+    ):
         g = self.gen
         ordered = []
         if not candidate_var_names:
@@ -344,6 +336,13 @@ class VarOrderPlanner:
                 if name not in candidate_var_names or name in filtered:
                     continue
                 filtered.append(name)
+            if order_by_step_idx:
+                filtered.sort(
+                    key=lambda name: (
+                        int(name.split("_")[1]),
+                        int(name.split("_")[2]),
+                    )
+                )
             if filtered:
                 g.constraint_set._append_unique_vars(ordered, filtered)
         return ordered
@@ -572,20 +571,54 @@ class VarOrderPlanner:
             ordered.extend(ordered_group)
         return ordered
 
+    # ------------------------------------------------------------------
+    # Deprecated
+    # ------------------------------------------------------------------
+
     def get_var_order_phase_entries(self):
+        """phase별 변수 목록·이름·family·grid_scope 등을 담은 진입점 목록을 반환한다."""
+        def build_var_entry(name):
+            entry = {
+                'param_name': name,
+                'param_kind': 'symbolic',
+            }
+            if name.startswith("sp_"):
+                parts = name.split("_")
+                step_idx = int(parts[1])
+                pos = int(parts[2])
+                group_vars = list(self.gen._sp_groups.get(step_idx, []))
+                entry.update({
+                    'param_kind': 'split',
+                    'split_step_idx': step_idx,
+                    'split_position': pos,
+                    'split_extent': self.gen._sp_extents.get(step_idx),
+                    'split_group_param_names': group_vars,
+                    'collapsed_factor_param_names': group_vars[:pos],
+                    'is_innermost': name in self.gen._innermost_names,
+                })
+            elif name.startswith("ur_"):
+                entry.update({
+                    'param_kind': 'unroll',
+                    'unroll_step_idx': int(name.split("_")[1]),
+                    'candidate_values': list(self.gen.pm.UNROLL_CANDIDATES),
+                })
+            return entry
+
         return [
             {
-                'name': entry['name'],
-                'family': entry['family'],
-                'label': entry['label'],
+                'phase_name': entry['name'],
+                'phase_family': entry['family'],
+                'phase_label': entry['label'],
                 'grid_scope': entry['grid_scope'],
                 'grid_scope_label': entry['grid_scope_label'],
-                'vars': list(entry['vars']),
+                'param_names': list(entry['vars']),
+                'param_entries': [build_var_entry(name) for name in entry['vars']],
             }
             for entry in self.gen._var_order_phase_entries
         ]
 
-    def _resolve_var_order_stop_index(self, stop_after_phase):
+    def resolve_var_order_stop_index(self, stop_after_phase):
+        """prefix 샘플링 시 멈출 phase 이름/인덱스를 받아 phase 인덱스를 반환한다."""
         g = self.gen
         exact_match = None
         last_family_match = None
@@ -600,13 +633,3 @@ class VarOrderPlanner:
         if last_family_match is not None:
             return last_family_match
         raise ValueError(f"Unknown var-order phase or family: {stop_after_phase}")
-
-    def get_var_order_prefix(self, stop_after_phase):
-        g = self.gen
-        prefix = []
-        stop_idx = self._resolve_var_order_stop_index(stop_after_phase)
-        for idx, entry in enumerate(g._var_order_phase_entries):
-            prefix.extend(entry['vars'])
-            if idx == stop_idx:
-                break
-        return prefix

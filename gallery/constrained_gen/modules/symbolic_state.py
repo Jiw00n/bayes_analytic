@@ -30,6 +30,7 @@ class SymbolicState:
             return int(simplified)
 
     def __init__(self, compute_dag):
+        """compute_dag의 op/stage 구조를 복사해 심볼릭 stages와 sym_map을 초기화한다."""
         self.stages = []
         self.sym_map = OrderedDict()
         self.compute_dag = compute_dag
@@ -74,6 +75,7 @@ class SymbolicState:
                 self.sym_map[name] = 0
 
     def clone(self):
+        """현재 stages·sym_map·메타데이터를 복사한 새 SymbolicState를 반환한다."""
         cloned = SymbolicState(self.compute_dag)
         cloned.stages = [stage.clone() for stage in self.stages]
         cloned.sym_map = OrderedDict((name, value) for name, value in self.sym_map.items())

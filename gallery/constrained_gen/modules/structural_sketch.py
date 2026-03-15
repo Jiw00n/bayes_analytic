@@ -1,10 +1,10 @@
 """Structural-sketch helpers for canonical symbolic-state construction."""
 
-from .tvm_verify import params_to_state_from_state
+from .concrete_gpu_verify import params_to_state_from_state
 
 
 def build_canonical_param_values(state, split_value=1, unroll_value=0):
-    """Return a canonical concrete parameter assignment for a structural sketch."""
+    """구조 스케치용 정규화된 구체 파라미터 할당(sp_*, ur_*)을 반환한다."""
     params = {}
     for step_idx, step in enumerate(state.transform_steps):
         tk = step.type_key.split(".")[-1]
@@ -19,7 +19,7 @@ def build_canonical_param_values(state, split_value=1, unroll_value=0):
 
 
 def build_canonical_state(task, state, split_value=1, unroll_value=0):
-    """Build a deterministic representative State for the structural sketch."""
+    """구조 스케치의 대표 State를 정규 파라미터로 만들어 반환한다."""
     params = build_canonical_param_values(
         state,
         split_value=split_value,

@@ -9,8 +9,8 @@ Primary responsibilities:
 - analyze exact-vs-concrete lowering mismatches
 - focus on gallery/constrained_gen/modules/constraint_set.py
 - focus on gallery/constrained_gen/modules/domain_propagator.py
-- focus on gallery/constrained_gen/modules/tvm_verify.py
-- focus on gallery/constrained_gen/modules/exact_gpu_constraints.py
+- focus on gallery/constrained_gen/modules/concrete_gpu_verify.py
+- focus on gallery/constrained_gen/modules/gpu_case_constraints.py
 - focus on src/auto_scheduler/exact_gpu_constraints.cc
 - do not broaden scope beyond the confirmed failure mode
 
