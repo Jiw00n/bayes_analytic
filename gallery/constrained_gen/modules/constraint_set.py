@@ -16,7 +16,7 @@ from .expr_nodes import (
     VarNode,
     parse_expr_tree,
 )
-from .gpu_case_constraints import build_exact_constraint_nodes
+from .deprecated.gpu_case_constraints import build_exact_constraint_nodes
 from .gpu_projection_constraints import (
     build_projected_constraint_nodes,
     build_projected_gpu_context,
