@@ -10,8 +10,8 @@ from itertools import product
 
 import tvm
 
-from .expr_nodes import CaseSplitNode, ConstNode, PrimExprNode
-from .gpu_projection_constraints import build_projected_gpu_context as _build_projected_gpu_context
+from ..expr_nodes import CaseSplitNode, ConstNode, PrimExprNode
+from ..gpu_projection_constraints import build_projected_gpu_context as _build_projected_gpu_context
 _LOWER_SYMBOLIC_POST_VECTORIZE = tvm.get_global_func(
     "constrained_gen.lower_symbolic_post_vectorize"
 )

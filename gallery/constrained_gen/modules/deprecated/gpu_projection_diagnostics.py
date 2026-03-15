@@ -5,7 +5,7 @@ import os
 import tvm
 from tvm import tir
 
-from .concrete_gpu_verify import GPU_VERIFY_CONSTRAINTS, verify_gpu_func_errors
+from ..concrete_gpu_verify import GPU_VERIFY_CONSTRAINTS, verify_gpu_func_errors
 
 
 ROOT_CAUSE_RUNTIME_PROJECTION = "runtime_projection_upper_bound_insufficient"

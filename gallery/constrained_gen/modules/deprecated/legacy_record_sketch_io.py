@@ -13,7 +13,7 @@ from tvm import auto_scheduler
 from tvm.auto_scheduler.measure_record import load_records
 from tvm.auto_scheduler.measure_record import load_record_from_string
 
-from .task_paths import TO_MEASURE_PROGRAM_FOLDER, clean_name
+from ..task_paths import TO_MEASURE_PROGRAM_FOLDER, clean_name
 
 
 STEP_RECORD_CODE = {
