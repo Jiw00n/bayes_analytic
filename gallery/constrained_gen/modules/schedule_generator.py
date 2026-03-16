@@ -211,21 +211,6 @@ class ScheduleGenerator:
         self._concrete_final_cache[cache_key] = dict(result)
         return result
 
-    def _get_constraint_records(self):
-        return self._inspector.get_constraint_records()
-
-    def _get_constraints_str(self, include_vars=False, include_meta=False):
-        return self._inspector.get_constraints_str(
-            include_vars=include_vars,
-            include_meta=include_meta,
-        )
-
-    def _get_constraints_with_assignment_str(self, sym_map=None, include_vars=False, include_eval=True):
-        return self._inspector.get_constraints_with_assignment_str(
-            sym_map=sym_map,
-            include_vars=include_vars,
-            include_eval=include_eval,
-        )
 
     def _build_split_domains(self):
         domains = {}
@@ -234,6 +219,46 @@ class ScheduleGenerator:
             extent = self._sp_extents.get(step_idx)
             domains[name] = [1, extent] if extent is not None else 1
         return domains
+
+    def _get_dynamic_split_extent(self, step_idx, sym_map=None):
+        if sym_map is None:
+            sym_map = self.s.sym_map
+        expr = self.s._split_step_extents.get(step_idx)
+        if expr is not None:
+            val = eval_sym_extent(expr, sym_map)
+            if val is not None:
+                return int(val)
+        return self._sp_extents.get(step_idx)
+
+    def _get_group_remaining(self, step_idx, group_remaining, sym_map=None):
+        remaining = group_remaining.get(step_idx)
+        if remaining is not None:
+            return int(remaining)
+        extent = self._get_dynamic_split_extent(step_idx, sym_map=sym_map)
+        if extent is not None:
+            group_remaining[step_idx] = int(extent)
+        return extent
+
+    def _build_dynamic_split_extents(self, sym_map=None):
+        if sym_map is None:
+            sym_map = self.s.sym_map
+        extents = {}
+        for step_idx in self._sp_groups:
+            extent = self._get_dynamic_split_extent(step_idx, sym_map=sym_map)
+            if extent is not None:
+                extents[step_idx] = int(extent)
+        return extents
+
+    def _get_split_extent_dependencies(self, step_idx):
+        expr = self.s._split_step_extents.get(step_idx)
+        if expr is None:
+            return set()
+        expr_text = str(expr)
+        return {
+            name
+            for name in re.findall(r"(?:sp|ur)_\d+(?:_\d+)?", expr_text)
+            if name in self.s.sym_map
+        }
 
     def _materialize_assignment_state(self, sym_map=None):
         requested = {}
@@ -249,10 +274,7 @@ class ScheduleGenerator:
                 self.s.sym_map[name] = None
 
             domains = self._build_split_domains()
-            group_remaining = {
-                step_idx: extent
-                for step_idx, extent in self._sp_extents.items()
-            }
+            group_remaining = {}
             effective_var_order = self.param_sampler._assign_initial_fixed_vars(
                 self._var_order,
                 domains,
@@ -272,7 +294,7 @@ class ScheduleGenerator:
 
                 value = int(requested[name])
                 step_idx = int(name.split("_")[1])
-                extent = self._sp_extents.get(step_idx)
+                extent = self._get_dynamic_split_extent(step_idx)
 
                 if extent is None:
                     fixed_value = int(self.s.sym_map.get(name, 1))
@@ -284,7 +306,7 @@ class ScheduleGenerator:
                     domains[name] = fixed_value
                     continue
 
-                remaining = group_remaining.get(step_idx, extent)
+                remaining = self._get_group_remaining(step_idx, group_remaining)
                 candidates = self.pm._divisors(remaining)
                 if name in self._innermost_names:
                     candidates = [
@@ -430,6 +452,7 @@ class ScheduleGenerator:
             raise ValueError("params_to_state requires concrete integer sp_/ur_ values")
 
         from .concrete_gpu_verify import params_to_state_from_record, params_to_state_from_state
+        split_extents = self._build_dynamic_split_extents(normalized)
 
         if self._base_input is not None and self._base_result is not None:
             return params_to_state_from_record(
@@ -437,150 +460,170 @@ class ScheduleGenerator:
                 self._base_input,
                 self._base_result,
                 normalized,
+                split_extents=split_extents,
             )
         if self._base_state is not None:
             return params_to_state_from_state(
                 self._task,
                 self._base_state,
                 normalized,
+                split_extents=split_extents,
             )
         raise ValueError("params_to_state requires a base record or base state")
 
-    # ------------------------------------------------------------------
-    # Deprecated
-    # ------------------------------------------------------------------
 
-    def check_all_pruning(self, sym_map=None):
-        """projected/심볼릭 pruning 제약만 검사해 위반 목록을 반환한다."""
-        return self.constraint_set.check_all_pruning(sym_map)
+    def _get_constraint_records(self):
+        return self._inspector.get_constraint_records()
 
-    def check_all_exact(self, sym_map=None):
-        """exact GPU 케이스 제약까지 검사해 위반 목록을 반환한다."""
-        return self.constraint_set.check_all_exact(sym_map)
-
-    def check_all_final(self, sym_map=None):
-        concrete_result = self._get_concrete_final_result(sym_map)
-        return self._check_all_final_with_concrete_result(sym_map, concrete_result)
-
-    def get_param_candidates(self, name, sym_map=None):
-        """지정 변수에 대한 제약-만족 후보값과 현재 할당·도메인·제약 요약을 반환한다."""
-        requested = {}
-        if sym_map is not None:
-            requested = dict(sym_map)
-        requested.pop(name, None)
-
-        assignment_state = self._materialize_assignment_state(requested)
-        domains = assignment_state['raw_domains']
-
-        if name in assignment_state['params']:
-            candidates = [assignment_state['params'][name]]
-        elif name.startswith("ur_"):
-            candidates = list(self.pm.UNROLL_CANDIDATES)
-        else:
-            dom = domains.get(name)
-            if dom is None:
-                raise ValueError(f"Unknown parameter: {name}")
-            if not isinstance(dom, list):
-                candidates = [int(dom)]
-            else:
-                saved_sym_map = dict(self.s.sym_map)
-                try:
-                    self.s.sym_map = dict(assignment_state['sym_map'])
-                    candidates = self.domain_propagator.candidate_values_for_domain(name, dom)
-                    if candidates is None:
-                        lo, hi = int(dom[0]), int(dom[1])
-                        candidates = list(range(lo, hi + 1))
-                    constraint_indices = self._var_constraints.get(name, [])
-                    if constraint_indices:
-                        candidates = self.domain_propagator.filter_by_constraints(
-                            name,
-                            candidates,
-                            constraint_indices,
-                            domains,
-                        )
-                finally:
-                    self.s.sym_map = saved_sym_map
-
-        report = self._build_observability_report(assignment_state['params'], domains)
-        report['query'] = {
-            'param_name': name,
-            'requested_params': assignment_state['requested_params'],
-        }
-        report['candidates'] = list(candidates)
-        return report
-
-    def propagate_param_assignment(self, name, value, sym_map=None):
-        """한 변수에 값을 할당한 뒤 도메인 전파를 수행하고 관측 리포트를 반환한다."""
-        updated = {}
-        if sym_map is not None:
-            updated.update(sym_map)
-        updated[name] = int(value)
-        assignment_state = self._materialize_assignment_state(updated)
-        report = self._build_observability_report(
-            assignment_state['params'],
-            assignment_state['raw_domains'],
+    def _get_constraints_str(self, include_vars=False, include_meta=False):
+        return self._inspector.get_constraints_str(
+            include_vars=include_vars,
+            include_meta=include_meta,
         )
-        report['query'] = {
-            'param_name': name,
-            'param_value': int(value),
-            'requested_params': assignment_state['requested_params'],
-        }
-        return report
 
-    def get_constraints_under_assignment(self, sym_map=None, include_vars=True, include_eval=True):
-        """현재 할당 하에서 제약식 요약(텍스트·남은 제약 등)을 담은 관측 리포트를 반환한다."""
-        assignment_state = self._materialize_assignment_state(sym_map)
-        report = self._build_observability_report(
-            assignment_state['params'],
-            assignment_state['raw_domains'],
-            include_constraints_text=True,
+    def _get_constraints_with_assignment_str(self, sym_map=None, include_vars=False, include_eval=True):
+        return self._inspector.get_constraints_with_assignment_str(
+            sym_map=sym_map,
             include_vars=include_vars,
             include_eval=include_eval,
         )
-        report['query'] = {
-            'requested_params': assignment_state['requested_params'],
-            'include_vars': bool(include_vars),
-            'include_eval': bool(include_eval),
-        }
-        return report
 
-    def get_full_var_order_entries(self):
-        """플래너가 계산한 변수 순서와 phase 구간 정보를 반환한다."""
-        phases = []
-        param_order = []
-        for phase_index, entry in enumerate(self._get_var_order_phase_entries()):
-            phase_param_names = list(entry['param_names'])
-            phase_start = len(param_order)
-            param_order.extend(phase_param_names)
-            phases.append({
-                **entry,
-                'phase_index': phase_index,
-                'param_count': len(phase_param_names),
-                'param_start': phase_start,
-                'param_stop': len(param_order),
-                'prefix_param_names': list(param_order),
-            })
-        return {
-            'phase_count': len(phases),
-            'param_order': param_order,
-            'phases': phases,
-        }
 
-    def randomize_params(self, rng=None, max_retries=1):
-        """제약을 만족하는 파라미터를 무작위로 한 번 샘플링해 반환한다."""
-        return self.param_sampler.randomize_params(rng=rng, max_retries=max_retries)
+#     # ------------------------------------------------------------------
+#     # Deprecated
+#     # ------------------------------------------------------------------
 
-    def reset_unique_search(self):
-        """unique schedule 탐색 캐시를 초기화한다."""
-        self.param_sampler.reset_unique_search()
+#     def check_all_pruning(self, sym_map=None):
+#         """projected/심볼릭 pruning 제약만 검사해 위반 목록을 반환한다."""
+#         return self.constraint_set.check_all_pruning(sym_map)
 
-    def randomize_params_prefix(self, stop_after_phase, rng=None, max_retries=1):
-        """지정 phase까지 prefix만 샘플링한 관측 리포트(assignment, domains, constraints 등)를 반환한다."""
-        return self.param_sampler.randomize_params_prefix(
-            stop_after_phase,
-            rng=rng,
-            max_retries=max_retries,
-        )
+#     def check_all_exact(self, sym_map=None):
+#         """exact GPU 케이스 제약까지 검사해 위반 목록을 반환한다."""
+#         return self.constraint_set.check_all_exact(sym_map)
+
+#     def check_all_final(self, sym_map=None):
+#         concrete_result = self._get_concrete_final_result(sym_map)
+#         return self._check_all_final_with_concrete_result(sym_map, concrete_result)
+
+#     def get_param_candidates(self, name, sym_map=None):
+#         """지정 변수에 대한 제약-만족 후보값과 현재 할당·도메인·제약 요약을 반환한다."""
+#         requested = {}
+#         if sym_map is not None:
+#             requested = dict(sym_map)
+#         requested.pop(name, None)
+
+#         assignment_state = self._materialize_assignment_state(requested)
+#         domains = assignment_state['raw_domains']
+
+#         if name in assignment_state['params']:
+#             candidates = [assignment_state['params'][name]]
+#         elif name.startswith("ur_"):
+#             candidates = list(self.pm.UNROLL_CANDIDATES)
+#         else:
+#             dom = domains.get(name)
+#             if dom is None:
+#                 raise ValueError(f"Unknown parameter: {name}")
+#             if not isinstance(dom, list):
+#                 candidates = [int(dom)]
+#             else:
+#                 saved_sym_map = dict(self.s.sym_map)
+#                 try:
+#                     self.s.sym_map = dict(assignment_state['sym_map'])
+#                     candidates = self.domain_propagator.candidate_values_for_domain(name, dom)
+#                     if candidates is None:
+#                         lo, hi = int(dom[0]), int(dom[1])
+#                         candidates = list(range(lo, hi + 1))
+#                     constraint_indices = self._var_constraints.get(name, [])
+#                     if constraint_indices:
+#                         candidates = self.domain_propagator.filter_by_constraints(
+#                             name,
+#                             candidates,
+#                             constraint_indices,
+#                             domains,
+#                         )
+#                 finally:
+#                     self.s.sym_map = saved_sym_map
+
+#         report = self._build_observability_report(assignment_state['params'], domains)
+#         report['query'] = {
+#             'param_name': name,
+#             'requested_params': assignment_state['requested_params'],
+#         }
+#         report['candidates'] = list(candidates)
+#         return report
+
+#     def propagate_param_assignment(self, name, value, sym_map=None):
+#         """한 변수에 값을 할당한 뒤 도메인 전파를 수행하고 관측 리포트를 반환한다."""
+#         updated = {}
+#         if sym_map is not None:
+#             updated.update(sym_map)
+#         updated[name] = int(value)
+#         assignment_state = self._materialize_assignment_state(updated)
+#         report = self._build_observability_report(
+#             assignment_state['params'],
+#             assignment_state['raw_domains'],
+#         )
+#         report['query'] = {
+#             'param_name': name,
+#             'param_value': int(value),
+#             'requested_params': assignment_state['requested_params'],
+#         }
+#         return report
+
+#     def get_constraints_under_assignment(self, sym_map=None, include_vars=True, include_eval=True):
+#         """현재 할당 하에서 제약식 요약(텍스트·남은 제약 등)을 담은 관측 리포트를 반환한다."""
+#         assignment_state = self._materialize_assignment_state(sym_map)
+#         report = self._build_observability_report(
+#             assignment_state['params'],
+#             assignment_state['raw_domains'],
+#             include_constraints_text=True,
+#             include_vars=include_vars,
+#             include_eval=include_eval,
+#         )
+#         report['query'] = {
+#             'requested_params': assignment_state['requested_params'],
+#             'include_vars': bool(include_vars),
+#             'include_eval': bool(include_eval),
+#         }
+#         return report
+
+#     def get_full_var_order_entries(self):
+#         """플래너가 계산한 변수 순서와 phase 구간 정보를 반환한다."""
+#         phases = []
+#         param_order = []
+#         for phase_index, entry in enumerate(self._get_var_order_phase_entries()):
+#             phase_param_names = list(entry['param_names'])
+#             phase_start = len(param_order)
+#             param_order.extend(phase_param_names)
+#             phases.append({
+#                 **entry,
+#                 'phase_index': phase_index,
+#                 'param_count': len(phase_param_names),
+#                 'param_start': phase_start,
+#                 'param_stop': len(param_order),
+#                 'prefix_param_names': list(param_order),
+#             })
+#         return {
+#             'phase_count': len(phases),
+#             'param_order': param_order,
+#             'phases': phases,
+#         }
+
+#     def randomize_params(self, rng=None, max_retries=1):
+#         """제약을 만족하는 파라미터를 무작위로 한 번 샘플링해 반환한다."""
+#         return self.param_sampler.randomize_params(rng=rng, max_retries=max_retries)
+
+#     def reset_unique_search(self):
+#         """unique schedule 탐색 캐시를 초기화한다."""
+#         self.param_sampler.reset_unique_search()
+
+#     def randomize_params_prefix(self, stop_after_phase, rng=None, max_retries=1):
+#         """지정 phase까지 prefix만 샘플링한 관측 리포트(assignment, domains, constraints 등)를 반환한다."""
+#         return self.param_sampler.randomize_params_prefix(
+#             stop_after_phase,
+#             rng=rng,
+#             max_retries=max_retries,
+#         )
 
 
 class _ScheduleGeneratorInspector:

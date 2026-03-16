@@ -14,8 +14,8 @@ class VarOrderPlanner:
         """phase 우선 순서를 구한 뒤 legacy fallback을 붙여 제너레이터에 var_order를 저장한다."""
         g = self.gen
         phase_entries = self._build_var_order_phase_entries()
-        normalized_entries, ordered, seen = self._build_phase_first_order(phase_entries)
-        self._append_legacy_fallback_vars(ordered, seen, self._compute_legacy_var_order())
+        normalized_entries, ordered = self._build_phase_first_order(phase_entries)
+        # self._append_legacy_fallback_vars(ordered, seen, self._compute_legacy_var_order())
 
         g._var_order_phase_entries = normalized_entries
         g._var_order = ordered
@@ -40,15 +40,8 @@ class VarOrderPlanner:
                 'grid_scope_label': entry['grid_scope_label'],
                 'vars': phase_vars,
             })
-        return normalized_entries, ordered, seen
+        return normalized_entries, ordered
 
-    @staticmethod
-    def _append_legacy_fallback_vars(ordered, seen, legacy_order):
-        for name in legacy_order:
-            if name in seen:
-                continue
-            seen.add(name)
-            ordered.append(name)
 
     # ------------------------------------------------------------------
     # Phase-order construction
@@ -491,145 +484,155 @@ class VarOrderPlanner:
             g.constraint_set._append_unique_vars(ordered, group)
         return ordered
 
-    def _compute_legacy_var_order(self):
-        g = self.gen
-        shared_vars = set()
-        thread_vars = set()
-        other_vars = set()
-        preferred_thread_vars = set(g._preferred_thread_vars)
-        preferred_thread_rank = {
-            name: idx for idx, name in enumerate(g._preferred_thread_vars)
-        }
 
-        for c in g._constraints:
-            kind = c['kind']
-            vs = c['vars']
-            if kind == 'shared_memory':
-                shared_vars.update(vs)
-            elif kind in ('max_threads', 'max_vthread'):
-                thread_vars.update(vs)
-            else:
-                other_vars.update(vs)
-
-        var_freq = {}
-        for v in g._all_sp_names:
-            var_freq[v] = len(g._var_constraints.get(v, []))
-
-        group_priority = {}
-        for step_idx, group in g._sp_groups.items():
-            group_set = set(group)
-
-            in_preferred_thread = bool(group_set & preferred_thread_vars)
-            in_shared = bool(group_set & shared_vars)
-            in_thread = bool(group_set & thread_vars)
-
-            if in_preferred_thread:
-                cat = 0
-            elif in_shared:
-                cat = 1
-            elif in_thread:
-                cat = 2
-            else:
-                cat = 3
-
-            min_nonlinear = True
-            total_freq = 0
-            preferred_hits = 0
-            preferred_rank = 1 << 30
-            for v in group:
-                total_freq += var_freq.get(v, 0)
-                if v in preferred_thread_vars:
-                    preferred_hits += 1
-                    preferred_rank = min(preferred_rank, preferred_thread_rank[v])
-                for ci in g._var_constraints.get(v, []):
-                    if not g._constraints[ci]['has_nonlinear']:
-                        min_nonlinear = False
-
-            group_priority[step_idx] = (
-                cat,
-                preferred_rank,
-                min_nonlinear,
-                -preferred_hits,
-                -total_freq,
-            )
-
-        sorted_steps = sorted(
-            g._sp_groups.keys(),
-            key=lambda si: group_priority.get(si, (3, True, 0))
-        )
-
-        ordered = []
-        for step_idx in sorted_steps:
-            ordered_group = sorted(
-                g._sp_groups[step_idx],
-                key=lambda name: (
-                    0 if name in preferred_thread_rank else 1,
-                    preferred_thread_rank.get(name, 1 << 30),
-                    int(name.split("_")[2]),
-                ),
-            )
-            ordered.extend(ordered_group)
-        return ordered
 
     # ------------------------------------------------------------------
     # Deprecated
     # ------------------------------------------------------------------
 
-    def get_var_order_phase_entries(self):
-        """phase별 변수 목록·이름·family·grid_scope 등을 담은 진입점 목록을 반환한다."""
-        def build_var_entry(name):
-            entry = {
-                'param_name': name,
-                'param_kind': 'symbolic',
-            }
-            if name.startswith("sp_"):
-                parts = name.split("_")
-                step_idx = int(parts[1])
-                pos = int(parts[2])
-                group_vars = list(self.gen._sp_groups.get(step_idx, []))
-                entry.update({
-                    'param_kind': 'split',
-                    'split_step_idx': step_idx,
-                    'split_position': pos,
-                    'split_extent': self.gen._sp_extents.get(step_idx),
-                    'split_group_param_names': group_vars,
-                    'collapsed_factor_param_names': group_vars[:pos],
-                    'is_innermost': name in self.gen._innermost_names,
-                })
-            elif name.startswith("ur_"):
-                entry.update({
-                    'param_kind': 'unroll',
-                    'unroll_step_idx': int(name.split("_")[1]),
-                    'candidate_values': list(self.gen.pm.UNROLL_CANDIDATES),
-                })
-            return entry
+    # @staticmethod
+    # def _append_legacy_fallback_vars(ordered, seen, legacy_order):
+    #     for name in legacy_order:
+    #         if name in seen:
+    #             continue
+    #         seen.add(name)
+    #         ordered.append(name)
 
-        return [
-            {
-                'phase_name': entry['name'],
-                'phase_family': entry['family'],
-                'phase_label': entry['label'],
-                'grid_scope': entry['grid_scope'],
-                'grid_scope_label': entry['grid_scope_label'],
-                'param_names': list(entry['vars']),
-                'param_entries': [build_var_entry(name) for name in entry['vars']],
-            }
-            for entry in self.gen._var_order_phase_entries
-        ]
+    # def _compute_legacy_var_order(self):
+    #     g = self.gen
+    #     shared_vars = set()
+    #     thread_vars = set()
+    #     other_vars = set()
+    #     preferred_thread_vars = set(g._preferred_thread_vars)
+    #     preferred_thread_rank = {
+    #         name: idx for idx, name in enumerate(g._preferred_thread_vars)
+    #     }
 
-    def resolve_var_order_stop_index(self, stop_after_phase):
-        """prefix 샘플링 시 멈출 phase 이름/인덱스를 받아 phase 인덱스를 반환한다."""
-        g = self.gen
-        exact_match = None
-        last_family_match = None
-        for idx, entry in enumerate(g._var_order_phase_entries):
-            if entry['name'] == stop_after_phase:
-                exact_match = idx
-                break
-            if entry['family'] == stop_after_phase:
-                last_family_match = idx
-        if exact_match is not None:
-            return exact_match
-        if last_family_match is not None:
-            return last_family_match
-        raise ValueError(f"Unknown var-order phase or family: {stop_after_phase}")
+    #     for c in g._constraints:
+    #         kind = c['kind']
+    #         vs = c['vars']
+    #         if kind == 'shared_memory':
+    #             shared_vars.update(vs)
+    #         elif kind in ('max_threads', 'max_vthread'):
+    #             thread_vars.update(vs)
+    #         else:
+    #             other_vars.update(vs)
+
+    #     var_freq = {}
+    #     for v in g._all_sp_names:
+    #         var_freq[v] = len(g._var_constraints.get(v, []))
+
+    #     group_priority = {}
+    #     for step_idx, group in g._sp_groups.items():
+    #         group_set = set(group)
+
+    #         in_preferred_thread = bool(group_set & preferred_thread_vars)
+    #         in_shared = bool(group_set & shared_vars)
+    #         in_thread = bool(group_set & thread_vars)
+
+    #         if in_preferred_thread:
+    #             cat = 0
+    #         elif in_shared:
+    #             cat = 1
+    #         elif in_thread:
+    #             cat = 2
+    #         else:
+    #             cat = 3
+
+    #         min_nonlinear = True
+    #         total_freq = 0
+    #         preferred_hits = 0
+    #         preferred_rank = 1 << 30
+    #         for v in group:
+    #             total_freq += var_freq.get(v, 0)
+    #             if v in preferred_thread_vars:
+    #                 preferred_hits += 1
+    #                 preferred_rank = min(preferred_rank, preferred_thread_rank[v])
+    #             for ci in g._var_constraints.get(v, []):
+    #                 if not g._constraints[ci]['has_nonlinear']:
+    #                     min_nonlinear = False
+
+    #         group_priority[step_idx] = (
+    #             cat,
+    #             preferred_rank,
+    #             min_nonlinear,
+    #             -preferred_hits,
+    #             -total_freq,
+    #         )
+
+    #     sorted_steps = sorted(
+    #         g._sp_groups.keys(),
+    #         key=lambda si: group_priority.get(si, (3, True, 0))
+    #     )
+
+    #     ordered = []
+    #     for step_idx in sorted_steps:
+    #         ordered_group = sorted(
+    #             g._sp_groups[step_idx],
+    #             key=lambda name: (
+    #                 0 if name in preferred_thread_rank else 1,
+    #                 preferred_thread_rank.get(name, 1 << 30),
+    #                 int(name.split("_")[2]),
+    #             ),
+    #         )
+    #         ordered.extend(ordered_group)
+    #     return ordered
+
+    # def get_var_order_phase_entries(self):
+    #     """phase별 변수 목록·이름·family·grid_scope 등을 담은 진입점 목록을 반환한다."""
+    #     def build_var_entry(name):
+    #         entry = {
+    #             'param_name': name,
+    #             'param_kind': 'symbolic',
+    #         }
+    #         if name.startswith("sp_"):
+    #             parts = name.split("_")
+    #             step_idx = int(parts[1])
+    #             pos = int(parts[2])
+    #             group_vars = list(self.gen._sp_groups.get(step_idx, []))
+    #             entry.update({
+    #                 'param_kind': 'split',
+    #                 'split_step_idx': step_idx,
+    #                 'split_position': pos,
+    #                 'split_extent': self.gen._sp_extents.get(step_idx),
+    #                 'split_group_param_names': group_vars,
+    #                 'collapsed_factor_param_names': group_vars[:pos],
+    #                 'is_innermost': name in self.gen._innermost_names,
+    #             })
+    #         elif name.startswith("ur_"):
+    #             entry.update({
+    #                 'param_kind': 'unroll',
+    #                 'unroll_step_idx': int(name.split("_")[1]),
+    #                 'candidate_values': list(self.gen.pm.UNROLL_CANDIDATES),
+    #             })
+    #         return entry
+
+    #     return [
+    #         {
+    #             'phase_name': entry['name'],
+    #             'phase_family': entry['family'],
+    #             'phase_label': entry['label'],
+    #             'grid_scope': entry['grid_scope'],
+    #             'grid_scope_label': entry['grid_scope_label'],
+    #             'param_names': list(entry['vars']),
+    #             'param_entries': [build_var_entry(name) for name in entry['vars']],
+    #         }
+    #         for entry in self.gen._var_order_phase_entries
+    #     ]
+
+    # def resolve_var_order_stop_index(self, stop_after_phase):
+    #     """prefix 샘플링 시 멈출 phase 이름/인덱스를 받아 phase 인덱스를 반환한다."""
+    #     g = self.gen
+    #     exact_match = None
+    #     last_family_match = None
+    #     for idx, entry in enumerate(g._var_order_phase_entries):
+    #         if entry['name'] == stop_after_phase:
+    #             exact_match = idx
+    #             break
+    #         if entry['family'] == stop_after_phase:
+    #             last_family_match = idx
+    #     if exact_match is not None:
+    #         return exact_match
+    #     if last_family_match is not None:
+    #         return last_family_match
+    #     raise ValueError(f"Unknown var-order phase or family: {stop_after_phase}")

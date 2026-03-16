@@ -401,6 +401,8 @@ class TransformApplier:
             tosplit_extent = SymExpr(int(step.extent))
         else:
             tosplit_extent = None
+        if tosplit_extent is not None:
+            s._split_step_extents[step_idx] = SymExpr(tosplit_extent.val)
 
         sym_lengths = []
         for li, length in enumerate(lengths):

@@ -84,13 +84,7 @@ class ParamSampler:
 
     def _build_split_domains(self):
         """모든 split 파라미터에 대한 초기 도메인 [1, extent] 딕셔너리를 만든다."""
-        g = self.gen
-        domains = {}
-        for name in g._all_sp_names:
-            step_idx = int(name.split("_")[1])
-            extent = g._sp_extents.get(step_idx)
-            domains[name] = [1, extent] if extent is not None else 1
-        return domains
+        return self.gen._build_split_domains()
 
     def _initialize_unique_search_base_state(self, var_order):
         """unique search용 초기 상태를 만든다.
@@ -104,10 +98,7 @@ class ParamSampler:
             g.s.sym_map[name] = 1
 
         domains = self._build_split_domains()
-        group_remaining = {
-            step_idx: extent
-            for step_idx, extent in g._sp_extents.items()
-        }
+        group_remaining = {}
         return result, domains, group_remaining, list(var_order)
 
     # ------------------------------------------------------------------
@@ -119,12 +110,12 @@ class ParamSampler:
         innermost_limit = g.hw['max_innermost_split_factor']
         parts = name.split("_")
         step_idx = int(parts[1])
-        extent = g._sp_extents.get(step_idx)
+        extent = g._get_dynamic_split_extent(step_idx)
 
         if extent is None:
             return [int(g.s.sym_map.get(name, 1))]
 
-        remaining = group_remaining.get(step_idx, extent)
+        remaining = g._get_group_remaining(step_idx, group_remaining)
         candidates = g.pm._divisors(remaining)
 
         if name in g._innermost_names:
@@ -162,12 +153,12 @@ class ParamSampler:
 
         parts = name.split("_")
         step_idx = int(parts[1])
-        extent = g._sp_extents.get(step_idx)
+        extent = g._get_dynamic_split_extent(step_idx)
         if extent is None:
             domains[name] = chosen
             return
 
-        remaining = group_remaining.get(step_idx, extent)
+        remaining = g._get_group_remaining(step_idx, group_remaining)
         domains[name] = chosen
         group_remaining[step_idx] = (remaining + chosen - 1) // chosen
 
@@ -324,369 +315,375 @@ class ParamSampler:
     # Deprecated
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _restore_sym_value(sym_map, name, old_value):
-        if old_value is None:
-            sym_map.pop(name, None)
-            return
-        sym_map[name] = old_value
+    # @staticmethod
+    # def _restore_sym_value(sym_map, name, old_value):
+    #     if old_value is None:
+    #         sym_map.pop(name, None)
+    #         return
+    #     sym_map[name] = old_value
 
-    def _assign_initial_fixed_vars(self, var_order, domains, group_remaining, result):
-        """이미 도메인이 1개 값으로 고정된 변수들을 먼저 할당하고, 미할당 변수 목록을 반환한다."""
-        g = self.gen
-        innermost_limit = g.hw['max_innermost_split_factor']
-        progress = True
+    # def _assign_initial_fixed_vars(self, var_order, domains, group_remaining, result):
+    #     """이미 도메인이 1개 값으로 고정된 변수들을 먼저 할당하고, 미할당 변수 목록을 반환한다."""
+    #     g = self.gen
+    #     innermost_limit = g.hw['max_innermost_split_factor']
+    #     progress = True
 
-        while progress:
-            progress = False
-            for name in var_order:
-                if name in result:
-                    continue
+    #     while progress:
+    #         progress = False
+    #         for name in var_order:
+    #             if name in result:
+    #                 continue
 
-                dom = domains.get(name)
-                if isinstance(dom, list):
-                    lo, hi = int(dom[0]), int(dom[1])
-                    if lo != hi:
-                        continue
-                    fixed_value = lo
-                else:
-                    fixed_value = int(dom)
+    #             dom = domains.get(name)
+    #             if isinstance(dom, list):
+    #                 lo, hi = int(dom[0]), int(dom[1])
+    #                 if lo != hi:
+    #                     continue
+    #                 fixed_value = lo
+    #             else:
+    #                 fixed_value = int(dom)
 
-                parts = name.split("_")
-                step_idx = int(parts[1])
-                extent = g._sp_extents.get(step_idx)
+    #             parts = name.split("_")
+    #             step_idx = int(parts[1])
+    #             extent = g._get_dynamic_split_extent(step_idx)
 
-                if extent is None:
-                    g.s.sym_map[name] = fixed_value
-                    domains[name] = fixed_value
-                    result[name] = fixed_value
-                    progress = True
-                    continue
+    #             if extent is None:
+    #                 g.s.sym_map[name] = fixed_value
+    #                 domains[name] = fixed_value
+    #                 result[name] = fixed_value
+    #                 progress = True
+    #                 continue
 
-                pos = int(parts[2])
-                group_names = g._sp_groups.get(step_idx, [])
-                if any(prev_name not in result for prev_name in group_names[:pos]):
-                    continue
+    #             unresolved_extent_deps = [
+    #                 dep_name
+    #                 for dep_name in g._get_split_extent_dependencies(step_idx)
+    #                 if dep_name.startswith("sp_") and dep_name not in result and dep_name != name
+    #             ]
+    #             if unresolved_extent_deps:
+    #                 continue
 
-                remaining = group_remaining.get(step_idx, extent)
-                candidates = g.pm._divisors(remaining)
-                if name in g._innermost_names:
-                    candidates = [c for c in candidates if c <= innermost_limit]
-                if fixed_value not in candidates:
-                    continue
+    #             pos = int(parts[2])
+    #             group_names = g._sp_groups.get(step_idx, [])
+    #             if any(prev_name not in result for prev_name in group_names[:pos]):
+    #                 continue
 
-                g.s.sym_map[name] = fixed_value
-                domains[name] = fixed_value
-                result[name] = fixed_value
-                group_remaining[step_idx] = (remaining + fixed_value - 1) // fixed_value
+    #             remaining = g._get_group_remaining(step_idx, group_remaining)
+    #             candidates = g.pm._divisors(remaining)
+    #             if name in g._innermost_names:
+    #                 candidates = [c for c in candidates if c <= innermost_limit]
+    #             if fixed_value not in candidates:
+    #                 continue
 
-                constraint_indices = g._var_constraints.get(name, [])
-                if constraint_indices:
-                    g.domain_propagator.propagate_domain(name, domains)
-                progress = True
+    #             g.s.sym_map[name] = fixed_value
+    #             domains[name] = fixed_value
+    #             result[name] = fixed_value
+    #             group_remaining[step_idx] = (remaining + fixed_value - 1) // fixed_value
 
-        return [name for name in var_order if name not in result]
+    #             constraint_indices = g._var_constraints.get(name, [])
+    #             if constraint_indices:
+    #                 g.domain_propagator.propagate_domain(name, domains)
+    #             progress = True
 
-    def _initialize_split_sampling_state(self, var_order):
-        """split 도메인·그룹 잔여량을 세팅하고 고정 변수를 할당한 뒤 (result, domains, group_remaining, 남은 변수 순서)를 반환한다."""
-        g = self.gen
-        result = {}
-        for name in g._all_sp_names:
-            g.s.sym_map[name] = 1
+    #     return [name for name in var_order if name not in result]
 
-        domains = self._build_split_domains()
-        group_remaining = {
-            step_idx: extent
-            for step_idx, extent in g._sp_extents.items()
-        }
-        effective_var_order = self._assign_initial_fixed_vars(
-            var_order,
-            domains,
-            group_remaining,
-            result,
-        )
-        return result, domains, group_remaining, effective_var_order
+    # def _initialize_split_sampling_state(self, var_order):
+    #     """split 도메인·그룹 잔여량을 세팅하고 고정 변수를 할당한 뒤 (result, domains, group_remaining, 남은 변수 순서)를 반환한다."""
+    #     g = self.gen
+    #     result = {}
+    #     for name in g._all_sp_names:
+    #         g.s.sym_map[name] = 1
 
-    def _sample_split_var(self, name, domains, group_remaining, rng, result):
-        """한 split 변수에 대해 제약을 만족하는 후보 중 하나를 무작위로 골라 할당한다. 성공 여부를 반환."""
-        g = self.gen
-        innermost_limit = g.hw['max_innermost_split_factor']
-        parts = name.split("_")
-        step_idx = int(parts[1])
-        extent = g._sp_extents.get(step_idx)
+    #     domains = self._build_split_domains()
+    #     group_remaining = {}
+    #     effective_var_order = self._assign_initial_fixed_vars(
+    #         var_order,
+    #         domains,
+    #         group_remaining,
+    #         result,
+    #     )
+    #     return result, domains, group_remaining, effective_var_order
 
-        if extent is None:
-            result[name] = g.s.sym_map[name]
-            domains[name] = g.s.sym_map[name]
-            return True
+    # def _sample_split_var(self, name, domains, group_remaining, rng, result):
+    #     """한 split 변수에 대해 제약을 만족하는 후보 중 하나를 무작위로 골라 할당한다. 성공 여부를 반환."""
+    #     g = self.gen
+    #     innermost_limit = g.hw['max_innermost_split_factor']
+    #     parts = name.split("_")
+    #     step_idx = int(parts[1])
+    #     extent = g._get_dynamic_split_extent(step_idx)
 
-        remaining = group_remaining.get(step_idx, extent)
-        candidates = g.pm._divisors(remaining)
+    #     if extent is None:
+    #         result[name] = g.s.sym_map[name]
+    #         domains[name] = g.s.sym_map[name]
+    #         return True
 
-        if name in g._innermost_names:
-            candidates = [c for c in candidates if c <= innermost_limit]
+    #     remaining = g._get_group_remaining(step_idx, group_remaining)
+    #     candidates = g.pm._divisors(remaining)
 
-        dom = domains.get(name)
-        if isinstance(dom, list):
-            if dom[1] < candidates[-1]:
-                candidates = [c for c in candidates if c <= dom[1]]
-            if dom[0] > candidates[0]:
-                candidates = [c for c in candidates if c >= dom[0]]
+    #     if name in g._innermost_names:
+    #         candidates = [c for c in candidates if c <= innermost_limit]
 
-        constraint_indices = g._var_constraints.get(name, [])
-        if constraint_indices:
-            candidates = g.domain_propagator.filter_by_constraints(
-                name,
-                candidates,
-                constraint_indices,
-                domains,
-            )
+    #     dom = domains.get(name)
+    #     if isinstance(dom, list):
+    #         if dom[1] < candidates[-1]:
+    #             candidates = [c for c in candidates if c <= dom[1]]
+    #         if dom[0] > candidates[0]:
+    #             candidates = [c for c in candidates if c >= dom[0]]
 
-        if not candidates:
-            return False
+    #     constraint_indices = g._var_constraints.get(name, [])
+    #     if constraint_indices:
+    #         candidates = g.domain_propagator.filter_by_constraints(
+    #             name,
+    #             candidates,
+    #             constraint_indices,
+    #             domains,
+    #         )
 
-        chosen = rng.choice(candidates)
-        g.s.sym_map[name] = chosen
-        result[name] = chosen
-        domains[name] = chosen
-        group_remaining[step_idx] = (remaining + chosen - 1) // chosen
+    #     if not candidates:
+    #         return False
 
-        if constraint_indices:
-            g.domain_propagator.propagate_domain(name, domains)
-        return True
+    #     chosen = rng.choice(candidates)
+    #     g.s.sym_map[name] = chosen
+    #     result[name] = chosen
+    #     domains[name] = chosen
+    #     group_remaining[step_idx] = (remaining + chosen - 1) // chosen
 
-    def _build_prefix_report(self, stop_after_phase, phases, prefix, params, domains):
-        """prefix 구간 샘플링 결과를 관측 가능한 리포트 딕셔너리로 만든다."""
-        g = self.gen
-        report = g._build_observability_report(params, domains)
-        report['query'] = {
-            'requested_stop_after_phase': stop_after_phase,
-        }
-        report['phase_selection'] = {
-            'resolved_phase_name': phases[-1]['phase_name'] if phases else None,
-            'resolved_phase_family': phases[-1]['phase_family'] if phases else None,
-            'resolved_phase_index': phases[-1]['phase_index'] if phases else None,
-        }
-        report['param_order'] = list(prefix)
-        report['phases'] = phases
-        return report
+    #     if constraint_indices:
+    #         g.domain_propagator.propagate_domain(name, domains)
+    #     return True
 
-    def randomize_params_with_order(
-        self,
-        var_order,
-        rng=None,
-        max_retries=1,
-        assign_unroll=True,
-        require_full_validation=True,
-        return_domains=False,
-    ):
-        """지정한 변수 순서대로 제약을 만족하는 파라미터를 무작위 샘플링한다. 실패 시 재시도."""
-        import random as _random
+    # def _build_prefix_report(self, stop_after_phase, phases, prefix, params, domains):
+    #     """prefix 구간 샘플링 결과를 관측 가능한 리포트 딕셔너리로 만든다."""
+    #     g = self.gen
+    #     report = g._build_observability_report(params, domains)
+    #     report['query'] = {
+    #         'requested_stop_after_phase': stop_after_phase,
+    #     }
+    #     report['phase_selection'] = {
+    #         'resolved_phase_name': phases[-1]['phase_name'] if phases else None,
+    #         'resolved_phase_family': phases[-1]['phase_family'] if phases else None,
+    #         'resolved_phase_index': phases[-1]['phase_index'] if phases else None,
+    #     }
+    #     report['param_order'] = list(prefix)
+    #     report['phases'] = phases
+    #     return report
 
-        g = self.gen
-        if rng is None:
-            rng = _random.Random()
+    # def randomize_params_with_order(
+    #     self,
+    #     var_order,
+    #     rng=None,
+    #     max_retries=1,
+    #     assign_unroll=True,
+    #     require_full_validation=True,
+    #     return_domains=False,
+    # ):
+    #     """지정한 변수 순서대로 제약을 만족하는 파라미터를 무작위 샘플링한다. 실패 시 재시도."""
+    #     import random as _random
 
-        violations = None
-        for _ in range(max_retries):
-            result, domains, group_remaining, effective_var_order = (
-                self._initialize_split_sampling_state(var_order)
-            )
+    #     g = self.gen
+    #     if rng is None:
+    #         rng = _random.Random()
 
-            ok = True
-            for name in effective_var_order:
-                if not self._sample_split_var(name, domains, group_remaining, rng, result):
-                    ok = False
-                    break
+    #     violations = None
+    #     for _ in range(max_retries):
+    #         result, domains, group_remaining, effective_var_order = (
+    #             self._initialize_split_sampling_state(var_order)
+    #         )
 
-            if not ok:
-                continue
+    #         ok = True
+    #         for name in effective_var_order:
+    #             if not self._sample_split_var(name, domains, group_remaining, rng, result):
+    #                 ok = False
+    #                 break
 
-            if assign_unroll:
-                self._assign_unroll_vars(result, rng)
+    #         if not ok:
+    #             continue
 
-            violations = self._validate_sample(
-                result,
-                assign_unroll=assign_unroll,
-                require_full_validation=require_full_validation,
-            )
-            if not require_full_validation:
-                if return_domains:
-                    return result, g.domain_propagator.snapshot_domains(domains)
-                return result
+    #         if assign_unroll:
+    #             self._assign_unroll_vars(result, rng)
 
-            if not violations:
-                return result
+    #         violations = self._validate_sample(
+    #             result,
+    #             assign_unroll=assign_unroll,
+    #             require_full_validation=require_full_validation,
+    #         )
+    #         if not require_full_validation:
+    #             if return_domains:
+    #                 return result, g.domain_propagator.snapshot_domains(domains)
+    #             return result
 
-        if require_full_validation:
-            raise RuntimeError(
-                f"Failed to find valid params after {max_retries} retries. "
-                f"Last violations: {violations}"
-            )
-        raise RuntimeError(
-            f"Failed to assign requested var prefix after {max_retries} retries."
-        )
+    #         if not violations:
+    #             return result
 
-    def randomize_params(self, rng=None, max_retries=1):
-        """전체 변수 순서로 파라미터를 한 번 무작위 샘플링해 할당 결과를 반환한다."""
-        g = self.gen
-        return self.randomize_params_with_order(
-            g._var_order,
-            rng=rng,
-            max_retries=max_retries,
-            assign_unroll=True,
-            require_full_validation=True,
-        )
+    #     if require_full_validation:
+    #         raise RuntimeError(
+    #             f"Failed to find valid params after {max_retries} retries. "
+    #             f"Last violations: {violations}"
+    #         )
+    #     raise RuntimeError(
+    #         f"Failed to assign requested var prefix after {max_retries} retries."
+    #     )
 
-    def randomize_params_prefix(self, stop_after_phase, rng=None, max_retries=1):
-        """지정 phase까지의 prefix 변수만 샘플링하고 관측 리포트(assignment, domains 등)를 반환한다."""
-        g = self.gen
-        stop_idx = g.var_order_planner.resolve_var_order_stop_index(stop_after_phase)
-        prefix = []
-        phases = []
-        for idx, entry in enumerate(g._get_var_order_phase_entries()):
-            prefix.extend(entry['param_names'])
-            phases.append({
-                **entry,
-                'phase_index': idx,
-                'param_count': len(entry['param_names']),
-                'param_start': len(prefix) - len(entry['param_names']),
-                'param_stop': len(prefix),
-                'prefix_param_names': list(prefix),
-            })
-            if idx == stop_idx:
-                break
-        params, domains = self.randomize_params_with_order(
-            prefix,
-            rng=rng,
-            max_retries=max_retries,
-            assign_unroll=False,
-            require_full_validation=False,
-            return_domains=True,
-        )
-        return self._build_prefix_report(stop_after_phase, phases, prefix, params, domains)
+    # def randomize_params(self, rng=None, max_retries=1):
+    #     """전체 변수 순서로 파라미터를 한 번 무작위 샘플링해 할당 결과를 반환한다."""
+    #     g = self.gen
+    #     return self.randomize_params_with_order(
+    #         g._var_order,
+    #         rng=rng,
+    #         max_retries=max_retries,
+    #         assign_unroll=True,
+    #         require_full_validation=True,
+    #     )
 
-    def _enumerate_all_params(self, max_results=100_000):
-        """제약을 만족하는 split 할당을 모두 열거한다 (최대 max_results개). 디버그/검증용."""
-        g = self.gen
-        innermost_limit = g.hw['max_innermost_split_factor']
-        sp_results = []
+    # def randomize_params_prefix(self, stop_after_phase, rng=None, max_retries=1):
+    #     """지정 phase까지의 prefix 변수만 샘플링하고 관측 리포트(assignment, domains 등)를 반환한다."""
+    #     g = self.gen
+    #     stop_idx = g.var_order_planner.resolve_var_order_stop_index(stop_after_phase)
+    #     prefix = []
+    #     phases = []
+    #     for idx, entry in enumerate(g._get_var_order_phase_entries()):
+    #         prefix.extend(entry['param_names'])
+    #         phases.append({
+    #             **entry,
+    #             'phase_index': idx,
+    #             'param_count': len(entry['param_names']),
+    #             'param_start': len(prefix) - len(entry['param_names']),
+    #             'param_stop': len(prefix),
+    #             'prefix_param_names': list(prefix),
+    #         })
+    #         if idx == stop_idx:
+    #             break
+    #     params, domains = self.randomize_params_with_order(
+    #         prefix,
+    #         rng=rng,
+    #         max_retries=max_retries,
+    #         assign_unroll=False,
+    #         require_full_validation=False,
+    #         return_domains=True,
+    #     )
+    #     return self._build_prefix_report(stop_after_phase, phases, prefix, params, domains)
 
-        def _dfs(var_idx, result, domains, group_remaining):
-            if len(sp_results) >= max_results:
-                return
+    # def _enumerate_all_params(self, max_results=100_000):
+    #     """제약을 만족하는 split 할당을 모두 열거한다 (최대 max_results개). 디버그/검증용."""
+    #     g = self.gen
+    #     innermost_limit = g.hw['max_innermost_split_factor']
+    #     sp_results = []
 
-            if var_idx == len(g._var_order):
-                for name, val in result.items():
-                    g.s.sym_map[name] = val
-                violations = g.check_all_exact(result)
-                if not violations:
-                    sp_results.append(dict(result))
-                return
+    #     def _dfs(var_idx, result, domains, group_remaining):
+    #         if len(sp_results) >= max_results:
+    #             return
 
-            name = g._var_order[var_idx]
-            parts = name.split("_")
-            step_idx = int(parts[1])
+    #         if var_idx == len(g._var_order):
+    #             for name, val in result.items():
+    #                 g.s.sym_map[name] = val
+    #             violations = g.check_all_exact(result)
+    #             if not violations:
+    #                 sp_results.append(dict(result))
+    #             return
 
-            extent = g._sp_extents.get(step_idx)
-            if extent is None:
-                result[name] = g.s.sym_map.get(name, 1)
-                domains[name] = result[name]
-                _dfs(var_idx + 1, result, domains, group_remaining)
-                del result[name]
-                del domains[name]
-                return
+    #         name = g._var_order[var_idx]
+    #         parts = name.split("_")
+    #         step_idx = int(parts[1])
 
-            remaining = group_remaining.get(step_idx, extent)
-            candidates = g.pm._divisors(remaining)
+    #         extent = g._get_dynamic_split_extent(step_idx)
+    #         if extent is None:
+    #             result[name] = g.s.sym_map.get(name, 1)
+    #             domains[name] = result[name]
+    #             _dfs(var_idx + 1, result, domains, group_remaining)
+    #             del result[name]
+    #             del domains[name]
+    #             return
 
-            if name in g._innermost_names:
-                candidates = [c for c in candidates if c <= innermost_limit]
+    #         remaining = g._get_group_remaining(step_idx, group_remaining)
+    #         candidates = g.pm._divisors(remaining)
 
-            dom = domains.get(name)
-            if isinstance(dom, list):
-                if dom[1] < candidates[-1]:
-                    candidates = [c for c in candidates if c <= dom[1]]
-                if dom[0] > candidates[0]:
-                    candidates = [c for c in candidates if c >= dom[0]]
+    #         if name in g._innermost_names:
+    #             candidates = [c for c in candidates if c <= innermost_limit]
 
-            constraint_indices = g._var_constraints.get(name, [])
-            if constraint_indices:
-                candidates = g.domain_propagator.filter_by_constraints(
-                    name, candidates, constraint_indices, domains
-                )
+    #         dom = domains.get(name)
+    #         if isinstance(dom, list):
+    #             if dom[1] < candidates[-1]:
+    #                 candidates = [c for c in candidates if c <= dom[1]]
+    #             if dom[0] > candidates[0]:
+    #                 candidates = [c for c in candidates if c >= dom[0]]
 
-            if not candidates:
-                return
+    #         constraint_indices = g._var_constraints.get(name, [])
+    #         if constraint_indices:
+    #             candidates = g.domain_propagator.filter_by_constraints(
+    #                 name, candidates, constraint_indices, domains
+    #             )
 
-            old_sym = g.s.sym_map.get(name, 1)
-            old_remaining = group_remaining.get(step_idx, extent)
+    #         if not candidates:
+    #             return
 
-            for chosen in candidates:
-                if len(sp_results) >= max_results:
-                    return
+    #         old_sym = g.s.sym_map.get(name, 1)
+    #         old_remaining = group_remaining.get(step_idx)
 
-                g.s.sym_map[name] = chosen
-                result[name] = chosen
+    #         for chosen in candidates:
+    #             if len(sp_results) >= max_results:
+    #                 return
 
-                saved_domains = {}
-                for k, v in domains.items():
-                    if isinstance(v, list):
-                        saved_domains[k] = list(v)
-                domains[name] = chosen
+    #             g.s.sym_map[name] = chosen
+    #             result[name] = chosen
 
-                group_remaining[step_idx] = (remaining + chosen - 1) // chosen
+    #             saved_domains = {}
+    #             for k, v in domains.items():
+    #                 if isinstance(v, list):
+    #                     saved_domains[k] = list(v)
+    #             domains[name] = chosen
 
-                if constraint_indices:
-                    g.domain_propagator.propagate_domain(name, domains)
+    #             group_remaining[step_idx] = (remaining + chosen - 1) // chosen
 
-                _dfs(var_idx + 1, result, domains, group_remaining)
+    #             if constraint_indices:
+    #                 g.domain_propagator.propagate_domain(name, domains)
 
-                del result[name]
-                g.s.sym_map[name] = old_sym
-                group_remaining[step_idx] = old_remaining
-                for k, saved_v in saved_domains.items():
-                    domains[k] = saved_v
-                domains.pop(name, None)
+    #             _dfs(var_idx + 1, result, domains, group_remaining)
 
-        for name in g._all_sp_names:
-            g.s.sym_map[name] = 1
+    #             del result[name]
+    #             g.s.sym_map[name] = old_sym
+    #             if old_remaining is None:
+    #                 group_remaining.pop(step_idx, None)
+    #             else:
+    #                 group_remaining[step_idx] = old_remaining
+    #             for k, saved_v in saved_domains.items():
+    #                 domains[k] = saved_v
+    #             domains.pop(name, None)
 
-        domains = {}
-        for name in g._all_sp_names:
-            parts = name.split("_")
-            step_idx = int(parts[1])
-            ext = g._sp_extents.get(step_idx)
-            if ext is not None:
-                domains[name] = [1, ext]
-            else:
-                domains[name] = 1
+    #     for name in g._all_sp_names:
+    #         g.s.sym_map[name] = 1
 
-        group_remaining = {}
-        for step_idx, ext in g._sp_extents.items():
-            group_remaining[step_idx] = ext
+    #     domains = {}
+    #     for name in g._all_sp_names:
+    #         parts = name.split("_")
+    #         step_idx = int(parts[1])
+    #         ext = g._get_dynamic_split_extent(step_idx)
+    #         if ext is not None:
+    #             domains[name] = [1, ext]
+    #         else:
+    #             domains[name] = 1
 
-        _dfs(0, {}, domains, group_remaining)
+    #     group_remaining = {}
 
-        if not sp_results:
-            return []
+    #     _dfs(0, {}, domains, group_remaining)
 
-        ur_names = sorted(g._ur_names)
-        if not ur_names:
-            return sp_results
+    #     if not sp_results:
+    #         return []
 
-        ur_combos = list(itertools_product(
-            *[g.pm.UNROLL_CANDIDATES for _ in ur_names]
-        ))
+    #     ur_names = sorted(g._ur_names)
+    #     if not ur_names:
+    #         return sp_results
 
-        all_results = []
-        for sp in sp_results:
-            for ur_vals in ur_combos:
-                if len(all_results) >= max_results:
-                    return all_results
-                combined = dict(sp)
-                for i, ur_name in enumerate(ur_names):
-                    combined[ur_name] = ur_vals[i]
-                all_results.append(combined)
+    #     ur_combos = list(itertools_product(
+    #         *[g.pm.UNROLL_CANDIDATES for _ in ur_names]
+    #     ))
 
-        return all_results
+    #     all_results = []
+    #     for sp in sp_results:
+    #         for ur_vals in ur_combos:
+    #             if len(all_results) >= max_results:
+    #                 return all_results
+    #             combined = dict(sp)
+    #             for i, ur_name in enumerate(ur_names):
+    #                 combined[ur_name] = ur_vals[i]
+    #             all_results.append(combined)
+
+    #     return all_results

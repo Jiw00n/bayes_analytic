@@ -1051,12 +1051,12 @@ IRModule VMCompiler::OptimizeModuleImpl(IRModule mod) {
   backend::BindParamsInModule(mod, params_);
   Array<Pass> pass_seqs = relay::backend::GetPassPrefix(
       /*is_homogeneous=*/config_->optional_homogeneous_target.defined(), /*is_vm=*/true);
-  pass_seqs.push_back(tvm::transform::PrintIR("after_prefix"));
+  // pass_seqs.push_back(tvm::transform::PrintIR("after_prefix"));
 
   // Always plan devices so the remaining passes don't need to distinguish homogeneous vs
   // heterogeneous execution.
   pass_seqs.push_back(transform::PlanDevices(config_));
-  pass_seqs.push_back(tvm::transform::PrintIR("after_plan_devices"));
+  // pass_seqs.push_back(tvm::transform::PrintIR("after_plan_devices"));
 
 
   if (config_->optional_homogeneous_target.defined()) {
@@ -1065,16 +1065,16 @@ IRModule VMCompiler::OptimizeModuleImpl(IRModule mod) {
         config_->optional_homogeneous_target->GetAttr<Integer>("max_function_args", 0)
             .value()
             .IntValue()));
-    pass_seqs.push_back(tvm::transform::PrintIR("after_split_args"));
+    // pass_seqs.push_back(tvm::transform::PrintIR("after_split_args"));
   }
   
 
   pass_seqs.push_back(transform::FuseOps());
-  pass_seqs.push_back(tvm::transform::PrintIR("after_fuse_ops"));
+  // pass_seqs.push_back(tvm::transform::PrintIR("after_fuse_ops"));
 
 
   pass_seqs.push_back(transform::AnnotateMemoryScope());
-  pass_seqs.push_back(tvm::transform::PrintIR("after_annotate_memory_scope"));
+  // pass_seqs.push_back(tvm::transform::PrintIR("after_annotate_memory_scope"));
 
 
   // Do layout rewrite for auto-scheduler.
@@ -1123,7 +1123,7 @@ IRModule VMCompiler::OptimizeModuleImpl(IRModule mod) {
       backend::UpdateConstants(func, &params_);
     }
   }));
-  pass_seqs.push_back(tvm::transform::PrintIR("after_lower_te"));
+  // pass_seqs.push_back(tvm::transform::PrintIR("after_lower_te"));
 
 
   // Since lowered functions are bound in the IRModule, we can now eliminate any unused

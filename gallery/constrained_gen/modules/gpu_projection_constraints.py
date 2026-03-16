@@ -296,9 +296,6 @@ def build_projected_shared_memory_constraint_node(
     return shared_node
 
 
-# ------------------------------------------------------------------
-# Deprecated
-# ------------------------------------------------------------------
 
 
 def _to_pruning_expr_node(node, constraint_name):
@@ -351,3 +348,8 @@ def build_projected_constraint_nodes(exact_nodes, hw, allowed_var_names=None):
         "shared_node": shared_node,
         "max_vthread_node": max_vthread_node,
     }
+
+
+# ------------------------------------------------------------------
+# Deprecated
+# ------------------------------------------------------------------

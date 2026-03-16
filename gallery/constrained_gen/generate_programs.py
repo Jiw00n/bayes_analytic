@@ -509,7 +509,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    tasks = load_and_register_tasks()
+    tasks = load_and_register_tasks("/root/work/tvm-ansor/gallery/dataset/network_info_all")
     selected_tasks = select_tasks(tasks, args)
 
     results = run_selected_tasks(

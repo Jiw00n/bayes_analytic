@@ -69,7 +69,7 @@ def verify_gpu_module_errors(mod, constraints=None):
     return errors
 
 
-def _patch_record_steps(record, params):
+def _patch_record_steps(record, params, split_extents=None):
     """Measure record JSON의 step payload에 params를 반영한다."""
     steps = record["i"][1][1]
 
@@ -88,18 +88,25 @@ def _patch_record_steps(record, params):
             if s[0] == "PR":
                 s[3] = f"auto_unroll_max_step${int(val)}"
 
+    if split_extents:
+        for step_idx, extent in split_extents.items():
+            if 0 <= int(step_idx) < len(steps):
+                s = steps[int(step_idx)]
+                if s[0] == "SP":
+                    s[3] = int(extent)
 
-def _params_to_state_from_measure_record(base_inp, base_res, params):
+
+def _params_to_state_from_measure_record(base_inp, base_res, params, split_extents=None):
     """기존 MeasureInput/MeasureResult record를 patch해 새 State를 복원한다."""
     record_str = dump_record_to_string(base_inp, base_res)
     record = json.loads(record_str)
-    _patch_record_steps(record, params)
+    _patch_record_steps(record, params, split_extents=split_extents)
     patched_str = json.dumps(record)
     new_inp, _ = load_record_from_string(patched_str)
     return new_inp.state
 
 
-def params_to_state_from_state(task, base_state, params):
+def params_to_state_from_state(task, base_state, params, split_extents=None):
     """Raw concrete State에 params를 적용한 새 auto_scheduler State를 반환."""
     base_inp = auto_scheduler.MeasureInput(task, base_state)
     base_res = auto_scheduler.MeasureResult(
@@ -109,7 +116,12 @@ def params_to_state_from_state(task, base_state, params):
         0.0,
         0,
     )
-    return _params_to_state_from_measure_record(base_inp, base_res, params)
+    return _params_to_state_from_measure_record(
+        base_inp,
+        base_res,
+        params,
+        split_extents=split_extents,
+    )
 
 
 def build_state_record_steps_payload(task, state):
@@ -137,18 +149,23 @@ def concrete_state_fingerprint(task, state):
 # ------------------------------------------------------------------
 
 
-def verify_gpu_module(mod, constraints=None):
-    """Lowered IRModule에 대해 tir.analysis.verify_gpu_code로 GPU 제약 확인."""
-    if constraints is None:
-        constraints = GPU_VERIFY_CONSTRAINTS
-    for _, f in mod.functions.items():
-        if isinstance(f, tvm.tir.PrimFunc):
-            if not _verify_gpu_code(f, constraints):
-                return False
-    return True
+# def verify_gpu_module(mod, constraints=None):
+#     """Lowered IRModule에 대해 tir.analysis.verify_gpu_code로 GPU 제약 확인."""
+#     if constraints is None:
+#         constraints = GPU_VERIFY_CONSTRAINTS
+#     for _, f in mod.functions.items():
+#         if isinstance(f, tvm.tir.PrimFunc):
+#             if not _verify_gpu_code(f, constraints):
+#                 return False
+#     return True
 
 
-def params_to_state_from_record(task, base_inp, base_res, params):
-    """Record 기반 sketch에 params를 적용한 새 auto_scheduler State를 반환."""
-    del task
-    return _params_to_state_from_measure_record(base_inp, base_res, params)
+# def params_to_state_from_record(task, base_inp, base_res, params, split_extents=None):
+#     """Record 기반 sketch에 params를 적용한 새 auto_scheduler State를 반환."""
+#     del task
+#     return _params_to_state_from_measure_record(
+#         base_inp,
+#         base_res,
+#         params,
+#         split_extents=split_extents,
+#     )

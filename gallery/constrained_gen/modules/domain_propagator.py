@@ -461,7 +461,7 @@ class DomainPropagator:
 
         step_idx = int(parts[1])
         pos = int(parts[2])
-        extent = g._sp_extents.get(step_idx)
+        extent = g._get_dynamic_split_extent(step_idx)
         group_names = g._sp_groups.get(step_idx)
         if extent is None or not group_names or pos >= len(group_names):
             return None

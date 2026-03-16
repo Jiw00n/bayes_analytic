@@ -37,6 +37,7 @@ class SymbolicState:
         self._state = None  # TransformApplier.apply_steps에서 설정
         self._ca_saved_extents = {}  # {(stage_id, iter_id): SymExpr}
         self._split_sym_products = {}  # {(stage_id, step_idx): SymExpr}
+        self._split_step_extents = {}  # {step_idx: SymExpr} current extent before applying SplitStep
         self._cache_read_consumer = {}  # {cache_read_stage_id: consumer_stage_id}
         self._cache_read_stencil_info = {}  # {cr_stage_id: {cr_axis_idx: (stride, sp_order, rd_order)}}
         self._shared_fused_extents = {}  # {stage_id: SymExpr}
@@ -85,6 +86,10 @@ class SymbolicState:
         }
         cloned._split_sym_products = {
             key: self._clone_symexpr(expr) for key, expr in self._split_sym_products.items()
+        }
+        cloned._split_step_extents = {
+            step_idx: self._clone_symexpr(expr)
+            for step_idx, expr in self._split_step_extents.items()
         }
         cloned._cache_read_consumer = dict(self._cache_read_consumer)
         cloned._cache_read_stencil_info = {
