@@ -124,6 +124,17 @@ def params_to_state_from_state(task, base_state, params, split_extents=None):
     )
 
 
+def params_to_state_from_record(task, base_inp, base_res, params, split_extents=None):
+    """Record 기반 sketch에 params를 적용한 새 auto_scheduler State를 반환."""
+    del task
+    return _params_to_state_from_measure_record(
+        base_inp,
+        base_res,
+        params,
+        split_extents=split_extents,
+    )
+
+
 def build_state_record_steps_payload(task, state):
     """Concrete State를 measure-record step payload JSON 문자열로 정규화해 반환한다."""
     measure_input = auto_scheduler.MeasureInput(task, state)
@@ -149,23 +160,13 @@ def concrete_state_fingerprint(task, state):
 # ------------------------------------------------------------------
 
 
-# def verify_gpu_module(mod, constraints=None):
-#     """Lowered IRModule에 대해 tir.analysis.verify_gpu_code로 GPU 제약 확인."""
-#     if constraints is None:
-#         constraints = GPU_VERIFY_CONSTRAINTS
-#     for _, f in mod.functions.items():
-#         if isinstance(f, tvm.tir.PrimFunc):
-#             if not _verify_gpu_code(f, constraints):
-#                 return False
-#     return True
+def verify_gpu_module(mod, constraints=None):
+    """Lowered IRModule에 대해 tir.analysis.verify_gpu_code로 GPU 제약 확인."""
+    if constraints is None:
+        constraints = GPU_VERIFY_CONSTRAINTS
+    for _, f in mod.functions.items():
+        if isinstance(f, tvm.tir.PrimFunc):
+            if not _verify_gpu_code(f, constraints):
+                return False
+    return True
 
-
-# def params_to_state_from_record(task, base_inp, base_res, params, split_extents=None):
-#     """Record 기반 sketch에 params를 적용한 새 auto_scheduler State를 반환."""
-#     del task
-#     return _params_to_state_from_measure_record(
-#         base_inp,
-#         base_res,
-#         params,
-#         split_extents=split_extents,
-#     )

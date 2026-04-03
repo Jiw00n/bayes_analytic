@@ -21,6 +21,7 @@ class VarOrderPlanner:
         g._var_order = ordered
 
     def _build_phase_first_order(self, phase_entries):
+        """phase별 변수 목록을 앞에서부터 병합하며 중복 변수를 제거한다."""
         ordered = []
         seen = set()
         normalized_entries = []
@@ -32,12 +33,12 @@ class VarOrderPlanner:
                 seen.add(name)
                 ordered.append(name)
                 phase_vars.append(name)
+            if not phase_vars:
+                continue
             normalized_entries.append({
                 'name': entry['name'],
                 'family': entry['family'],
-                'label': entry['label'],
                 'grid_scope': entry['grid_scope'],
-                'grid_scope_label': entry['grid_scope_label'],
                 'vars': phase_vars,
             })
         return normalized_entries, ordered
@@ -48,15 +49,8 @@ class VarOrderPlanner:
     # ------------------------------------------------------------------
 
     def _build_var_order_phase_entries(self):
+        """execution, memory, instruction phase를 grid scope 단위로 조립한다."""
         g = self.gen
-        max_thread_items = []
-        if 'max_threads' in g._enabled:
-            max_thread_items = g.constraint_set._build_max_threads_constraints()['items']
-
-        max_vthread_items = []
-        if 'max_vthread' in g._enabled:
-            max_vthread_items = g.constraint_set._build_max_vthread_constraints()['items']
-
         vectorize_items = []
         if 'vectorize' in g._enabled:
             vectorize_items = g.constraint_set._build_vectorize_constraints()['items']
@@ -65,54 +59,48 @@ class VarOrderPlanner:
         if 'shared_memory' in g._enabled:
             shared_vars = set(g.constraint_set._build_shared_memory_constraints()['tree'].variables())
 
-        (
-            scope_infos,
-            max_thread_items_by_scope,
-            thread_axis_items_by_scope,
-            vthread_items_by_scope,
-        ) = self._build_grid_scope_infos(
-            max_thread_items,
-            max_vthread_items,
-        )
-        if not scope_infos:
-            scope_infos = [{
-                'grid_index': 0,
-                'grid_scope': tuple(),
-                'grid_scope_label': f"grid_0: {g.constraint_set._format_block_scope(tuple())}",
-                'is_main_compute_anchor': True,
-            }]
-            max_thread_items_by_scope = {}
-            thread_axis_items_by_scope = {}
-            vthread_items_by_scope = {}
+        scope_context = g.constraint_set._build_grid_scope_context()
+        scope_infos = scope_context['scope_infos']
+        max_thread_items_by_scope = scope_context['max_thread_items_by_scope']
+        max_thread_block_items_by_scope = scope_context['max_thread_block_items_by_scope']
+        thread_axis_items_by_scope = scope_context['thread_axis_items_by_scope']
+        vthread_items_by_scope = scope_context['vthread_items_by_scope']
 
         thread_owned_vars = self._build_scope_owned_vars(scope_infos, thread_axis_items_by_scope)
         vthread_owned_vars = self._build_scope_owned_vars(scope_infos, vthread_items_by_scope)
         initial_domains = self._build_initial_domains()
         family_labels = dict(g.VAR_ORDER_PHASE_FAMILIES)
-        phase_entries = []
-        anchor_scope = next(
-            (info['grid_scope'] for info in scope_infos if info.get('is_main_compute_anchor')),
-            scope_infos[0]['grid_scope'],
-        )
+        main_scope = scope_context['main_scope']
 
-        vectorize_vars = []
-        for item in vectorize_items:
-            g.constraint_set._append_unique_vars(
-                vectorize_vars,
-                g.constraint_set._ordered_unique_tree_variables(item['tree']),
-            )
-        vectorize_var_set = set(vectorize_vars)
+        vectorize_vars_by_scope = self._collect_constraint_vars_by_scope(
+            scope_infos,
+            vectorize_items,
+            default_scope=main_scope,
+        )
+        unroll_vars_by_scope = self._collect_unroll_vars_by_scope(
+            scope_infos,
+            default_scope=main_scope,
+        )
         shared_step_indices = self._collect_step_indices_for_vars(shared_vars)
+        execution_phase_entries_by_scope = {}
+        memory_dependent_scopes = []
+        remaining_non_main_scopes = []
 
         for scope_info in scope_infos:
             scope = scope_info['grid_scope']
             max_thread_scope_items = max_thread_items_by_scope.get(scope, [])
+            max_thread_block_scope_items = max_thread_block_items_by_scope.get(scope, [])
             max_vthread_scope_items = vthread_items_by_scope.get(scope, [])
-            execution_items = max_thread_scope_items + max_vthread_scope_items
+            execution_items = (
+                max_thread_scope_items
+                + max_thread_block_scope_items
+                + max_vthread_scope_items
+            )
             execution_owned = []
             g.constraint_set._append_unique_vars(execution_owned, thread_owned_vars.get(scope, []))
             g.constraint_set._append_unique_vars(execution_owned, vthread_owned_vars.get(scope, []))
             execution_owned_set = set(execution_owned)
+            execution_overlaps_memory = bool(shared_vars & execution_owned_set)
 
             thread_pure = self._collect_scoped_product_phase_vars(
                 max_thread_scope_items,
@@ -124,11 +112,20 @@ class VarOrderPlanner:
                 max_vthread_scope_items,
                 set(vthread_owned_vars.get(scope, [])),
                 want_scale=1,
+                order_by_step_idx=True,
             )
+            vthread_pure_from_block = self._collect_scoped_product_phase_vars(
+                max_thread_block_scope_items,
+                set(vthread_owned_vars.get(scope, [])),
+                want_scale=1,
+                order_by_step_idx=True,
+            )
+            g.constraint_set._append_unique_vars(vthread_pure, vthread_pure_from_block)
             has_execution_pure_product = bool(thread_pure or vthread_pure)
+            scope_phase_entries = []
 
             if has_execution_pure_product:
-                phase_entries.append(
+                scope_phase_entries.append(
                     self._make_phase_entry(
                         scope_info,
                         'execution_max_threads_pure_product',
@@ -136,27 +133,28 @@ class VarOrderPlanner:
                         thread_pure,
                     )
                 )
-                phase_entries.append(
+                scope_phase_entries.append(
                     self._make_phase_entry(
                         scope_info,
-                        'execution_max_vthread_pure_product',
-                        family_labels['execution_max_vthread_pure_product'],
-                        vthread_pure,
-                    )
-                )
-                phase_entries.append(
-                    self._make_phase_entry(
-                        scope_info,
-                        'execution_block_split_structure',
-                        family_labels['execution_block_split_structure'],
+                        'execution_split_assignment',
+                        family_labels['execution_split_assignment'],
                         self._collect_split_phase_vars_for_steps(
                             self._collect_step_indices_for_vars(execution_owned_set),
+                            excluded_vars=vthread_pure,
                             inner_first=True,
                         ),
                     )
                 )
+                scope_phase_entries.append(
+                    self._make_phase_entry(
+                        scope_info,
+                        'execution_max_vthread',
+                        family_labels['execution_max_vthread'],
+                        vthread_pure,
+                    )
+                )
             else:
-                phase_entries.append(
+                scope_phase_entries.append(
                     self._make_phase_entry(
                         scope_info,
                         'execution_non_product_direct_arm',
@@ -169,7 +167,7 @@ class VarOrderPlanner:
                         ),
                     )
                 )
-                phase_entries.append(
+                scope_phase_entries.append(
                     self._make_phase_entry(
                         scope_info,
                         'execution_non_product_gate_vars',
@@ -183,103 +181,84 @@ class VarOrderPlanner:
                     )
                 )
 
-            if scope == anchor_scope:
-                phase_entries.append(
-                    self._make_phase_entry(
-                        scope_info,
-                        'memory_split_structure',
-                        family_labels['memory_split_structure'],
-                        self._collect_split_phase_vars_for_steps(
-                            shared_step_indices,
-                            inner_first=True,
-                        ),
-                    )
-                )
-                vector_scaled = self._collect_scoped_product_phase_vars(
-                    vectorize_items,
-                    vectorize_var_set,
-                    want_scale='non_unit',
-                )
-                phase_entries.append(
-                    self._make_phase_entry(
-                        scope_info,
-                        'instruction_scaled_product_upper_bound',
-                        family_labels['instruction_scaled_product_upper_bound'],
-                        vector_scaled,
-                    )
-                )
-                vector_non_product = []
-                for item in vectorize_items:
-                    meta = g.constraint_set._extract_product_form_meta(item['tree'])
-                    if meta is not None and int(meta['scale']) != 1:
-                        continue
-                    g.constraint_set._append_unique_vars(
-                        vector_non_product,
-                        [
-                            name
-                            for name in g.constraint_set._ordered_unique_tree_variables(item['tree'])
-                            if name in vectorize_var_set and name not in vector_scaled
-                        ],
-                    )
-                phase_entries.append(
-                    self._make_phase_entry(
-                        scope_info,
-                        'instruction_non_product_min',
-                        family_labels['instruction_non_product_min'],
-                        vector_non_product,
-                    )
-                )
-
-        return phase_entries
-
-    def _build_grid_scope_infos(self, max_thread_items, max_vthread_items):
-        g = self.gen
-        max_thread_items_by_scope = {}
-        thread_axis_items_by_scope = {}
-        vthread_items_by_scope = {}
-
-        total_scope_order = []
-        seen_total_scopes = set()
-        for item in max_thread_items:
-            scope = item.get('block_scope', tuple())
-            max_thread_items_by_scope.setdefault(scope, []).append(item)
-            if item.get('axis_name') == 'threads per block':
-                if scope not in seen_total_scopes:
-                    seen_total_scopes.add(scope)
-                    total_scope_order.append(scope)
+            execution_phase_entries_by_scope[scope] = scope_phase_entries
+            if scope == main_scope:
                 continue
-            thread_axis_items_by_scope.setdefault(scope, []).append(item)
+            if execution_overlaps_memory:
+                memory_dependent_scopes.append(scope)
+            else:
+                remaining_non_main_scopes.append(scope)
 
-        for item in max_vthread_items:
-            scope = item.get('block_scope', tuple())
-            vthread_items_by_scope.setdefault(scope, []).append(item)
-
-        anchor_scope = None
-        vthread_scopes = set(vthread_items_by_scope.keys())
-        for scope in total_scope_order:
-            if scope in vthread_scopes:
-                anchor_scope = scope
+        phase_entries = []
+        main_scope_info = None
+        for scope_info in scope_infos:
+            if scope_info['grid_scope'] == main_scope:
+                main_scope_info = scope_info
                 break
 
-        ordered_scopes = list(total_scope_order)
-        if anchor_scope is not None:
-            ordered_scopes = [anchor_scope] + [scope for scope in total_scope_order if scope != anchor_scope]
+        if main_scope_info is not None:
+            phase_entries.extend(execution_phase_entries_by_scope.get(main_scope, []))
 
-        scope_infos = []
-        for idx, scope in enumerate(ordered_scopes):
-            scope_infos.append({
-                'grid_index': idx,
-                'grid_scope': scope,
-                'grid_scope_label': f"grid_{idx}: {g.constraint_set._format_block_scope(scope)}",
-                'is_main_compute_anchor': scope == anchor_scope,
-            })
-        return scope_infos, max_thread_items_by_scope, thread_axis_items_by_scope, vthread_items_by_scope
+        for scope in memory_dependent_scopes:
+            phase_entries.extend(execution_phase_entries_by_scope.get(scope, []))
+            phase_entries.append(
+                self._make_phase_entry(
+                    self._find_scope_info(scope_infos, scope),
+                    'instruction_vectorize_unroll',
+                    family_labels['instruction_vectorize_unroll'],
+                    self._merge_instruction_phase_vars(
+                        vectorize_vars_by_scope.get(scope, []),
+                        unroll_vars_by_scope.get(scope, []),
+                    ),
+                )
+            )
+
+        if main_scope_info is not None:
+            phase_entries.append(
+                self._make_phase_entry(
+                    main_scope_info,
+                    'memory_split_structure',
+                    family_labels['memory_split_structure'],
+                    self._collect_split_phase_vars_for_steps(
+                        shared_step_indices,
+                        inner_first=True,
+                    ),
+                )
+            )
+            phase_entries.append(
+                self._make_phase_entry(
+                    main_scope_info,
+                    'instruction_vectorize_unroll',
+                    family_labels['instruction_vectorize_unroll'],
+                    self._merge_instruction_phase_vars(
+                        vectorize_vars_by_scope.get(main_scope, []),
+                        unroll_vars_by_scope.get(main_scope, []),
+                    ),
+                )
+            )
+
+        for scope in remaining_non_main_scopes:
+            phase_entries.extend(execution_phase_entries_by_scope.get(scope, []))
+            phase_entries.append(
+                self._make_phase_entry(
+                    self._find_scope_info(scope_infos, scope),
+                    'instruction_vectorize_unroll',
+                    family_labels['instruction_vectorize_unroll'],
+                    self._merge_instruction_phase_vars(
+                        vectorize_vars_by_scope.get(scope, []),
+                        unroll_vars_by_scope.get(scope, []),
+                    ),
+                )
+            )
+
+        return phase_entries
 
     # ------------------------------------------------------------------
     # Phase variable collection and legacy fallback heuristics
     # ------------------------------------------------------------------
 
     def _build_scope_owned_vars(self, scope_infos, items_by_scope):
+        """scope별 constraint item에서 직접 소유한 변수를 순서대로 모은다."""
         g = self.gen
         owned = {}
         for scope_info in scope_infos:
@@ -294,15 +273,108 @@ class VarOrderPlanner:
         return owned
 
     @staticmethod
+    def _find_scope_info(scope_infos, scope):
+        """grid scope tuple에 대응하는 scope_info를 찾고, 없으면 기본 정보를 만든다."""
+        for scope_info in scope_infos:
+            if scope_info['grid_scope'] == scope:
+                return scope_info
+        return {
+            'grid_index': 0,
+            'grid_scope': scope,
+        }
+
+    @staticmethod
     def _make_phase_entry(scope_info, family, family_label, vars_in_phase):
+        """내부 var-order phase entry 포맷을 만든다."""
+        del family_label
         return {
             'name': f"grid_{scope_info['grid_index']}__{family}",
             'family': family,
-            'label': f"{family_label} [{scope_info['grid_scope_label']}]",
             'grid_scope': scope_info['grid_scope'],
-            'grid_scope_label': scope_info['grid_scope_label'],
             'vars': list(vars_in_phase),
         }
+
+    @staticmethod
+    def _order_param_names_by_step_index(names):
+        """split/unroll 이름을 step index 기준으로 정렬하고 중복을 제거한다."""
+        ordered = []
+        seen = set()
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            ordered.append(name)
+
+        def order_key(name):
+            parts = name.split("_")
+            step_idx = int(parts[1]) if len(parts) > 1 else 1 << 30
+            pos = int(parts[2]) if len(parts) > 2 else -1
+            kind_order = 0 if name.startswith("sp_") else 1 if name.startswith("ur_") else 2
+            return (step_idx, kind_order, pos, name)
+
+        ordered.sort(key=order_key)
+        return ordered
+
+    def _collect_constraint_vars_by_scope(self, scope_infos, items, default_scope=None):
+        """constraint item의 자유변수를 block scope별 instruction 후보로 모은다."""
+        g = self.gen
+        scope_set = {scope_info['grid_scope'] for scope_info in scope_infos}
+        vars_by_scope = {scope: [] for scope in scope_set}
+        for item in items:
+            scope = item.get('block_scope', default_scope)
+            if scope not in scope_set:
+                scope = default_scope
+            if scope not in vars_by_scope:
+                vars_by_scope[scope] = []
+            g.constraint_set._append_unique_vars(
+                vars_by_scope[scope],
+                g.constraint_set._ordered_unique_tree_variables(item['tree']),
+            )
+        return {
+            scope: self._order_param_names_by_step_index(names)
+            for scope, names in vars_by_scope.items()
+        }
+
+    def _collect_unroll_vars_by_scope(self, scope_infos, default_scope=None):
+        """PragmaStep의 stage scope를 따라 unroll 변수를 grid별로 귀속시킨다."""
+        g = self.gen
+        scope_set = {scope_info['grid_scope'] for scope_info in scope_infos}
+        vars_by_scope = {scope: [] for scope in scope_set}
+        state = getattr(g.s, '_state', None)
+
+        for name in g._ur_names:
+            scope = default_scope
+            step_idx = int(name.split("_")[1])
+            if state is not None and step_idx < len(state.transform_steps):
+                step = state.transform_steps[step_idx]
+                if step.type_key.split(".")[-1] == "PragmaStep":
+                    stage_id = int(step.stage_id)
+                    scope = g.constraint_set._resolve_block_scope(
+                        stage_id,
+                        len(g.s.stages[stage_id].iters),
+                    )
+            if scope not in scope_set:
+                scope = default_scope
+            if scope not in vars_by_scope:
+                vars_by_scope[scope] = []
+            vars_by_scope[scope].append(name)
+
+        return {
+            scope: self._order_param_names_by_step_index(names)
+            for scope, names in vars_by_scope.items()
+        }
+
+    @staticmethod
+    def _merge_instruction_phase_vars(vectorize_vars, unroll_vars):
+        """vectorize 변수 뒤에 unroll 변수를 붙여 instruction phase 순서를 만든다."""
+        ordered = []
+        seen = set()
+        for name in list(vectorize_vars) + list(unroll_vars):
+            if name in seen:
+                continue
+            seen.add(name)
+            ordered.append(name)
+        return ordered
 
     def _collect_scoped_product_phase_vars(
         self,
@@ -311,6 +383,7 @@ class VarOrderPlanner:
         want_scale,
         order_by_step_idx=False,
     ):
+        """product-form 상한식에서 원하는 scale 조건의 변수만 골라 phase 후보를 만든다."""
         g = self.gen
         ordered = []
         if not candidate_var_names:
@@ -341,6 +414,7 @@ class VarOrderPlanner:
         return ordered
 
     def _build_initial_domains(self):
+        """split 변수의 초기 도메인 사전을 step extent 기반으로 구성한다."""
         g = self.gen
         domains = {}
         for name in g._all_sp_names:
@@ -354,6 +428,7 @@ class VarOrderPlanner:
 
     @classmethod
     def _quick_interval(cls, node, domains, cap=None):
+        """간단한 식 노드에 대해 빠른 구간 추정을 수행한다."""
         if isinstance(node, ConstNode):
             value = int(node.val)
             return value, value
@@ -400,6 +475,7 @@ class VarOrderPlanner:
 
     @staticmethod
     def _clip_interval(lo, hi, cap):
+        """추정 구간의 상한을 cap으로 잘라 interval 폭이 과도하게 커지지 않게 한다."""
         if cap is None:
             return lo, hi
         upper = int(cap)
@@ -410,6 +486,7 @@ class VarOrderPlanner:
         return lo, hi
 
     def _classify_non_product_item_vars(self, item, candidate_var_names, domains):
+        """MinNode 기반 non-product 제약을 direct arm과 gate arm 변수로 나눈다."""
         g = self.gen
         tree = item['tree']
         if g.constraint_set._extract_product_form_meta(tree) is not None:
@@ -425,14 +502,11 @@ class VarOrderPlanner:
                 if name in candidate_var_names
             ]
             lower_bound, _ = self._quick_interval(branch, domains, cap=item['limit'] + 1)
-            exotic_nodes, node_count = g.constraint_set._thread_tree_metrics(branch)
             branch_infos.append({
                 'vars': ordered_vars,
                 'lower_bound': lower_bound,
                 'sort_key': (
                     len(ordered_vars),
-                    exotic_nodes,
-                    node_count,
                     len(repr(branch)),
                 ),
             })
@@ -451,6 +525,7 @@ class VarOrderPlanner:
         return direct_vars, gate_vars
 
     def _collect_non_product_phase_vars(self, items, candidate_var_names, domains, want_gate):
+        """non-product 제약들에서 direct 또는 gate 쪽 변수만 추려 phase를 구성한다."""
         g = self.gen
         ordered = []
         if not candidate_var_names:
@@ -467,6 +542,7 @@ class VarOrderPlanner:
         return ordered
 
     def _collect_step_indices_for_vars(self, var_names):
+        """주어진 변수 집합이 포함된 split step index 목록을 찾는다."""
         g = self.gen
         target = set(var_names)
         step_indices = []
@@ -475,14 +551,77 @@ class VarOrderPlanner:
                 step_indices.append(step_idx)
         return step_indices
 
-    def _collect_split_phase_vars_for_steps(self, step_indices, inner_first=False):
+    def _collect_split_phase_vars_for_steps(self, step_indices, excluded_vars=None, inner_first=False):
+        """지정한 split step들에서 phase에 넣을 split 변수 순서를 만든다."""
         g = self.gen
         ordered = []
+        excluded = set(excluded_vars or [])
         for step_idx in step_indices:
             group = list(g._sp_groups.get(step_idx, []))
             group.sort(key=lambda name: int(name.split("_")[2]), reverse=inner_first)
-            g.constraint_set._append_unique_vars(ordered, group)
+            for name in group:
+                if name in excluded or name in ordered:
+                    continue
+                ordered.append(name)
         return ordered
+
+    def get_var_order_phase_entries(self):
+        """phase별 변수 목록·이름·family·grid_scope 등을 담은 진입점 목록을 반환한다."""
+        def build_var_entry(name):
+            """공개용 phase entry에 들어갈 파라미터 메타정보를 만든다."""
+            entry = {
+                'param_name': name,
+                'param_kind': 'symbolic',
+            }
+            if name.startswith("sp_"):
+                parts = name.split("_")
+                step_idx = int(parts[1])
+                pos = int(parts[2])
+                group_vars = list(self.gen._sp_groups.get(step_idx, []))
+                entry.update({
+                    'param_kind': 'split',
+                    'split_step_idx': step_idx,
+                    'split_position': pos,
+                    'split_extent': self.gen._sp_extents.get(step_idx),
+                    'split_group_param_names': group_vars,
+                    'collapsed_factor_param_names': group_vars[:pos],
+                    'is_innermost': name in self.gen._innermost_names,
+                })
+            elif name.startswith("ur_"):
+                entry.update({
+                    'param_kind': 'unroll',
+                    'unroll_step_idx': int(name.split("_")[1]),
+                    'candidate_values': list(self.gen.pm.UNROLL_CANDIDATES),
+                })
+            return entry
+
+        return [
+            {
+                'phase_name': entry['name'],
+                'phase_family': entry['family'],
+                'grid_scope': entry['grid_scope'],
+                'param_names': list(entry['vars']),
+                'param_entries': [build_var_entry(name) for name in entry['vars']],
+            }
+            for entry in self.gen._var_order_phase_entries
+        ]
+
+    def resolve_var_order_stop_index(self, stop_after_phase):
+        """prefix 샘플링 시 멈출 phase 이름/인덱스를 받아 phase 인덱스를 반환한다."""
+        g = self.gen
+        exact_match = None
+        last_family_match = None
+        for idx, entry in enumerate(g._var_order_phase_entries):
+            if entry['name'] == stop_after_phase:
+                exact_match = idx
+                break
+            if entry['family'] == stop_after_phase:
+                last_family_match = idx
+        if exact_match is not None:
+            return exact_match
+        if last_family_match is not None:
+            return last_family_match
+        raise ValueError(f"Unknown var-order phase or family: {stop_after_phase}")
 
 
 
@@ -492,6 +631,7 @@ class VarOrderPlanner:
 
     # @staticmethod
     # def _append_legacy_fallback_vars(ordered, seen, legacy_order):
+    #     """legacy 순서에서 아직 등장하지 않은 변수만 뒤에 덧붙인다."""
     #     for name in legacy_order:
     #         if name in seen:
     #             continue
@@ -499,6 +639,7 @@ class VarOrderPlanner:
     #         ordered.append(name)
 
     # def _compute_legacy_var_order(self):
+    #     """예전 휴리스틱 기반 변수 순서를 계산해 비교나 fallback에 쓸 수 있게 한다."""
     #     g = self.gen
     #     shared_vars = set()
     #     thread_vars = set()
@@ -577,62 +718,3 @@ class VarOrderPlanner:
     #         )
     #         ordered.extend(ordered_group)
     #     return ordered
-
-    # def get_var_order_phase_entries(self):
-    #     """phase별 변수 목록·이름·family·grid_scope 등을 담은 진입점 목록을 반환한다."""
-    #     def build_var_entry(name):
-    #         entry = {
-    #             'param_name': name,
-    #             'param_kind': 'symbolic',
-    #         }
-    #         if name.startswith("sp_"):
-    #             parts = name.split("_")
-    #             step_idx = int(parts[1])
-    #             pos = int(parts[2])
-    #             group_vars = list(self.gen._sp_groups.get(step_idx, []))
-    #             entry.update({
-    #                 'param_kind': 'split',
-    #                 'split_step_idx': step_idx,
-    #                 'split_position': pos,
-    #                 'split_extent': self.gen._sp_extents.get(step_idx),
-    #                 'split_group_param_names': group_vars,
-    #                 'collapsed_factor_param_names': group_vars[:pos],
-    #                 'is_innermost': name in self.gen._innermost_names,
-    #             })
-    #         elif name.startswith("ur_"):
-    #             entry.update({
-    #                 'param_kind': 'unroll',
-    #                 'unroll_step_idx': int(name.split("_")[1]),
-    #                 'candidate_values': list(self.gen.pm.UNROLL_CANDIDATES),
-    #             })
-    #         return entry
-
-    #     return [
-    #         {
-    #             'phase_name': entry['name'],
-    #             'phase_family': entry['family'],
-    #             'phase_label': entry['label'],
-    #             'grid_scope': entry['grid_scope'],
-    #             'grid_scope_label': entry['grid_scope_label'],
-    #             'param_names': list(entry['vars']),
-    #             'param_entries': [build_var_entry(name) for name in entry['vars']],
-    #         }
-    #         for entry in self.gen._var_order_phase_entries
-    #     ]
-
-    # def resolve_var_order_stop_index(self, stop_after_phase):
-    #     """prefix 샘플링 시 멈출 phase 이름/인덱스를 받아 phase 인덱스를 반환한다."""
-    #     g = self.gen
-    #     exact_match = None
-    #     last_family_match = None
-    #     for idx, entry in enumerate(g._var_order_phase_entries):
-    #         if entry['name'] == stop_after_phase:
-    #             exact_match = idx
-    #             break
-    #         if entry['family'] == stop_after_phase:
-    #             last_family_match = idx
-    #     if exact_match is not None:
-    #         return exact_match
-    #     if last_family_match is not None:
-    #         return last_family_match
-    #     raise ValueError(f"Unknown var-order phase or family: {stop_after_phase}")

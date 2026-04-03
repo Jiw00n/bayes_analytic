@@ -296,3 +296,13 @@ gallery/*.txt
 
 gallery/dataset/
 gallery/constrained_gen/verify_batches/
+
+*.pt
+wandb/
+wandb/*
+*.pkl
+
+*/handoffs/
+*/handoffs/*
+*/docs_agents/
+*/docs_agents/*

@@ -32,9 +32,13 @@ def clean_name(x):
     x = x.replace("'", '')
     return x
 
-def get_to_measure_gen_filename(task, output_dir=TO_MEASURE_GEN_PROGRAM_FOLDER):
+def get_to_measure_gen_filename(task, task_index=None, output_dir=None):
     """생성된 측정 대상 프로그램 JSON 파일 경로를 반환한다."""
-    task_key = (task.workload_key, str(task.target.kind))
+    task_key = clean_name((task.workload_key, str(task.target.kind)))
+    if task_index is not None:
+        task_key = f"{task_index}_{task_key}"
+    if output_dir is None:
+        output_dir = TO_MEASURE_GEN_PROGRAM_FOLDER
     return f"{output_dir}/{clean_name(task_key)}.json"
 
 
@@ -107,11 +111,13 @@ def load_and_register_tasks(network_info_folder=NETWORK_INFO_FOLDER):
 #     return f"{TO_MEASURE_PROGRAM_FOLDER}/{clean_name(task_key)}.json"
 
 
-# def get_measure_record_filename(task, target=None):
-#     """측정 완료된 레코드 JSON 파일 경로를 반환한다."""
-#     target = target or task.target
-#     task_key = (task.workload_key, str(target.kind))
-#     return f"{MEASURED_FOLDER}/{target.model}/{clean_name(task_key)}.json"
+def get_measure_record_filename(task, target=None, output_dir=None):
+    """측정 완료된 레코드 JSON 파일 경로를 반환한다."""
+    target = target or task.target
+    task_key = (task.workload_key, str(target.kind))
+    if output_dir is None:
+        output_dir = MEASURED_FOLDER
+    return f"{output_dir}/{clean_name(task_key)}.json"
 
 
 # def load_and_register_network(network_task_path=TO_MEASURE_NETWORK_FOLDER):

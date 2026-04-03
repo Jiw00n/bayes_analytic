@@ -571,6 +571,7 @@ def parse_expr_tree(sym_expr_str):
 
     Returns: ExprNode
     """
+    # breakpoint()
     s = sym_expr_str.strip()
     node, pos = _parse_add_sub(s, 0)
     pos = _skip_spaces(s, pos)
@@ -675,6 +676,7 @@ def _parse_atom(s, pos):
         return CeilDivNode(a, b), pos
 
     if s[pos:pos+10] == 'math.ceil(':
+        print("Warning: 'math.ceil' is deprecated in sym exprs, use 'ceil' instead")
         pos += 10
         a, pos = _parse_add_sub(s, pos)
         pos = _skip_spaces(s, pos)

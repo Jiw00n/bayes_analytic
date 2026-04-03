@@ -62,7 +62,11 @@ class ParamSampler:
         base_result, base_domains, base_group_remaining, search_var_order = (
             self._initialize_unique_search_base_state(g._var_order)
         )
-        search_order = list(search_var_order) + list(g._ur_names)
+        search_order = list(search_var_order)
+        for name in g._ur_names:
+            if name in search_order:
+                continue
+            search_order.append(name)
         self._unique_search_state = {
             'base_result': dict(base_result),
             'base_domains': self._copy_domains(base_domains),
@@ -116,7 +120,7 @@ class ParamSampler:
             return [int(g.s.sym_map.get(name, 1))]
 
         remaining = g._get_group_remaining(step_idx, group_remaining)
-        candidates = g.pm._divisors(remaining)
+        candidates = g._enumerate_split_candidates(name, remaining)
 
         if name in g._innermost_names:
             candidates = [c for c in candidates if c <= innermost_limit]
@@ -239,12 +243,8 @@ class ParamSampler:
                 self._mark_prefix_exhausted(state, prefix_key)
                 self._propagate_exhausted_path(state, path_records)
                 return None
-            
 
-
-            # breakpoint()
             logits = [rng.uniform(0, 1) for _ in range(len(live_candidates))]
-
             chosen = max(zip(live_candidates, logits), key=lambda x: x[1])[0]
 
             path_records.append({
@@ -315,76 +315,71 @@ class ParamSampler:
     # Deprecated
     # ------------------------------------------------------------------
 
-    # @staticmethod
-    # def _restore_sym_value(sym_map, name, old_value):
-    #     if old_value is None:
-    #         sym_map.pop(name, None)
-    #         return
-    #     sym_map[name] = old_value
+    def _assign_initial_fixed_vars(self, var_order, domains, group_remaining, result):
+        """이미 도메인이 1개 값으로 고정된 변수들을 먼저 할당하고, 미할당 변수 목록을 반환한다."""
+        g = self.gen
+        innermost_limit = g.hw['max_innermost_split_factor']
+        progress = True
 
-    # def _assign_initial_fixed_vars(self, var_order, domains, group_remaining, result):
-    #     """이미 도메인이 1개 값으로 고정된 변수들을 먼저 할당하고, 미할당 변수 목록을 반환한다."""
-    #     g = self.gen
-    #     innermost_limit = g.hw['max_innermost_split_factor']
-    #     progress = True
+        while progress:
+            progress = False
+            for name in var_order:
+                if name in result:
+                    continue
+                if name.startswith("ur_"):
+                    continue
 
-    #     while progress:
-    #         progress = False
-    #         for name in var_order:
-    #             if name in result:
-    #                 continue
+                dom = domains.get(name)
+                if isinstance(dom, list):
+                    lo, hi = int(dom[0]), int(dom[1])
+                    if lo != hi:
+                        continue
+                    fixed_value = lo
+                else:
+                    fixed_value = int(dom)
 
-    #             dom = domains.get(name)
-    #             if isinstance(dom, list):
-    #                 lo, hi = int(dom[0]), int(dom[1])
-    #                 if lo != hi:
-    #                     continue
-    #                 fixed_value = lo
-    #             else:
-    #                 fixed_value = int(dom)
+                parts = name.split("_")
+                step_idx = int(parts[1])
+                extent = g._get_dynamic_split_extent(step_idx)
 
-    #             parts = name.split("_")
-    #             step_idx = int(parts[1])
-    #             extent = g._get_dynamic_split_extent(step_idx)
+                if extent is None:
+                    g.s.sym_map[name] = fixed_value
+                    domains[name] = fixed_value
+                    result[name] = fixed_value
+                    progress = True
+                    continue
 
-    #             if extent is None:
-    #                 g.s.sym_map[name] = fixed_value
-    #                 domains[name] = fixed_value
-    #                 result[name] = fixed_value
-    #                 progress = True
-    #                 continue
+                unresolved_extent_deps = [
+                    dep_name
+                    for dep_name in g._get_split_extent_dependencies(step_idx)
+                    if dep_name.startswith("sp_") and dep_name not in result and dep_name != name
+                ]
+                if unresolved_extent_deps:
+                    continue
 
-    #             unresolved_extent_deps = [
-    #                 dep_name
-    #                 for dep_name in g._get_split_extent_dependencies(step_idx)
-    #                 if dep_name.startswith("sp_") and dep_name not in result and dep_name != name
-    #             ]
-    #             if unresolved_extent_deps:
-    #                 continue
+                pos = int(parts[2])
+                group_names = g._sp_groups.get(step_idx, [])
+                if any(prev_name not in result for prev_name in group_names[:pos]):
+                    continue
 
-    #             pos = int(parts[2])
-    #             group_names = g._sp_groups.get(step_idx, [])
-    #             if any(prev_name not in result for prev_name in group_names[:pos]):
-    #                 continue
+                remaining = g._get_group_remaining(step_idx, group_remaining)
+                candidates = g._enumerate_split_candidates(name, remaining)
+                if name in g._innermost_names:
+                    candidates = [c for c in candidates if c <= innermost_limit]
+                if fixed_value not in candidates:
+                    continue
 
-    #             remaining = g._get_group_remaining(step_idx, group_remaining)
-    #             candidates = g.pm._divisors(remaining)
-    #             if name in g._innermost_names:
-    #                 candidates = [c for c in candidates if c <= innermost_limit]
-    #             if fixed_value not in candidates:
-    #                 continue
+                g.s.sym_map[name] = fixed_value
+                domains[name] = fixed_value
+                result[name] = fixed_value
+                group_remaining[step_idx] = (remaining + fixed_value - 1) // fixed_value
 
-    #             g.s.sym_map[name] = fixed_value
-    #             domains[name] = fixed_value
-    #             result[name] = fixed_value
-    #             group_remaining[step_idx] = (remaining + fixed_value - 1) // fixed_value
+                constraint_indices = g._var_constraints.get(name, [])
+                if constraint_indices:
+                    g.domain_propagator.propagate_domain(name, domains)
+                progress = True
 
-    #             constraint_indices = g._var_constraints.get(name, [])
-    #             if constraint_indices:
-    #                 g.domain_propagator.propagate_domain(name, domains)
-    #             progress = True
-
-    #     return [name for name in var_order if name not in result]
+        return [name for name in var_order if name not in result]
 
     # def _initialize_split_sampling_state(self, var_order):
     #     """split 도메인·그룹 잔여량을 세팅하고 고정 변수를 할당한 뒤 (result, domains, group_remaining, 남은 변수 순서)를 반환한다."""

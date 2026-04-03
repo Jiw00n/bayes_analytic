@@ -36,11 +36,14 @@ class SymbolicState:
         self.compute_dag = compute_dag
         self._state = None  # TransformApplier.apply_steps에서 설정
         self._ca_saved_extents = {}  # {(stage_id, iter_id): SymExpr}
+        self._ca_saved_mins = {}  # {(stage_id, iter_id): SymExpr}
         self._split_sym_products = {}  # {(stage_id, step_idx): SymExpr}
         self._split_step_extents = {}  # {step_idx: SymExpr} current extent before applying SplitStep
         self._cache_read_consumer = {}  # {cache_read_stage_id: consumer_stage_id}
         self._cache_read_stencil_info = {}  # {cr_stage_id: {cr_axis_idx: (stride, sp_order, rd_order)}}
         self._shared_fused_extents = {}  # {stage_id: SymExpr}
+        self._exception_split_names = set()  # {sp_stepidx_lenidx}
+        self._thread_extent_meta = {}  # {(stage_id, iter_id): {is_mlt_root_thread, relax_min_thread_extent}}
 
         for sid, op in enumerate(compute_dag.ops):
             if hasattr(op, 'axis'):
@@ -50,12 +53,14 @@ class SymbolicState:
                     name = str(axis.var.name)
                     ext = self._safe_int_extent(axis.dom.extent) if axis.dom is not None else None
                     iters.append(SymIter(name, SymExpr(ext) if ext is not None else None,
-                                         annotation=0, iter_kind=0))
+                                         annotation=0, iter_kind=0,
+                                         min_value=SymExpr(0)))
                 for axis in op.reduce_axis:
                     name = str(axis.var.name)
                     ext = self._safe_int_extent(axis.dom.extent) if axis.dom is not None else None
                     iters.append(SymIter(name, SymExpr(ext) if ext is not None else None,
-                                         annotation=0, iter_kind=1))
+                                         annotation=0, iter_kind=1,
+                                         min_value=SymExpr(0)))
                 self.stages.append(SymStage(op.name, 'compute', iters, dtype=dtype))
             else:
                 dtype = str(op.output(0).dtype) if hasattr(op, 'output') else "float32"
@@ -84,6 +89,9 @@ class SymbolicState:
         cloned._ca_saved_extents = {
             key: self._clone_symexpr(expr) for key, expr in self._ca_saved_extents.items()
         }
+        cloned._ca_saved_mins = {
+            key: self._clone_symexpr(expr) for key, expr in self._ca_saved_mins.items()
+        }
         cloned._split_sym_products = {
             key: self._clone_symexpr(expr) for key, expr in self._split_sym_products.items()
         }
@@ -98,6 +106,10 @@ class SymbolicState:
         cloned._shared_fused_extents = {
             sid: self._clone_symexpr(expr) for sid, expr in self._shared_fused_extents.items()
         }
+        cloned._exception_split_names = set(self._exception_split_names)
+        cloned._thread_extent_meta = {
+            key: dict(meta) for key, meta in self._thread_extent_meta.items()
+        }
         return cloned
 
     # ─── 내부 데이터 shift (CacheRead/CacheWrite stage 삽입 시) ───
@@ -108,6 +120,12 @@ class SymbolicState:
             new_sid = sid + offset if sid >= inserted_stage_id else sid
             new_saved[(new_sid, iid)] = expr
         self._ca_saved_extents = new_saved
+
+        new_saved_mins = {}
+        for (sid, iid), expr in self._ca_saved_mins.items():
+            new_sid = sid + offset if sid >= inserted_stage_id else sid
+            new_saved_mins[(new_sid, iid)] = expr
+        self._ca_saved_mins = new_saved_mins
 
         new_split_prods = {}
         for (sid, step_idx), expr in self._split_sym_products.items():
@@ -161,11 +179,19 @@ class SymbolicState:
 
         indent = 0
         for iid, it in enumerate(stage.iters):
-            is_trivial = (it.extent is not None and it.extent.is_concrete and it.extent.val == 1)
+            is_zero_min = (
+                it.min_value is not None and it.min_value.is_concrete and it.min_value.val == 0
+            )
+            is_trivial = (
+                it.extent is not None and it.extent.is_concrete and it.extent.val == 1 and is_zero_min
+            )
             if not (delete_trivial_loop and is_trivial):
                 ann = ANNOTATION_STR.get(it.annotation, "?")
                 if it.extent is not None:
-                    lines.append(" " * (base_indent + indent) + f"{ann} {it.name} (0,{it.extent})")
+                    lines.append(
+                        " " * (base_indent + indent)
+                        + f"{ann} {it.name} ({it.min_value},{it.extent})"
+                    )
                 else:
                     lines.append(" " * (base_indent + indent) + f"{ann} {it.name} (None)")
                 indent += 2

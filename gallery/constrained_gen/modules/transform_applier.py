@@ -22,19 +22,46 @@ class TransformApplier:
         self.s = sym_state
 
     @staticmethod
+    def _to_state_object(state):
+        if state is None:
+            return None
+        return state if isinstance(state, StateObject) else state.state_object
+
+    def _replay_partial_state(self, state, step_idx):
+        state_obj = self._to_state_object(state)
+        if state_obj is None:
+            return None
+        return tvm._ffi.get_global_func("auto_scheduler.ReplayStepsPartial")(
+            self.s.compute_dag, state_obj, step_idx)
+
+    def _infer_bound_partial_from_state(self, state, step_idx):
+        ps = self._replay_partial_state(state, step_idx)
+        if ps is None:
+            return None
+        return self.s.compute_dag.infer_bound_from_state(ps)
+
+    def _infer_bound_from_state(self, state):
+        state_obj = self._to_state_object(state)
+        if state_obj is None:
+            return None
+        return self.s.compute_dag.infer_bound_from_state(state_obj)
+
+    @staticmethod
     def _clamp_positive_split_extent(sym_ext, tosplit_extent):
         """Split extent clamp for strictly-positive extents.
 
         Split factors and loop extents in this path are positive. When either
-        side is the concrete constant 1, the clamped extent is also exactly 1,
-        so avoid materializing symbolic forms like min(sp_i_j,1).
+        side is the concrete constant 1, the clamped extent is also exactly 1.
+        Keep symbolic split factors visible when they are clamped by a concrete
+        extent of 1 so downstream constraint builders can still observe which
+        split vars participated in the binding expression.
         """
         if sym_ext is None or tosplit_extent is None:
             return sym_ext if tosplit_extent is None else tosplit_extent
 
         sym_val = sym_ext.val if isinstance(sym_ext, SymExpr) else sym_ext
         clamp_val = tosplit_extent.val if isinstance(tosplit_extent, SymExpr) else tosplit_extent
-        if sym_val == 1 or clamp_val == 1:
+        if sym_val == 1:
             return SymExpr(1)
         return SymExpr.min(sym_ext, tosplit_extent)
 
@@ -82,7 +109,13 @@ class TransformApplier:
         for it in real_stage.iters:
             ext = int(it.range.extent) if it.range is not None else None
             new_iters.append(
-                SymIter(it.name, SymExpr(ext) if ext is not None else None, annotation=0, iter_kind=0)
+                SymIter(
+                    it.name,
+                    SymExpr(ext) if ext is not None else None,
+                    annotation=0,
+                    iter_kind=0,
+                    min_value=SymExpr(0),
+                )
             )
         return SymStage(
             real_stage.op.name,
@@ -125,6 +158,12 @@ class TransformApplier:
     def _get_safe_saved_extent(self, stage_id, iter_id, real_ext):
         del real_ext
         saved = self.s._ca_saved_extents.get((stage_id, iter_id))
+        if saved is None:
+            return None
+        return SymExpr(saved.val)
+
+    def _get_safe_saved_min(self, stage_id, iter_id):
+        saved = self.s._ca_saved_mins.get((stage_id, iter_id))
         if saved is None:
             return None
         return SymExpr(saved.val)
@@ -180,6 +219,21 @@ class TransformApplier:
 
         return SymExpr(real_ext)
 
+    def _recover_iter_min(self, stage_id, iter_id):
+        stage = self.s.stages[stage_id]
+        if iter_id < len(stage.iters):
+            current = stage.iters[iter_id].min_value
+            if current is not None and not (current.is_concrete and current.val == 0):
+                return SymExpr(current.val)
+        saved = self._get_safe_saved_min(stage_id, iter_id)
+        if saved is not None:
+            return saved
+        if iter_id < len(stage.iters):
+            current = stage.iters[iter_id].min_value
+            if current is not None:
+                return SymExpr(current.val)
+        return SymExpr(0)
+
     def _restore_stage_extents_if_needed(self, stage_id, step_idx):
         s = self.s
         stage = s.stages[stage_id]
@@ -187,11 +241,8 @@ class TransformApplier:
         if not has_none:
             return
 
-        ps = tvm._ffi.get_global_func("auto_scheduler.ReplayStepsPartial")(
-            s.compute_dag, s._state, step_idx)
-        bounded = s.compute_dag.infer_bound_from_state(ps)
-
-        if stage_id >= len(bounded.stages):
+        bounded = self._infer_bound_partial_from_state(s._state, step_idx)
+        if bounded is None or stage_id >= len(bounded.stages):
             return
 
         cr_sym_candidates, cr_stencil, cr_ordered_splits = self._get_cache_read_restore_ctx(stage_id)
@@ -202,6 +253,7 @@ class TransformApplier:
                 real_it = real_stage.iters[iid]
                 if real_it.range is not None:
                     real_ext = int(real_it.range.extent)
+                    stage.iters[iid].min_value = self._recover_iter_min(stage_id, iid)
                     stage.iters[iid].extent = self._recover_iter_extent(
                         stage_id, iid, real_ext,
                         cr_sym_candidates=cr_sym_candidates,
@@ -265,8 +317,9 @@ class TransformApplier:
 
     def _infer_bound_final(self, state):
         s = self.s
-        state_obj = state if isinstance(state, StateObject) else state.state_object
-        bounded = s.compute_dag.infer_bound_from_state(state_obj)
+        bounded = self._infer_bound_from_state(state)
+        if bounded is None:
+            return
 
         for sid in range(len(s.stages)):
             sym_stage = s.stages[sid]
@@ -278,10 +331,13 @@ class TransformApplier:
 
             for iid in range(len(sym_stage.iters)):
                 sym_it = sym_stage.iters[iid]
-                if sym_it.extent is None and iid < len(real_stage.iters):
-                    real_it = real_stage.iters[iid]
-                    if real_it.range is None:
-                        continue
+                if iid >= len(real_stage.iters):
+                    continue
+                real_it = real_stage.iters[iid]
+                if real_it.range is None:
+                    continue
+                sym_it.min_value = self._recover_iter_min(sid, iid)
+                if sym_it.extent is None:
                     real_ext = int(real_it.range.extent)
                     sym_it.extent = self._recover_iter_extent(
                         sid, iid, real_ext,
@@ -591,6 +647,8 @@ class TransformApplier:
         for iid, it in enumerate(stage.iters):
             if it.extent is not None and not it.extent.is_concrete:
                 s._ca_saved_extents[(sid, iid)] = SymExpr(it.extent.val)
+            if it.min_value is not None and not it.min_value.is_concrete:
+                s._ca_saved_mins[(sid, iid)] = SymExpr(it.min_value.val)
             it.extent = None
         if ".shared" in stage.op_name:
             s._shared_fused_extents.pop(sid, None)
@@ -614,6 +672,8 @@ class TransformApplier:
         for iid, it in enumerate(stage.iters):
             if it.extent is not None and not it.extent.is_concrete:
                 s._ca_saved_extents[(sid, iid)] = SymExpr(it.extent.val)
+            if it.min_value is not None and not it.min_value.is_concrete:
+                s._ca_saved_mins[(sid, iid)] = SymExpr(it.min_value.val)
             it.extent = None
         if ".shared" in stage.op_name:
             s._shared_fused_extents.pop(sid, None)
@@ -627,11 +687,13 @@ class TransformApplier:
         sid = step.stage_id
         added_stage_id = sid + 1
 
-        ps_after = tvm._ffi.get_global_func("auto_scheduler.ReplayStepsPartial")(
-            s.compute_dag, state, step_idx + 1)
+        ps_after = self._replay_partial_state(state, step_idx + 1)
 
         s.stages[sid].op_name = ps_after.stages[sid].op.name
-        s.stages.insert(added_stage_id, self._clone_real_stage(ps_after.stages[added_stage_id]))
+        s.stages.insert(
+            added_stage_id,
+            self._clone_real_stage(ps_after.stages[added_stage_id]),
+        )
 
         s._shift_ca_saved_extents(added_stage_id)
 
@@ -798,8 +860,7 @@ class TransformApplier:
     def _apply_cache_write(self, step, state, step_idx):
         s = self.s
         sid = step.stage_id
-        ps_after = tvm._ffi.get_global_func("auto_scheduler.ReplayStepsPartial")(
-            s.compute_dag, state, step_idx + 1)
+        ps_after = self._replay_partial_state(state, step_idx + 1)
         added_ops = len(ps_after.stages) - len(s.stages)
         if added_ops < 1:
             raise RuntimeError(f"Unexpected CacheWrite added_ops={added_ops} at stage {sid}")
@@ -811,7 +872,10 @@ class TransformApplier:
 
         next_stage_id = sid + 2
         if added_ops == 2:
-            s.stages.insert(next_stage_id, self._clone_real_stage(ps_after.stages[next_stage_id]))
+            s.stages.insert(
+                next_stage_id,
+                self._clone_real_stage(ps_after.stages[next_stage_id]),
+            )
             next_stage_id += 1
 
         s._shift_ca_saved_extents(sid, offset=added_ops)

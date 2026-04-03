@@ -144,10 +144,11 @@ class SymExpr:
 
 class SymIter:
     """Iterator (C++ Iterator 대응)"""
-    def __init__(self, name, extent, annotation=0, iter_kind=0):
-        """심볼릭 이터레이터(이름, extent, 어노테이션, iter_kind)를 만든다."""
+    def __init__(self, name, extent, annotation=0, iter_kind=0, min_value=None):
+        """심볼릭 이터레이터(이름, min, extent, 어노테이션, iter_kind)를 만든다."""
         self.name = name
         self.extent = extent         # SymExpr or None
+        self.min_value = SymExpr(0) if min_value is None else min_value
         self.annotation = annotation # int
         self.iter_kind = iter_kind   # int
 
@@ -155,12 +156,13 @@ class SymIter:
         """이 SymIter의 복사본을 반환한다."""
         return SymIter(self.name,
                        SymExpr(self.extent.val) if self.extent else None,
-                       self.annotation, self.iter_kind)
+                       self.annotation, self.iter_kind,
+                       min_value=SymExpr(self.min_value.val) if self.min_value else None)
 
     def __repr__(self):
         ann = ANNOTATION_STR.get(self.annotation, "?")
         if self.extent is not None:
-            return f"{ann} {self.name} (0,{self.extent})"
+            return f"{ann} {self.name} ({self.min_value},{self.extent})"
         else:
             return f"{ann} {self.name} (None)"
 

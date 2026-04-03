@@ -1,9 +1,6 @@
 """
 gpu_projection_constraints — projected GPU pruning constraints derived from symbolic TIR.
 
-This module owns the runtime-projected vectorize/shared-memory pruning helpers
-used by the active generation path. It deliberately excludes exact case-table
-materialization and post-vectorize exact lowering helpers.
 """
 
 import tvm
@@ -53,22 +50,23 @@ def _collect_projected_gpu_metadata(pre_func):
         tvm.tir.stmt_functor.post_order_visit(stmt.body, visit)
         vector_scalar_bytes.append(max_bytes)
 
-    def visit_stmt(stmt):
+    def visit_stmt(stmt, block_scope_ord=()):
         if isinstance(stmt, tvm.tir.SeqStmt):
             for child in stmt.seq:
-                visit_stmt(child)
+                visit_stmt(child, block_scope_ord)
             return
 
         if isinstance(stmt, tvm.tir.AttrStmt):
             if stmt.attr_key in ("thread_extent", "virtual_thread"):
                 iter_var = stmt.node
                 if hasattr(iter_var, "var"):
+                    var_name = str(iter_var.var.name)
                     add_domain(
-                        str(iter_var.var.name),
+                        var_name,
                         tvm.tir.IntImm("int32", 0),
                         analyzer.simplify(stmt.value - 1),
                     )
-            visit_stmt(stmt.body)
+            visit_stmt(stmt.body, block_scope_ord)
             return
 
         if isinstance(stmt, tvm.tir.For):
@@ -79,38 +77,38 @@ def _collect_projected_gpu_metadata(pre_func):
             )
             if stmt.kind == tvm.tir.ForKind.VECTORIZED:
                 collect_vector_loop_scalar_bytes(stmt)
-            visit_stmt(stmt.body)
+            visit_stmt(stmt.body, block_scope_ord)
             return
 
         if isinstance(stmt, tvm.tir.LetStmt):
             add_domain(str(stmt.var.name), stmt.value, stmt.value)
-            visit_stmt(stmt.body)
+            visit_stmt(stmt.body, block_scope_ord)
             return
 
         if isinstance(stmt, tvm.tir.IfThenElse):
-            visit_stmt(stmt.then_case)
+            visit_stmt(stmt.then_case, block_scope_ord)
             if stmt.else_case is not None:
-                visit_stmt(stmt.else_case)
+                visit_stmt(stmt.else_case, block_scope_ord)
             return
 
         if isinstance(stmt, tvm.tir.While):
-            visit_stmt(stmt.body)
+            visit_stmt(stmt.body, block_scope_ord)
             return
 
         if isinstance(stmt, tvm.tir.Allocate):
-            visit_stmt(stmt.body)
+            visit_stmt(stmt.body, block_scope_ord)
             return
 
         block_realize = getattr(tvm.tir, "BlockRealize", None)
         if block_realize is not None and isinstance(stmt, block_realize):
-            visit_stmt(stmt.block)
+            visit_stmt(stmt.block, block_scope_ord)
             return
 
         block = getattr(tvm.tir, "Block", None)
         if block is not None and isinstance(stmt, block):
             if stmt.init is not None:
-                visit_stmt(stmt.init)
-            visit_stmt(stmt.body)
+                visit_stmt(stmt.init, block_scope_ord)
+            visit_stmt(stmt.body, block_scope_ord)
 
     visit_stmt(pre_func.body)
     return vector_scalar_bytes, runtime_domains
@@ -296,58 +294,6 @@ def build_projected_shared_memory_constraint_node(
     return shared_node
 
 
-
-
-def _to_pruning_expr_node(node, constraint_name):
-    if isinstance(node, ConstNode):
-        return node
-    if isinstance(node, MaxNode):
-        return MaxNode(
-            [_to_pruning_expr_node(child, constraint_name) for child in node.children]
-        )
-    if isinstance(node, PrimExprNode):
-        text = str(node).replace("T.min(", "min(").replace("T.max(", "max(")
-        try:
-            return parse_expr_tree(text)
-        except ValueError as err:
-            raise RuntimeError(
-                f"Unsupported projected {constraint_name} expression for pruning: {text}"
-            ) from err
-    raise TypeError(f"Unsupported projected {constraint_name} node type: {type(node)!r}")
-
-
-def build_projected_constraint_nodes(exact_nodes, hw, allowed_var_names=None):
-    """exact 노드들을 runtime 상한으로 projection해 pruning용 노드 딕셔너리를 반환한다."""
-    runtime_domains = exact_nodes["runtime_domains"]
-
-    shared_terms = _dedupe_nodes(
-        [_project_runtime_upper(case["expr"], runtime_domains) for case in exact_nodes["shared_node"].cases]
-    )
-    max_vthread_terms = _dedupe_nodes(
-        [_project_runtime_upper(case["expr"], runtime_domains) for case in exact_nodes["max_vthread_node"].cases]
-    )
-
-    vector_node = build_projected_vectorize_constraint_node(
-        {
-            "selectors": exact_nodes["selectors"],
-            "vector_scalar_bytes": exact_nodes["vector_scalar_bytes"],
-            "runtime_domains": runtime_domains,
-        },
-        hw,
-        allowed_var_names=allowed_var_names,
-    )
-    shared_node = _collapse_max(shared_terms)
-    max_vthread_node = _collapse_max(_dedupe_nodes(max_vthread_terms))
-    max_vthread_node = _to_pruning_expr_node(max_vthread_node, "max_vthread")
-
-    _validate_projected_free_vars(shared_node, "shared_memory", allowed_var_names)
-    _validate_projected_free_vars(max_vthread_node, "max_vthread", allowed_var_names)
-
-    return {
-        "vector_node": vector_node,
-        "shared_node": shared_node,
-        "max_vthread_node": max_vthread_node,
-    }
 
 
 # ------------------------------------------------------------------

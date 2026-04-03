@@ -130,7 +130,7 @@ def dump_program(task, size, network_name=None, max_retry_iter=1):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # parser.add_argument("--network", type=str, required=True)
-    parser.add_argument("--size", type=int, default=2000)
+    parser.add_argument("--size", type=int, default=4000)
     args = parser.parse_args()
 
 

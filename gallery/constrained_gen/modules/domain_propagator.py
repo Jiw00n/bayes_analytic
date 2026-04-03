@@ -471,7 +471,7 @@ class DomainPropagator:
             chosen = self._get_sym_value(g.s.sym_map, prev_name)
             remaining = (remaining + chosen - 1) // chosen
 
-        candidates = g.pm._divisors(remaining)
+        candidates = g._enumerate_split_candidates(var_name, remaining)
         if var_name in g._innermost_names:
             candidates = [
                 value
