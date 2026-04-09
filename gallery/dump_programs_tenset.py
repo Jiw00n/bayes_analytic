@@ -14,8 +14,8 @@ from tvm import auto_scheduler
 from common import load_and_register_tasks, get_to_measure_filename
 
 
-def dump_program(task, size, output_dir=None, max_retry_iter=10):
-    filename = get_to_measure_filename(task, output_dir=output_dir)
+def dump_program(task, size, output_dir=None, task_idx=None, max_retry_iter=10):
+    filename = get_to_measure_filename(task, output_dir=output_dir, task_index=task_idx)
 
     os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -82,7 +82,9 @@ if __name__ == "__main__":
     end_idx = args.end_idx or len(tasks)
 
     # Dump programs for all tasks
-    for task in tqdm(tasks[start_idx:end_idx]):
-        dump_program(task, size=args.size, output_dir=args.output_dir)
+    # for task in tqdm(tasks[start_idx:end_idx]):
+    selected_tasks = [(i, task) for i, task in enumerate(tasks) if i in [110, 145, 169, 208, 249, 262, 302, 317, 575, 648, 1179, 1194, 2010, 2012, 2018, 2177, 2194, 2400]]
+    for i, task in tqdm(selected_tasks):
+        dump_program(task, size=args.size, output_dir=args.output_dir, task_idx=i)
         gc.collect()
 

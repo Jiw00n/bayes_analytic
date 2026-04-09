@@ -13,7 +13,7 @@ from ..modules.symbolic_state_bridge import build_symbolic_state
 
 tasks = load_and_register_tasks()
 
-task_idx = 520
+task_idx = 584
 task = tasks[task_idx]
 print(task.desc)
 sample = SketchPolicy(task, params={'sample_init_no_invalid': 1 }, verbose=False).generate_concrete_sketches()[0]

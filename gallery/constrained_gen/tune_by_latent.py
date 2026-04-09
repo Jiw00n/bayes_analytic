@@ -10,19 +10,20 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from tvm import auto_scheduler
+import math
 
 if __package__ in (None, ""):
     _HERE = Path(__file__).resolve().parent
     sys.path.insert(0, str(_HERE))
     sys.path.insert(0, str(_HERE.parent))
-    from latent_param_model.adapter import GeneratorRegistry, JsonSampleRecord, LegalPrefixOracle, load_json_sample
-    from latent_param_model.model import LatentParamVAE
-    from latent_param_model.tokenizer import ParamTokenizer
+    from latent_model.adapter import GeneratorRegistry, JsonSampleRecord, LegalPrefixOracle, load_json_sample
+    from latent_model.model import LatentParamVAE
+    from latent_model.tokenizer import ParamTokenizer
     from modules.task_paths import clean_name, get_measure_record_filename
 else:
-    from .latent_param_model.adapter import GeneratorRegistry, JsonSampleRecord, LegalPrefixOracle, load_json_sample
-    from .latent_param_model.model import LatentParamVAE
-    from .latent_param_model.tokenizer import ParamTokenizer
+    from .latent_model.adapter import GeneratorRegistry, JsonSampleRecord, LegalPrefixOracle, load_json_sample
+    from .latent_model.model import LatentParamVAE
+    from .latent_model.tokenizer import ParamTokenizer
     from .modules.task_paths import clean_name, get_measure_record_filename
 
 
@@ -85,7 +86,7 @@ def measure_candidate(
     """단일 MeasureResult를 요약 딕셔너리로 변환한다."""
     error_no = int(result.error_no)
     costs = [float(x) for x in result.costs]
-    mean_cost = float(sum(costs) / len(costs)) if costs else None
+    mean_cost = -math.log(float(sum(costs) / len(costs))) if costs else None
     usable_measurement = error_no == int(auto_scheduler.measure.MeasureErrorNo.NO_ERROR)
     error_msg = str(result.error_msg)
     return {
@@ -416,6 +417,7 @@ def greedy_decode_from_z(
             step_input,
             step_var_ids,
             memory,
+            z,
             decoder_pad_mask=step_input.eq(tokenizer.pad_id),
         )
         step_logits = logits[0, -1].masked_fill(~token_mask, float("-inf"))

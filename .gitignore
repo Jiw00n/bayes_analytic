@@ -306,3 +306,8 @@ wandb/*
 */handoffs/*
 */docs_agents/
 */docs_agents/*
+
+analysis/
+checkpoints/
+walk_records/
+trash_can/

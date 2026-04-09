@@ -18,8 +18,10 @@ from tvm import auto_scheduler
 from tvm.auto_scheduler import SketchPolicy
 from tqdm import tqdm
 
-from ..modules.task_paths import get_to_measure_gen_filename, load_and_register_tasks
-from ..modules.schedule_generator import ScheduleGenerator
+sys.path.append("/root/work/tvm-ansor/gallery/constrained_gen")
+
+from modules.task_paths import get_to_measure_gen_filename, load_and_register_tasks
+from modules.schedule_generator import ScheduleGenerator
 
 
 TASK_NETWORK_INFO_FOLDER = "/root/work/tvm-ansor/gallery/dataset/network_info_all"
@@ -116,7 +118,7 @@ def load_existing_output_fingerprints(task, output_path):
     }
 
 
-def process_task(task_index, task, records_per_task=1, emit_logs=True):
+def process_task(task_index, task, records_per_task=1, emit_logs=True, show_record_bar=False):
     """한 task에 대해 unique concrete schedule을 records_per_task개까지 모아 저장한다."""
     output_path = get_to_measure_gen_filename(task, task_index=task_index, output_dir=TO_MEASURE_GEN_PROGRAM_FOLDER)
     output_label = _short_output_path(output_path)
@@ -186,64 +188,72 @@ def process_task(task_index, task, records_per_task=1, emit_logs=True):
     collected_results = []
     total_duplicates_skipped = 0
     exhausted_sketches = 0
+    record_bar_ctx = (
+        tqdm(total=target_count, desc=f"task {task_index} records", unit="record", leave=False)
+        if show_record_bar
+        else nullcontext()
+    )
 
-    for sketch_index, state in enumerate(sketches):
-        if len(collected_inputs) >= target_count:
-            break
-
-        try:
-            gen = ScheduleGenerator.from_task_state(task, state)
-        except Exception as err:  # pylint: disable=broad-except
-            _emit_failure(task_index, task, "construct_schedule_generator", sketch_index, err)
-            continue
-
-        start_stats = gen.get_unique_search_stats()
-        while len(collected_inputs) < target_count:
-            try:
-                payload = gen.next_unique_schedule(seen_fingerprints)
-            except Exception as err:  # pylint: disable=broad-except
-                _emit_failure(task_index, task, "next_unique_schedule", sketch_index, err)
-                payload = None
-                break
-
-            if payload is None:
-                exhausted_sketches += 1
-                break
-
-            seen_fingerprints.add(payload["fingerprint"])
-            try:
-                measure_input, measure_result = build_measure_record(task, payload["state"])
-            except Exception as err:  # pylint: disable=broad-except
-                _emit_failure(task_index, task, "build_measure_record", sketch_index, err)
-                break
-
-            collected_inputs.append(measure_input)
-            collected_results.append(measure_result)
+    with record_bar_ctx as record_bar:
+        for sketch_index, state in enumerate(sketches):
             if len(collected_inputs) >= target_count:
+                break
+
+            try:
+                gen = ScheduleGenerator.from_task_state(task, state)
+            except Exception as err:  # pylint: disable=broad-except
+                _emit_failure(task_index, task, "construct_schedule_generator", sketch_index, err)
+                continue
+
+            start_stats = gen.get_unique_search_stats()
+            while len(collected_inputs) < target_count:
+                try:
+                    payload = gen.next_unique_schedule(seen_fingerprints)
+                except Exception as err:  # pylint: disable=broad-except
+                    _emit_failure(task_index, task, "next_unique_schedule", sketch_index, err)
+                    payload = None
+                    break
+
+                if payload is None:
+                    exhausted_sketches += 1
+                    break
+
+                seen_fingerprints.add(payload["fingerprint"])
+                try:
+                    measure_input, measure_result = build_measure_record(task, payload["state"])
+                except Exception as err:  # pylint: disable=broad-except
+                    _emit_failure(task_index, task, "build_measure_record", sketch_index, err)
+                    break
+
+                collected_inputs.append(measure_input)
+                collected_results.append(measure_result)
+                if record_bar is not None:
+                    record_bar.update(1)
+                if len(collected_inputs) >= target_count:
+                    _maybe_emit_task_log(
+                        task_index,
+                        task,
+                        emit_logs,
+                        (
+                            f"PROGRESS unique={len(collected_inputs)}/{target_count} "
+                            f"seeded={existing_seed_count} dup={total_duplicates_skipped}"
+                        ),
+                    )
+
+            end_stats = gen.get_unique_search_stats()
+            sketch_duplicates = end_stats["duplicates_skipped"] - start_stats["duplicates_skipped"]
+            total_duplicates_skipped += sketch_duplicates
+            if len(collected_inputs) < target_count:
                 _maybe_emit_task_log(
                     task_index,
                     task,
                     emit_logs,
                     (
-                        f"PROGRESS unique={len(collected_inputs)}/{target_count} "
-                        f"seeded={existing_seed_count} dup={total_duplicates_skipped}"
+                        f"SKETCH_DONE sketch={sketch_index} status=exhausted "
+                        f"unique={len(collected_inputs)}/{target_count} "
+                        f"sketch_dup={sketch_duplicates}"
                     ),
                 )
-
-        end_stats = gen.get_unique_search_stats()
-        sketch_duplicates = end_stats["duplicates_skipped"] - start_stats["duplicates_skipped"]
-        total_duplicates_skipped += sketch_duplicates
-        if len(collected_inputs) < target_count:
-            _maybe_emit_task_log(
-                task_index,
-                task,
-                emit_logs,
-                (
-                    f"SKETCH_DONE sketch={sketch_index} status=exhausted "
-                    f"unique={len(collected_inputs)}/{target_count} "
-                    f"sketch_dup={sketch_duplicates}"
-                ),
-            )
 
     if collected_inputs:
         deduped_inputs, deduped_results, dropped = dedupe_measure_records(
@@ -377,6 +387,7 @@ def run_selected_tasks(
                         task,
                         records_per_task,
                         emit_logs=False,
+                        show_record_bar=not suppress_progress_output,
                     )
                 )
                 if pbar is not None:
@@ -458,11 +469,7 @@ def parse_args():
     group.add_argument("--all", action="store_true")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument(
-        "--records-per-task",
-        type=int,
-        default=1,
-        metavar="N",
+    parser.add_argument("--records-per-task", type=int, default=1, metavar="N",
         help="한 task당 생성할 유효 레코드 개수 (기본 1)",
     )
     parser.add_argument("--_quiet-task-logs", action="store_true", help=argparse.SUPPRESS)

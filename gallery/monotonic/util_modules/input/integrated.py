@@ -87,12 +87,13 @@ def divide_by_sketches(inputs, results):
     return sketches, sketch_results
 
 
-def json_to_VecCosts(json, type="schedules"):
+def json_to_VecCosts(json, type="schedules", return_raw_cost=False):
     inputs, results = auto_scheduler.RecordReader(json).read_lines()
     inputs, results, original_indices = filter_InpRes_by_cost(inputs, results)
 
     costs = np.array([-np.log(np.mean([c.value for c in res.costs])) for res in results])
-
+    if return_raw_cost:
+        costs = np.array([np.mean([c.value for c in res.costs]) for res in results])
 
     if type == "schedules":
         output = measureInput_to_Sch(inputs)

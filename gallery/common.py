@@ -55,13 +55,15 @@ def get_task_info_filename(network_key, target):
     network_task_key = (network_key,) + (str(target.kind),)
     return f"{NETWORK_INFO_FOLDER}/{clean_name(network_task_key)}.task.pkl"
 
-def get_to_measure_filename(task, output_dir=None, network_name=None):
+def get_to_measure_filename(task, task_index=None, output_dir=None, network_name=None):
     task_key = (task.workload_key, str(task.target.kind))
-    if output_dir is not None:
-        return f"{output_dir}/{clean_name(task_key)}.json"
+    if output_dir is None:
+        output_dir = TO_MEASURE_PROGRAM_FOLDER
     if network_name is not None:
-        return f"{TO_MEASURE_PROGRAM_FOLDER}/{network_name}/{clean_name(task_key)}.json"
-    return f"{TO_MEASURE_PROGRAM_FOLDER}/{clean_name(task_key)}.json"
+        output_dir = f"{output_dir}/{network_name}"
+    if task_index is not None:
+        return f"{output_dir}/{task_index}_{clean_name(task_key)}.json"
+    return f"{output_dir}/{clean_name(task_key)}.json"
 
 # def get_measure_record_filename(task, target=None):
 #     target = target or task.target

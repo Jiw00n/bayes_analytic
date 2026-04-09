@@ -7,7 +7,8 @@ import sys
 
 from tvm import auto_scheduler
 
-from ..modules.task_paths import (
+sys.path.append("/root/work/tvm-ansor/gallery/constrained_gen")
+from modules.task_paths import (
     get_measure_record_filename,
     get_to_measure_gen_filename,
     load_and_register_tasks,
@@ -53,6 +54,13 @@ def _make_measurer(task, log_filename):
         [auto_scheduler.RecordToFile(log_filename)],
         verbose=VERBOSE,
     )
+
+
+def _resolve_output_path(input_path, task, output_dir=None):
+    """입력 파일 basename을 유지한 측정 결과 파일 경로를 반환한다."""
+    if output_dir is None:
+        output_dir = os.path.dirname(get_measure_record_filename(task, task.target))
+    return os.path.join(output_dir, os.path.basename(input_path))
 
 
 def select_input_files(tasks, task_index, explicit_input_paths=None):
@@ -122,7 +130,7 @@ def measure_file(input_path, tasks_by_workload_key, records_per_task, output_dir
         raw_inputs = random.sample(raw_inputs, records_per_task)
 
     measure_inputs = [auto_scheduler.MeasureInput(task, inp.state) for inp in raw_inputs]
-    output_path = get_measure_record_filename(task, task.target, output_dir=output_dir)
+    output_path = _resolve_output_path(input_path, task, output_dir=output_dir)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     try:

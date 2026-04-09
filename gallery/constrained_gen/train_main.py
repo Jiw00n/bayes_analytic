@@ -6,11 +6,11 @@ from pathlib import Path
 if __package__ in (None, ""):
     here = Path(__file__).resolve().parent
     sys.path.insert(0, str(here.parent))
-    from latent_param_model.config import build_config
-    from latent_param_model.train import train_main
+    from latent_model.config import build_config
+    from latent_model.train import train_main
 else:
-    from .latent_param_model.config import build_config
-    from .latent_param_model.train import train_main
+    from .latent_model.config import build_config
+    from .latent_model.train import train_main
 
 
 def main() -> None:
