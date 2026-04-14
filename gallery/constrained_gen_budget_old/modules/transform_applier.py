@@ -1,7 +1,6 @@
 """
 transform_applier — TransformApplier: SymbolicState에 transform step을 적용하는 로직.
 """
-
 import tvm
 from tvm import tir
 from tvm.auto_scheduler.loop_state import StateObject
@@ -238,6 +237,9 @@ class TransformApplier:
     def _restore_stage_extents_if_needed(self, stage_id, step_idx):
         s = self.s
         stage = s.stages[stage_id]
+        has_none = any(it.extent is None for it in stage.iters)
+        if not has_none:
+            return
 
         bounded = self._infer_bound_partial_from_state(s._state, step_idx)
         if bounded is None or stage_id >= len(bounded.stages):
@@ -246,43 +248,18 @@ class TransformApplier:
         cr_sym_candidates, cr_stencil, cr_ordered_splits = self._get_cache_read_restore_ctx(stage_id)
 
         real_stage = bounded.stages[stage_id]
-        for iid in range(min(len(stage.iters), len(real_stage.iters))):
-            real_it = real_stage.iters[iid]
-            if real_it.range is None:
-                continue
-            real_ext = int(real_it.range.extent)
-            stage.iters[iid].min_value = self._recover_iter_min(stage_id, iid)
-
-            current_extent = stage.iters[iid].extent
-            keep_current = False
-            if current_extent is not None:
-                eval_extent = eval_sym_extent(current_extent, s.sym_map)
-                if eval_extent is not None:
-                    try:
-                        keep_current = int(eval_extent) == real_ext
-                    except (TypeError, ValueError):
-                        keep_current = False
-
-            if keep_current:
-                continue
-
-            recovered_extent = self._recover_iter_extent(
-                stage_id, iid, real_ext,
-                cr_sym_candidates=cr_sym_candidates,
-                cr_stencil=cr_stencil,
-                cr_ordered_splits=cr_ordered_splits,
-            )
-            recovered_eval = eval_sym_extent(recovered_extent, s.sym_map)
-            if recovered_eval is None:
-                stage.iters[iid].extent = SymExpr(real_ext)
-                continue
-            try:
-                recovered_matches = int(recovered_eval) == real_ext
-            except (TypeError, ValueError):
-                recovered_matches = False
-            stage.iters[iid].extent = (
-                recovered_extent if recovered_matches else SymExpr(real_ext)
-            )
+        for iid in range(len(stage.iters)):
+            if stage.iters[iid].extent is None and iid < len(real_stage.iters):
+                real_it = real_stage.iters[iid]
+                if real_it.range is not None:
+                    real_ext = int(real_it.range.extent)
+                    stage.iters[iid].min_value = self._recover_iter_min(stage_id, iid)
+                    stage.iters[iid].extent = self._recover_iter_extent(
+                        stage_id, iid, real_ext,
+                        cr_sym_candidates=cr_sym_candidates,
+                        cr_stencil=cr_stencil,
+                        cr_ordered_splits=cr_ordered_splits,
+                    )
 
     def _get_consumer_split_sym_products(self, cache_read_stage_id):
         s = self.s
@@ -474,12 +451,12 @@ class TransformApplier:
 
         orig_iter = stage.iters[iid]
 
-        tosplit_extent = orig_iter.extent
-        if tosplit_extent is None:
-            raise AssertionError(
-                f"SplitStep replay could not recover extent before step {step_idx} "
-                f"(stage_id={sid}, iter_id={iid})"
-            )
+        if orig_iter.extent is not None:
+            tosplit_extent = orig_iter.extent
+        elif step.extent is not None:
+            tosplit_extent = SymExpr(int(step.extent))
+        else:
+            tosplit_extent = None
         if tosplit_extent is not None:
             s._split_step_extents[step_idx] = SymExpr(tosplit_extent.val)
 

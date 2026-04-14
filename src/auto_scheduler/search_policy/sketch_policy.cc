@@ -1131,15 +1131,44 @@ TVM_REGISTER_GLOBAL("auto_scheduler.ReplayStepsPartial")
       // init_state에서 시작하여 num_steps개의 step만 적용
       State new_state = dag->init_state;
       auto* pstate = new_state.CopyOnWrite();
-      
+
       int n = std::min(num_steps, (int)s->transform_steps.size());
       for (int i = 0; i < n; i++) {
         pstate->transform_steps.push_back(s->transform_steps[i]);
         StepApplyToState(s->transform_steps[i], &new_state, dag);
       }
-      
+
       // InferBound로 완전한 bound 정보 채움
       return dag.InferBound(new_state);
+    });
+
+TVM_REGISTER_GLOBAL("auto_scheduler.FixSplitExtentsInState")
+    .set_body_typed([](const ComputeDAG& dag, const State& s) -> State {
+      // Rebuild state, replacing each SplitStep's `extent` with the live
+      // iterator extent at the moment the split is applied. Other steps are
+      // copied verbatim. See docs comment at MutateTileSize for background.
+      State new_state = dag->init_state;
+      auto* pstate = new_state.CopyOnWrite();
+      for (const auto& step : s->transform_steps) {
+        if (auto ps = step.as<SplitStepNode>()) {
+          State probed = dag.InferBound(new_state);
+          const auto& iter = probed->stages[ps->stage_id]->iters[ps->iter_id];
+          Optional<PrimExpr> live_extent;
+          if (iter->range.defined()) {
+            live_extent = iter->range->extent;
+          } else {
+            live_extent = ps->extent;
+          }
+          SplitStep fixed(ps->stage_id, ps->iter_id, live_extent, ps->lengths,
+                          ps->inner_to_outer);
+          pstate->transform_steps.push_back(fixed);
+          StepApplyToState(fixed, &new_state, dag);
+        } else {
+          pstate->transform_steps.push_back(step);
+          StepApplyToState(step, &new_state, dag);
+        }
+      }
+      return new_state;
     });
 
 }  // namespace auto_scheduler

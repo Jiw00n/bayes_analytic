@@ -135,6 +135,14 @@ def params_to_state_from_record(task, base_inp, base_res, params, split_extents=
     )
 
 
+def infer_bound_state_partial(task, base_inp, base_res, params, step_idx):
+    """step_idx 직전까지 replay된 patched State에 infer_bound를 적용해 반환한다."""
+    patched_state = _params_to_state_from_measure_record(base_inp, base_res, params)
+    replay = tvm._ffi.get_global_func("auto_scheduler.ReplayStepsPartial")
+    partial = replay(task.compute_dag, patched_state, int(step_idx))
+    return task.compute_dag.infer_bound_from_state(partial)
+
+
 def build_state_record_steps_payload(task, state):
     """Concrete State를 measure-record step payload JSON 문자열로 정규화해 반환한다."""
     measure_input = auto_scheduler.MeasureInput(task, state)

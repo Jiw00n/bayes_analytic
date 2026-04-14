@@ -9,9 +9,21 @@ import os
 
 from tqdm import tqdm
 
+import tvm
 from tvm import auto_scheduler
 
 from common import load_and_register_tasks, get_to_measure_filename
+
+
+_fix_split_extents = tvm._ffi.get_global_func("auto_scheduler.FixSplitExtentsInState")
+
+
+def _rebuild_state_with_true_extents(task, state):
+    """Replace each SplitStep's frozen extent with the live iterator extent at
+    the moment of split, so serialized records carry the true runtime extent."""
+    state_obj = state.state_object if hasattr(state, "state_object") else state
+    new_state_obj = _fix_split_extents(task.compute_dag, state_obj)
+    return auto_scheduler.loop_state.State(new_state_obj, task.compute_dag)
 
 
 def dump_program(task, size, output_dir=None, task_idx=None, max_retry_iter=10):
@@ -61,7 +73,8 @@ def dump_program(task, size, output_dir=None, task_idx=None, max_retry_iter=10):
     measure_inputs = []
     measure_results = []
     for state in all_state_list:
-        measure_inputs.append(auto_scheduler.MeasureInput(task, state))
+        fixed_state = _rebuild_state_with_true_extents(task, state)
+        measure_inputs.append(auto_scheduler.MeasureInput(task, fixed_state))
         measure_results.append(auto_scheduler.MeasureResult([0.0], 0, "", 0, time.time()))
 
     # Dump to file
@@ -83,7 +96,7 @@ if __name__ == "__main__":
 
     # Dump programs for all tasks
     # for task in tqdm(tasks[start_idx:end_idx]):
-    selected_tasks = [(i, task) for i, task in enumerate(tasks) if i in [415, 534]]
+    selected_tasks = [(i, task) for i, task in enumerate(tasks) if i in [415]]
     for i, task in tqdm(selected_tasks):
         dump_program(task, size=args.size, output_dir=args.output_dir, task_idx=i)
         gc.collect()
