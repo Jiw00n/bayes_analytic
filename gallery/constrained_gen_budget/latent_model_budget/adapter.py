@@ -194,29 +194,28 @@ def _extract_measure_record_params_from_payload(payload: dict) -> Tuple[Dict[str
     return params, tuple(param_signature)
 
 
-def _bind_raw_step_extents(record: JsonSampleRecord, generator) -> None:
-    """Override generator's per-step recorded extents with the raw JSON values.
+def _record_split_extent_overrides(record: JsonSampleRecord) -> Optional[Dict[int, int]]:
+    """Extract per-SplitStep frozen extent from record's raw JSON.
 
     Sketch-time extents (e.g. vectorize splits on cache_read after FuseStep)
-    are frozen in the raw record's SP step entry but cannot be re-derived from
-    sym_map alone. This binds those frozen values into the shared generator
-    so per-record lookups via ``_get_dynamic_split_extent`` return the
-    sketch-time extent regardless of substituted sym_map.
+    are frozen in the raw record's SP step entry. Returned as a read-only
+    override dict to be threaded into per-call extent lookups, avoiding any
+    mutation of the shared cached generator.
     """
-    from modules.sym_types import SymExpr
-
     raw_steps = record.raw.get("i", [None, [None, None]])[1][1]
-    sym_state = generator.s
+    if not isinstance(raw_steps, list):
+        return None
+    overrides: Dict[int, int] = {}
     for step_idx, raw_step in enumerate(raw_steps):
         if not isinstance(raw_step, list) or not raw_step or raw_step[0] != "SP":
             continue
         if len(raw_step) < 4:
             continue
         try:
-            extent_val = int(raw_step[3])
+            overrides[int(step_idx)] = int(raw_step[3])
         except (TypeError, ValueError):
             continue
-        sym_state._split_step_extents[step_idx] = SymExpr(extent_val)
+    return overrides or None
 
 
 def _augment_record_budget_params(record: JsonSampleRecord, generator) -> None:
@@ -720,7 +719,6 @@ class GeneratorRegistry:
             sketch_index=record.sketch_index,
         )
         _augment_record_budget_params(record, gen)
-        _bind_raw_step_extents(record, gen)
         return gen
 
     def get_generator_from_payload(self, payload: dict):
@@ -736,7 +734,9 @@ class GeneratorRegistry:
         )
 
     def build_oracle_from_record(self, record: JsonSampleRecord) -> "LegalPrefixOracle":
-        return LegalPrefixOracle(self.get_generator_from_record(record))
+        gen = self.get_generator_from_record(record)
+        overrides = _record_split_extent_overrides(record)
+        return LegalPrefixOracle(gen, extent_overrides=overrides)
 
     def build_oracle_from_payload(self, payload: dict) -> "LegalPrefixOracle":
         return LegalPrefixOracle(self.get_generator_from_payload(payload))
@@ -787,10 +787,18 @@ class LegalPrefixOracle:
     - upstream observability format change
     """
 
-    def __init__(self, generator):
+    def __init__(self, generator, extent_overrides=None):
         self.generator = generator
+        self._extent_overrides = (
+            {int(k): int(v) for k, v in extent_overrides.items()}
+            if extent_overrides else None
+        )
+        self._extent_fingerprint = (
+            tuple(sorted(self._extent_overrides.items())) if self._extent_overrides else ()
+        )
         _, domains, group_remaining, _ = generator.param_sampler._initialize_unique_search_base_state(
-            generator._var_order
+            generator._var_order,
+            extent_overrides=self._extent_overrides,
         )
         self.assignment: Dict[str, int] = {}
         self._domains = generator.param_sampler._copy_domains(domains)
@@ -808,12 +816,13 @@ class LegalPrefixOracle:
             self.generator._lpm_candidate_cache = {}
         if not hasattr(self.generator, "_lpm_mask_cache"):
             self.generator._lpm_mask_cache = {}
+        root_key = (self._extent_fingerprint, tuple())
         if not hasattr(self.generator, "_lpm_prefix_state_cache"):
-            self.generator._lpm_prefix_state_cache = {tuple(): root_snapshot}
-        elif tuple() not in self.generator._lpm_prefix_state_cache:
-            self.generator._lpm_prefix_state_cache[tuple()] = root_snapshot
+            self.generator._lpm_prefix_state_cache = {root_key: root_snapshot}
+        elif root_key not in self.generator._lpm_prefix_state_cache:
+            self.generator._lpm_prefix_state_cache[root_key] = root_snapshot
 
-        cached_root = self.generator._lpm_prefix_state_cache[tuple()]
+        cached_root = self.generator._lpm_prefix_state_cache[root_key]
         self.assignment.clear()
         self.assignment.update(cached_root[0])
         self._domains = self.generator.param_sampler._copy_domains(cached_root[1])
@@ -825,12 +834,18 @@ class LegalPrefixOracle:
     def _activate_state(self) -> None:
         self.generator.param_sampler._restore_sym_map(self._sym_map)
 
+    def mask_cache_key(self, prefix_tuple, var_name) -> tuple:
+        return (self._extent_fingerprint, tuple(prefix_tuple), str(var_name))
+
+    def prefix_state_key(self, prefix_tuple) -> tuple:
+        return (self._extent_fingerprint, tuple(prefix_tuple))
+
     def param_order(self) -> List[str]:
         return list(self.generator.get_full_var_order_entries()["param_order"])
 
     def candidate_values(self, var_name: str) -> List[int]:
         self._activate_state()
-        cache_key = (tuple(self.assignment.items()), str(var_name))
+        cache_key = (self._extent_fingerprint, tuple(self.assignment.items()), str(var_name))
         cached = self.generator._lpm_candidate_cache.get(cache_key)
         if cached is not None:
             candidates = list(cached)
@@ -841,6 +856,7 @@ class LegalPrefixOracle:
                 self._group_remaining,
                 self._budget_remaining,
                 self.assignment,
+                extent_overrides=self._extent_overrides,
             )
             self.generator._lpm_candidate_cache[cache_key] = tuple(int(v) for v in candidates)
         candidates = list(sorted(dict.fromkeys(int(v) for v in candidates)))
@@ -861,13 +877,14 @@ class LegalPrefixOracle:
             self._domains,
             self._group_remaining,
             self._budget_remaining,
+            extent_overrides=self._extent_overrides,
         )
         self._sym_map = dict(self.generator.s.sym_map)
         self.last_report = {
             "query": {"param_name": var_name, "param_value": value},
             "assignment": {"params": dict(self.assignment)},
         }
-        self.generator._lpm_prefix_state_cache[tuple(self.assignment.items())] = (
+        self.generator._lpm_prefix_state_cache[(self._extent_fingerprint, tuple(self.assignment.items()))] = (
             dict(self.assignment),
             self.generator.param_sampler._copy_domains(self._domains),
             self.generator.param_sampler._copy_group_remaining(self._group_remaining),

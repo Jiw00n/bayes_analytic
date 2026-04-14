@@ -309,7 +309,7 @@ class DomainPropagator:
             return True
         return False
 
-    def propagate_domain(self, assigned_name, domains):
+    def propagate_domain(self, assigned_name, domains, extent_overrides=None):
         """한 변수 할당 후 해당 변수를 쓰는 제약으로 다른 변수 도메인을 좁힌다."""
         g = self.gen
         constraint_indices = g._var_constraints.get(assigned_name, [])
@@ -323,19 +323,19 @@ class DomainPropagator:
                 dom = domains.get(other_var)
                 if not isinstance(dom, list):
                     continue
-                self._propagate_constraint_to_var(c, other_var, dom, sym_map)
+                self._propagate_constraint_to_var(c, other_var, dom, sym_map, extent_overrides=extent_overrides)
 
-    def _propagate_constraint_to_var(self, constraint, other_var, dom, sym_map):
+    def _propagate_constraint_to_var(self, constraint, other_var, dom, sym_map, extent_overrides=None):
         if constraint['is_upper']:
-            self._propagate_upper_constraint_to_var(constraint, other_var, dom, sym_map)
+            self._propagate_upper_constraint_to_var(constraint, other_var, dom, sym_map, extent_overrides=extent_overrides)
             return
-        self._propagate_lower_constraint_to_var(constraint, other_var, dom, sym_map)
+        self._propagate_lower_constraint_to_var(constraint, other_var, dom, sym_map, extent_overrides=extent_overrides)
 
-    def _propagate_upper_constraint_to_var(self, constraint, other_var, dom, sym_map):
+    def _propagate_upper_constraint_to_var(self, constraint, other_var, dom, sym_map, extent_overrides=None):
         if self._propagate_upper_domain_fast(constraint, other_var, dom, sym_map):
             return
 
-        candidates = self.candidate_values_for_domain(other_var, dom)
+        candidates = self.candidate_values_for_domain(other_var, dom, extent_overrides=extent_overrides)
         if candidates is not None:
             self._tighten_upper_domain_from_candidates(
                 constraint,
@@ -414,7 +414,7 @@ class DomainPropagator:
         if lo < cur_hi:
             dom[1] = lo
 
-    def _propagate_lower_constraint_to_var(self, constraint, other_var, dom, sym_map):
+    def _propagate_lower_constraint_to_var(self, constraint, other_var, dom, sym_map, extent_overrides=None):
         tree = constraint['tree']
         rhs = constraint['rhs']
         cur_lo, cur_hi = dom
@@ -450,7 +450,7 @@ class DomainPropagator:
     # Candidate filtering and bisection
     # ------------------------------------------------------------------
 
-    def candidate_values_for_domain(self, var_name, dom):
+    def candidate_values_for_domain(self, var_name, dom, extent_overrides=None):
         g = self.gen
         if not var_name.startswith("sp_"):
             return None
@@ -461,7 +461,7 @@ class DomainPropagator:
 
         step_idx = int(parts[1])
         pos = int(parts[2])
-        extent = g._get_dynamic_split_extent(step_idx)
+        extent = g._get_dynamic_split_extent(step_idx, extent_overrides=extent_overrides)
         group_names = g._sp_groups.get(step_idx)
         if extent is None or not group_names or pos >= len(group_names):
             return None

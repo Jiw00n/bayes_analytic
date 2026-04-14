@@ -95,7 +95,7 @@ class ParamSampler:
         """모든 split 파라미터에 대한 초기 도메인 [1, extent] 딕셔너리를 만든다."""
         return self.gen._build_split_domains()
 
-    def _initialize_unique_search_base_state(self, var_order):
+    def _initialize_unique_search_base_state(self, var_order, extent_overrides=None):
         """unique search용 초기 상태를 만든다.
 
         retry sampler와 달리 singleton 도메인 변수를 미리 할당하지 않고,
@@ -115,17 +115,17 @@ class ParamSampler:
     # Per-variable sampling
     # ------------------------------------------------------------------
 
-    def _get_split_candidates_base(self, name, domains, group_remaining):
+    def _get_split_candidates_base(self, name, domains, group_remaining, extent_overrides=None):
         g = self.gen
         innermost_limit = g.hw['max_innermost_split_factor']
         parts = name.split("_")
         step_idx = int(parts[1])
-        extent = g._get_dynamic_split_extent(step_idx)
+        extent = g._get_dynamic_split_extent(step_idx, extent_overrides=extent_overrides)
 
         if extent is None:
             return [int(g.s.sym_map.get(name, 1))]
 
-        remaining = g._get_group_remaining(step_idx, group_remaining)
+        remaining = g._get_group_remaining(step_idx, group_remaining, extent_overrides=extent_overrides)
         candidates = g._enumerate_split_candidates(name, remaining)
 
         if name in g._innermost_names:
@@ -164,7 +164,7 @@ class ParamSampler:
                 break
         return reachable
 
-    def _get_budget_candidates(self, name, domains, group_remaining, result):
+    def _get_budget_candidates(self, name, domains, group_remaining, result, extent_overrides=None):
         g = self.gen
         spec = g._get_budget_spec(name)
         if spec is None:
@@ -176,6 +176,7 @@ class ParamSampler:
                 factor_name,
                 domains,
                 group_remaining,
+                extent_overrides=extent_overrides,
             )
             if not candidates:
                 return []
@@ -199,6 +200,7 @@ class ParamSampler:
         group_remaining,
         budget_remaining,
         result,
+        extent_overrides=None,
     ):
         g = self.gen
         spec = g._budget_spec_by_factor.get(name)
@@ -224,6 +226,7 @@ class ParamSampler:
                     factor_name,
                     domains,
                     group_remaining,
+                    extent_overrides=extent_overrides,
                 )
                 if not factor_candidates:
                     remaining_lists = None
@@ -240,8 +243,8 @@ class ParamSampler:
                 filtered.append(candidate)
         return filtered
 
-    def _get_split_candidates(self, name, domains, group_remaining, budget_remaining, result):
-        candidates = self._get_split_candidates_base(name, domains, group_remaining)
+    def _get_split_candidates(self, name, domains, group_remaining, budget_remaining, result, extent_overrides=None):
+        candidates = self._get_split_candidates_base(name, domains, group_remaining, extent_overrides=extent_overrides)
         return self._split_candidates_with_budget(
             name,
             candidates,
@@ -249,17 +252,18 @@ class ParamSampler:
             group_remaining,
             budget_remaining,
             result,
+            extent_overrides=extent_overrides,
         )
 
-    def _get_search_candidates(self, name, domains, group_remaining, budget_remaining, result):
+    def _get_search_candidates(self, name, domains, group_remaining, budget_remaining, result, extent_overrides=None):
         g = self.gen
         if g._is_budget_name(name):
-            return self._get_budget_candidates(name, domains, group_remaining, result)
+            return self._get_budget_candidates(name, domains, group_remaining, result, extent_overrides=extent_overrides)
         if name.startswith("ur_"):
             return [int(value) for value in g.pm.UNROLL_CANDIDATES]
-        return self._get_split_candidates(name, domains, group_remaining, budget_remaining, result)
+        return self._get_split_candidates(name, domains, group_remaining, budget_remaining, result, extent_overrides=extent_overrides)
 
-    def _apply_search_assignment(self, name, chosen, result, domains, group_remaining, budget_remaining):
+    def _apply_search_assignment(self, name, chosen, result, domains, group_remaining, budget_remaining, extent_overrides=None):
         g = self.gen
         chosen = int(chosen)
         result[name] = chosen
@@ -284,12 +288,12 @@ class ParamSampler:
 
         parts = name.split("_")
         step_idx = int(parts[1])
-        extent = g._get_dynamic_split_extent(step_idx)
+        extent = g._get_dynamic_split_extent(step_idx, extent_overrides=extent_overrides)
         if extent is None:
             domains[name] = chosen
             return
 
-        remaining = g._get_group_remaining(step_idx, group_remaining)
+        remaining = g._get_group_remaining(step_idx, group_remaining, extent_overrides=extent_overrides)
         domains[name] = chosen
         group_remaining[step_idx] = (remaining + chosen - 1) // chosen
 
@@ -299,7 +303,7 @@ class ParamSampler:
 
         constraint_indices = g._var_constraints.get(name, [])
         if constraint_indices:
-            g.domain_propagator.propagate_domain(name, domains)
+            g.domain_propagator.propagate_domain(name, domains, extent_overrides=extent_overrides)
 
     # ------------------------------------------------------------------
     # Final validation and reporting
@@ -454,7 +458,7 @@ class ParamSampler:
     # Deprecated
     # ------------------------------------------------------------------
 
-    def _assign_initial_fixed_vars(self, var_order, domains, group_remaining, result):
+    def _assign_initial_fixed_vars(self, var_order, domains, group_remaining, result, extent_overrides=None):
         """이미 도메인이 1개 값으로 고정된 변수들을 먼저 할당하고, 미할당 변수 목록을 반환한다."""
         g = self.gen
         innermost_limit = g.hw['max_innermost_split_factor']
@@ -481,7 +485,7 @@ class ParamSampler:
 
                 parts = name.split("_")
                 step_idx = int(parts[1])
-                extent = g._get_dynamic_split_extent(step_idx)
+                extent = g._get_dynamic_split_extent(step_idx, extent_overrides=extent_overrides)
 
                 if extent is None:
                     g.s.sym_map[name] = fixed_value
@@ -492,7 +496,7 @@ class ParamSampler:
 
                 unresolved_extent_deps = [
                     dep_name
-                    for dep_name in g._get_split_extent_dependencies(step_idx)
+                    for dep_name in g._get_split_extent_dependencies(step_idx, extent_overrides=extent_overrides)
                     if dep_name.startswith("sp_") and dep_name not in result and dep_name != name
                 ]
                 if unresolved_extent_deps:
@@ -503,7 +507,7 @@ class ParamSampler:
                 if any(prev_name not in result for prev_name in group_names[:pos]):
                     continue
 
-                remaining = g._get_group_remaining(step_idx, group_remaining)
+                remaining = g._get_group_remaining(step_idx, group_remaining, extent_overrides=extent_overrides)
                 candidates = g._enumerate_split_candidates(name, remaining)
                 if name in g._innermost_names:
                     candidates = [c for c in candidates if c <= innermost_limit]
@@ -517,7 +521,7 @@ class ParamSampler:
 
                 constraint_indices = g._var_constraints.get(name, [])
                 if constraint_indices:
-                    g.domain_propagator.propagate_domain(name, domains)
+                    g.domain_propagator.propagate_domain(name, domains, extent_overrides=extent_overrides)
                 progress = True
 
         return [name for name in var_order if name not in result]

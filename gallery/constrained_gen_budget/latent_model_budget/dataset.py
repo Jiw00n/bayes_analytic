@@ -151,9 +151,9 @@ def _build_prepared_sample(
             gold_token = tokenizer.value_to_token(name, value)
             gold_id = tokenizer.token_to_id.get(gold_token, tokenizer.unk_id)
             try:
-                mask_key = (
+                mask_key = oracle.mask_cache_key(
                     tuple((order[idx], int(ordered_values[idx])) for idx in range(t)),
-                    str(name),
+                    name,
                 )
                 cached_mask = oracle.generator._lpm_mask_cache.get(mask_key)
                 if cached_mask is None:
@@ -794,7 +794,9 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                     (order[pos], int(values[pos]))
                     for pos in range(prefix_len)
                 )
-                snapshot = current_oracle.generator._lpm_prefix_state_cache.get(prefix_key)
+                snapshot = current_oracle.generator._lpm_prefix_state_cache.get(
+                    current_oracle.prefix_state_key(prefix_key)
+                )
                 if snapshot is None:
                     current_oracle = registry.build_oracle_from_record(record)
                     prefix_len = 0
@@ -969,7 +971,9 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                     (order[pos], int(values[pos]))
                     for pos in range(prefix_len)
                 )
-                snapshot = current_oracle.generator._lpm_prefix_state_cache.get(prefix_key)
+                snapshot = current_oracle.generator._lpm_prefix_state_cache.get(
+                    current_oracle.prefix_state_key(prefix_key)
+                )
                 if snapshot is None:
                     current_oracle = registry.build_oracle_from_record(record)
                     prefix_len = 0

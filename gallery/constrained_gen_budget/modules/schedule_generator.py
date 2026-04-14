@@ -352,8 +352,12 @@ class ScheduleGenerator:
         self._concrete_extent_cache[cache_key] = result
         return result
 
-    def _get_dynamic_split_extent(self, step_idx, sym_map=None):
+    def _get_dynamic_split_extent(self, step_idx, sym_map=None, extent_overrides=None):
         """현재 sym_map 기준으로 split step의 동적 extent를 계산한다."""
+        if extent_overrides is not None:
+            override = extent_overrides.get(step_idx)
+            if override is not None:
+                return int(override)
         if sym_map is None:
             sym_map = self.s.sym_map
         expr = self.s._split_step_extents.get(step_idx)
@@ -363,29 +367,31 @@ class ScheduleGenerator:
                 return int(val)
         return self._sp_extents.get(step_idx)
 
-    def _get_group_remaining(self, step_idx, group_remaining, sym_map=None):
+    def _get_group_remaining(self, step_idx, group_remaining, sym_map=None, extent_overrides=None):
         """같은 split group에서 아직 남은 extent를 캐시와 함께 계산한다."""
         remaining = group_remaining.get(step_idx)
         if remaining is not None:
             return int(remaining)
-        extent = self._get_dynamic_split_extent(step_idx, sym_map=sym_map)
+        extent = self._get_dynamic_split_extent(step_idx, sym_map=sym_map, extent_overrides=extent_overrides)
         if extent is not None:
             group_remaining[step_idx] = int(extent)
         return extent
 
-    def _build_dynamic_split_extents(self, sym_map=None):
+    def _build_dynamic_split_extents(self, sym_map=None, extent_overrides=None):
         """모든 split step의 현재 동적 extent를 한 번에 계산한다."""
         if sym_map is None:
             sym_map = self.s.sym_map
         extents = {}
         for step_idx in self._sp_groups:
-            extent = self._get_dynamic_split_extent(step_idx, sym_map=sym_map)
+            extent = self._get_dynamic_split_extent(step_idx, sym_map=sym_map, extent_overrides=extent_overrides)
             if extent is not None:
                 extents[step_idx] = int(extent)
         return extents
 
-    def _get_split_extent_dependencies(self, step_idx):
+    def _get_split_extent_dependencies(self, step_idx, extent_overrides=None):
         """split extent 식이 의존하는 sp_/ur_ 변수 집합을 추출한다."""
+        if extent_overrides is not None and step_idx in extent_overrides:
+            return set()
         expr = self.s._split_step_extents.get(step_idx)
         if expr is None:
             return set()
@@ -396,7 +402,7 @@ class ScheduleGenerator:
             if name in self.s.sym_map
         }
 
-    def _materialize_assignment_state(self, sym_map=None):
+    def _materialize_assignment_state(self, sym_map=None, extent_overrides=None):
         """부분 할당을 실제 샘플링 상태처럼 전개해 params/domains/sym_map 스냅샷을 만든다."""
         requested = {}
         if sym_map is not None:
@@ -419,6 +425,7 @@ class ScheduleGenerator:
                 domains,
                 group_remaining,
                 result,
+                extent_overrides=extent_overrides,
             )
 
             for name, value in requested.items():
@@ -448,7 +455,7 @@ class ScheduleGenerator:
                     continue
 
                 step_idx = int(name.split("_")[1])
-                extent = self._get_dynamic_split_extent(step_idx)
+                extent = self._get_dynamic_split_extent(step_idx, extent_overrides=extent_overrides)
 
                 if extent is None:
                     fixed_value = int(self.s.sym_map.get(name, 1))
@@ -460,13 +467,14 @@ class ScheduleGenerator:
                     domains[name] = fixed_value
                     continue
 
-                remaining = self._get_group_remaining(step_idx, group_remaining)
+                remaining = self._get_group_remaining(step_idx, group_remaining, extent_overrides=extent_overrides)
                 candidates = self.param_sampler._get_split_candidates(
                     name,
                     domains,
                     group_remaining,
                     budget_remaining,
                     result,
+                    extent_overrides=extent_overrides,
                 )
 
                 if value not in candidates:
@@ -655,14 +663,14 @@ class ScheduleGenerator:
         return self._check_all_final_with_concrete_result(sym_map, concrete_result)
 
 
-    def get_param_candidates(self, name, sym_map=None):
+    def get_param_candidates(self, name, sym_map=None, extent_overrides=None):
         """지정 변수에 대한 제약-만족 후보값과 현재 할당·도메인·제약 요약을 반환한다."""
         requested = {}
         if sym_map is not None:
             requested = dict(sym_map)
         requested.pop(name, None)
 
-        assignment_state = self._materialize_assignment_state(requested)
+        assignment_state = self._materialize_assignment_state(requested, extent_overrides=extent_overrides)
         domains = assignment_state['raw_domains']
 
         if name in assignment_state['params']:
@@ -679,7 +687,7 @@ class ScheduleGenerator:
                 saved_sym_map = dict(self.s.sym_map)
                 try:
                     self.s.sym_map = dict(assignment_state['sym_map'])
-                    candidates = self.domain_propagator.candidate_values_for_domain(name, dom)
+                    candidates = self.domain_propagator.candidate_values_for_domain(name, dom, extent_overrides=extent_overrides)
                     if candidates is None:
                         lo, hi = int(dom[0]), int(dom[1])
                         candidates = list(range(lo, hi + 1))
@@ -702,13 +710,13 @@ class ScheduleGenerator:
         report['candidates'] = list(candidates)
         return report
 
-    def propagate_param_assignment(self, name, value, sym_map=None):
+    def propagate_param_assignment(self, name, value, sym_map=None, extent_overrides=None):
         """한 변수에 값을 할당한 뒤 도메인 전파를 수행하고 관측 리포트를 반환한다."""
         updated = {}
         if sym_map is not None:
             updated.update(sym_map)
         updated[name] = int(value)
-        assignment_state = self._materialize_assignment_state(updated)
+        assignment_state = self._materialize_assignment_state(updated, extent_overrides=extent_overrides)
         report = self._build_observability_report(
             assignment_state['params'],
             assignment_state['raw_domains'],
@@ -720,9 +728,9 @@ class ScheduleGenerator:
         }
         return report
 
-    def get_constraints_under_assignment(self, sym_map=None, include_vars=True, include_eval=True):
+    def get_constraints_under_assignment(self, sym_map=None, include_vars=True, include_eval=True, extent_overrides=None):
         """현재 할당 하에서 제약식 요약(텍스트·남은 제약 등)을 담은 관측 리포트를 반환한다."""
-        assignment_state = self._materialize_assignment_state(sym_map)
+        assignment_state = self._materialize_assignment_state(sym_map, extent_overrides=extent_overrides)
         report = self._build_observability_report(
             assignment_state['params'],
             assignment_state['raw_domains'],

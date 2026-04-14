@@ -42,7 +42,6 @@ class SymbolicState:
         self._cache_read_consumer = {}  # {cache_read_stage_id: consumer_stage_id}
         self._cache_read_stencil_info = {}  # {cr_stage_id: {cr_axis_idx: (pattern_kind, pattern_value, sp_name, rd_name)}}
         self._shared_fused_extents = {}  # {stage_id: SymExpr}
-        self._cooperative_fetch_splits = {}  # {step_idx: stage_id} — marked in _apply_split for lazy cutoff+InferBound extent
         self._exception_split_names = set()  # {sp_stepidx_lenidx}
         self._thread_extent_meta = {}  # {(stage_id, iter_id): {is_mlt_root_thread, relax_min_thread_extent}}
 

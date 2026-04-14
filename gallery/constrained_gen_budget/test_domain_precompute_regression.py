@@ -11,7 +11,11 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from latent_model_budget.config import build_config
-from latent_model_budget.adapter import GeneratorRegistry, load_json_samples
+from latent_model_budget.adapter import (
+    GeneratorRegistry,
+    _record_split_extent_overrides,
+    load_json_samples,
+)
 from latent_model_budget.dataset import (
     _build_prepared_sample,
     build_dataset_bundle,
@@ -64,7 +68,10 @@ def test_generic_replay_recovers_step31_split_extent(records, registry):
     assert step31[:4] == ["SP", 2, 0, 28]
 
     gen = registry.get_generator_from_record(record)
-    assert gen._get_dynamic_split_extent(31, sym_map=record.params) == 28
+    overrides = _record_split_extent_overrides(record)
+    assert gen._get_dynamic_split_extent(
+        31, sym_map=record.params, extent_overrides=overrides
+    ) == 28
 
     oracle = registry.build_oracle_from_record(record)
     order = get_model_param_order(gen, include_budget=False)
@@ -75,7 +82,9 @@ def test_generic_replay_recovers_step31_split_extent(records, registry):
             break
         oracle.assign(name, value)
 
-    assert gen._get_dynamic_split_extent(31, sym_map=oracle._sym_map) == 28
+    assert gen._get_dynamic_split_extent(
+        31, sym_map=oracle._sym_map, extent_overrides=overrides
+    ) == 28
     assert max(oracle.candidate_values("sp_31_0")) <= 28
 
 
