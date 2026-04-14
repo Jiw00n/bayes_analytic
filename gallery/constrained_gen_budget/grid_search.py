@@ -21,19 +21,23 @@ else:
     from .latent_model_budget.model import LatentParamVAE
     from .latent_model_budget import train as train_module
 
+TASK_INDEX = 1490
+
 
 SEARCH_SPACE = {
-    "train.learning_rate": [3e-4, 5e-4, 7e-4],
-    "train.lambda_nce": [0.05, 0.1, 0.2],
-    "train.tau_nce": [0.2, 0.3],
-    "train.beta_end": [0.002, 0.003],
-    "train.beta_warmup_epochs": [10, 20],
-    "train.order_nce": [True, False],
-    "train.nce_mu": [True, False],
+    "train.learning_rate": [5e-4, 7e-4],
+    "train.lambda_nce": [0.1, 0.2],
+    "train.tau_nce": [0.2],
+    "train.beta_end": [0.002],
+    "train.beta_warmup_epochs": [20],
+    "train.order_nce": [False, True],
+    "train.nce_mu": [False, True],
+    "model.adaln": [False, True],
 }
 
 BEST_METRIC = "val_full_sequence_exact_match"
 BEST_MODE = "max"
+EVALUATE_AUTOREGRESSIVE_EACH_EPOCH = 10
 
 
 _SHARED_DATASET_ARTIFACTS: dict[str, dict] = {}
@@ -109,12 +113,19 @@ def set_nested_attr(obj, dotted_key: str, value):
 
 
 def run_one(exp_idx: int, params: dict) -> None:
+    
     cfg = build_config()
-
+    from glob import glob
+    json_paths = glob("/root/work/tvm-ansor/gallery/constrained_gen/data/measured_*/*.json")
+    for p in json_paths:
+        if f"/{TASK_INDEX}_" in p:
+            cfg.data.json_paths = [p]
+            cfg.train.checkpoint_dir = str(Path(cfg.train.checkpoint_dir) / f"{TASK_INDEX}" / "grid_search")
     cfg.train.num_epochs = 100
     cfg.train.early_stop_min_delta = 1e-4
     cfg.train.best_metric_name = BEST_METRIC
     cfg.train.best_metric_mode = BEST_MODE
+    cfg.train.evaluate_autoregressive_each_epoch = EVALUATE_AUTOREGRESSIVE_EACH_EPOCH
 
     for k, v in params.items():
         set_nested_attr(cfg, k, v)
@@ -131,8 +142,6 @@ def main():
     combos = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
 
     for idx, params in enumerate(combos, start=1):
-        if idx <= 186: 
-            continue
         print(f"\n===== [{idx}/{len(combos)}] {params} =====")
         run_one(idx, deepcopy(params))
 

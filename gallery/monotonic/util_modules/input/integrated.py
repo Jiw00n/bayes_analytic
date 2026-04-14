@@ -93,7 +93,7 @@ def json_to_VecCosts(json, type="schedules", return_raw_cost=False):
 
     costs = np.array([-np.log(np.mean([c.value for c in res.costs])) for res in results])
     if return_raw_cost:
-        costs = np.array([np.mean([c.value for c in res.costs]) for res in results])
+        raw_costs = np.array([np.mean([c.value for c in res.costs]) for res in results])
 
     if type == "schedules":
         output = measureInput_to_Sch(inputs)
@@ -116,8 +116,11 @@ def json_to_VecCosts(json, type="schedules", return_raw_cost=False):
     # 원래 순서로 복원
     output = output[np.array(original_indices)]
     costs = costs[np.array(original_indices)]
+    if return_raw_cost:
+        raw_costs = raw_costs[np.array(original_indices)]
+        return output, costs, raw_costs
 
-    return output, costs
+    return output, costs, None
 
 
 # if __name__ == "__main__":

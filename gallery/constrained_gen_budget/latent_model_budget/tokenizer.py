@@ -109,6 +109,15 @@ class ParamTokenizer:
             )
         )
 
+    @classmethod
+    def from_checkpoint_payload(cls, payload: Mapping[str, object]) -> "ParamTokenizer":
+        tokenizer_state = payload.get("tokenizer")
+        if tokenizer_state is None:
+            tokenizer_state = payload.get("tokenizer_state")
+        if tokenizer_state is None:
+            raise KeyError("checkpoint is missing both 'tokenizer' and 'tokenizer_state'")
+        return cls.from_state_dict(tokenizer_state)
+
     def encode_values(self, ordered_names: Sequence[str], ordered_values: Sequence[int]) -> List[int]:
         encoded: List[int] = []
         for name, value in zip(ordered_names, ordered_values):

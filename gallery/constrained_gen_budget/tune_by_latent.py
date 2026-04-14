@@ -24,6 +24,7 @@ if __package__ in (None, ""):
         load_json_sample,
         load_json_samples,
     )
+    from latent_model_budget.config import build_config
     from latent_model_budget.dataset import budget_enabled, get_model_param_order
     from latent_model_budget.model import LatentParamVAE
     from latent_model_budget.tokenizer import ParamTokenizer
@@ -34,7 +35,7 @@ if __package__ in (None, ""):
         load_existing_deterministic_sample_ids,
         load_existing_random_seeds,
         make_sym_map_key,
-        resolve_results_csv_path,
+        resolve_checkpoint_name,
     )
 else:
     from .latent_model_budget.adapter import (
@@ -44,6 +45,7 @@ else:
         load_json_sample,
         load_json_samples,
     )
+    from .latent_model_budget.config import build_config
     from .latent_model_budget.dataset import budget_enabled, get_model_param_order
     from .latent_model_budget.model import LatentParamVAE
     from .latent_model_budget.tokenizer import ParamTokenizer
@@ -54,7 +56,7 @@ else:
         load_existing_deterministic_sample_ids,
         load_existing_random_seeds,
         make_sym_map_key,
-        resolve_results_csv_path,
+        resolve_checkpoint_name,
     )
 
 
@@ -66,7 +68,7 @@ RUN_TIMEOUT = 5
 NUMBER = 1
 VERBOSE = 1
 
-DEFAULT_CHECKPOINT_PATH = "/root/work/tvm-ansor/gallery/constrained_gen_budget/checkpoints/last.pt"
+# DEFAULT_CHECKPOINT_PATH = "/root/work/tvm-ansor/gallery/constrained_gen_budget/checkpoints/last.pt"
 
 
 
@@ -229,10 +231,10 @@ def log_candidate_result(result: Dict[str, Any]) -> None:
     mean_cost = measurement.get("mean_cost")
     mean_cost_text = "n/a" if mean_cost is None else f"{mean_cost:.4f}"
     print(
-        f"[latent-walk] step={step_index} alpha={alpha:.4f} "
-        f"pred={predicted_score:.6f} status=ok "
-        f"mean_cost={mean_cost_text} "
-        f"log={measurement.get('measure_record_path')}"
+        f"[latent-walk] step={step_index} alpha={alpha:.4f}\n"
+        f"pred={predicted_score:.6f} status=ok\n"
+        f"mean_cost={mean_cost_text}\n"
+        # f"log={measurement.get('measure_record_path')}"
     )
 
 
@@ -251,7 +253,7 @@ def log_grouped_candidate_result(grouped_record: Dict[str, Any]) -> None:
 
     if record.final_violations:
         print(
-            f"[latent-walk] alphas={alpha_text} pred_mean={pred_mean_text} status=violated "
+            f"[latent-walk] alphas={alpha_text}\npred_mean={pred_mean_text} status=violated "
             f"violations={len(record.final_violations)}"
         )
         return
@@ -284,7 +286,7 @@ def log_grouped_candidate_result(grouped_record: Dict[str, Any]) -> None:
     print(
         f"[latent-walk] alphas={alpha_text} pred_mean={pred_mean_text} "
         f"mean_cost={mean_cost_text} "
-        f"log={measurement.get('measure_record_path')}"
+        # f"log={measurement.get('measure_record_path')}"
     )
 
 
@@ -302,21 +304,50 @@ def _resolve_output_layout(
     *,
     checkpoint_path: str | Path,
     record_json_path: str | Path,
-    output: Optional[str | Path],
-) -> tuple[Optional[Path], Optional[str]]:
-    if output is None:
-        return None, None
-
-    output_root = Path(output)
+    output_root: str | Path,
+) -> tuple[Path, str]:
+    output_root = Path(output_root)
     walk_output_path = _default_walk_output_path(checkpoint_path, record_json_path, output_root)
     measure_output_dir = str(output_root / "measure_records")
     return walk_output_path, measure_output_dir
 
 
-def _resolve_measure_output_dir(output: Optional[str | Path]) -> Optional[str]:
-    if output is None:
+def _resolve_record_task_index(bundle: "LoadedBundle", record: JsonSampleRecord) -> Optional[int]:
+    try:
+        return bundle.registry.get_task_index(
+            workload_key=record.workload_key,
+            target_kind=record.target_kind,
+            task_index=record.task_index,
+        )
+    except (KeyError, ValueError):
         return None
-    return str(Path(output) / "measure_records")
+
+
+def _resolve_task_output_root(
+    *,
+    script_path: str | Path,
+    output: Optional[str | Path],
+    task_index: Optional[int],
+) -> Path:
+    task_dirname = "na" if task_index is None else str(int(task_index))
+    output_root = (
+        Path(script_path).resolve().parent / "results"
+        if output is None
+        else Path(output)
+    )
+    if output_root.name == task_dirname:
+        return output_root
+    return output_root / task_dirname
+
+
+def _resolve_task_results_csv_path(
+    *,
+    task_output_root: str | Path,
+    checkpoint_path: str | Path,
+    checkpoint_payload: Dict[str, Any],
+) -> Path:
+    checkpoint_name = resolve_checkpoint_name(checkpoint_path, checkpoint_payload)
+    return Path(task_output_root) / "by_latent" / f"{checkpoint_name}.csv"
 
 
 def _select_record_from_path(
@@ -443,9 +474,30 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+def _rewrite_checkpoint_path(path_value: str) -> str:
+    return str(path_value).replace("/workspace/tvm_gits/tvm-ansor", "/root/work/tvm-ansor")
+
+
+def _expand_json_paths(entries: List[str]) -> List[Path]:
+    raw_paths: List[Path] = []
+    for entry in entries:
+        p = Path(entry)
+        if p.is_dir():
+            raw_paths.extend(sorted(p.glob("*.json")))
+        else:
+            raw_paths.append(p)
+    return raw_paths
+
+
 
 def _make_model_cfg(cfg_payload: Dict[str, Any]) -> Any:
-    return SimpleNamespace(**cfg_payload)
+    default_model_cfg = build_config().model
+    merged = {
+        key: value
+        for key, value in vars(default_model_cfg).items()
+    }
+    merged.update(dict(cfg_payload))
+    return SimpleNamespace(**merged)
 
 
 
@@ -458,14 +510,20 @@ def load_bundle(
 ) -> LoadedBundle:
     checkpoint_path = Path(checkpoint_path)
     payload = torch.load(checkpoint_path, map_location="cpu")
+    data_cfg = payload.get("config", {}).get("data", {})
+    train_cfg = payload.get("config", {}).get("train", {})
+    if isinstance(data_cfg.get("json_paths"), list):
+        data_cfg["json_paths"] = [
+            _rewrite_checkpoint_path(path)
+            for path in data_cfg["json_paths"]
+        ]
+    if isinstance(data_cfg.get("network_info_folder"), str):
+        data_cfg["network_info_folder"] = _rewrite_checkpoint_path(data_cfg["network_info_folder"])
+    if isinstance(train_cfg.get("checkpoint_dir"), str):
+        train_cfg["checkpoint_dir"] = _rewrite_checkpoint_path(train_cfg["checkpoint_dir"])
 
-    tokenizer_state = payload.get("tokenizer")
-    if tokenizer_state is None:
-        tokenizer_state = payload.get("tokenizer_state")
-    if tokenizer_state is None:
-        raise KeyError("checkpoint is missing both 'tokenizer' and 'tokenizer_state'")
 
-    tokenizer = ParamTokenizer.from_state_dict(tokenizer_state)
+    tokenizer = ParamTokenizer.from_checkpoint_payload(payload)
     model_cfg = _make_model_cfg(payload["config"]["model"])
     model = LatentParamVAE(
         vocab_size=len(tokenizer.id_to_token),
@@ -506,6 +564,41 @@ def load_bundle(
         cost_source=cost_source,
         device=torch_device,
     )
+
+
+def _resolve_record_json_path(
+    record_json_path: Optional[str | Path],
+    bundle: LoadedBundle,
+) -> Path:
+    if record_json_path is not None:
+        return Path(record_json_path)
+
+    cfg_data = dict(bundle.checkpoint_payload.get("config", {}).get("data", {}))
+    json_paths = [str(path) for path in cfg_data.get("json_paths", [])]
+    if not json_paths:
+        raise ValueError(
+            "--record-json was not provided and checkpoint config.data.json_paths is empty"
+        )
+
+    expanded_paths = _expand_json_paths(json_paths)
+    if not expanded_paths:
+        raise ValueError(
+            "--record-json was not provided and checkpoint config.data.json_paths "
+            "did not resolve to any JSON files"
+        )
+
+    selected_path = expanded_paths[0]
+    if len(expanded_paths) > 1:
+        print(
+            # "[latent-walk] --record-json 미지정: checkpoint config.data.json_paths의 첫 번째 JSON을 사용합니다 "
+            f"[latent-walk] {selected_path}"
+        )
+    else:
+        print(
+            # "[latent-walk] --record-json 미지정: checkpoint config.data.json_paths에서 JSON을 사용합니다 "
+            f"[latent-walk] {selected_path}"
+        )
+    return selected_path
 
 
 @torch.no_grad()
@@ -735,7 +828,7 @@ def build_walk_records(
     normalize_direction: bool = True,
     random_z: bool = False,
     seed: Optional[int] = None,
-    output: Optional[str | Path] = None,
+    measure_output_dir: Optional[str] = None,
     deterministic_start: bool = False,
 ) -> tuple[List[WalkRecord], StartZContext]:
     start_ctx = resolve_start_z(
@@ -748,7 +841,6 @@ def build_walk_records(
     z0 = start_ctx.z0
     gen = start_ctx.generator
     ordered_names = start_ctx.ordered_names
-    measure_output_dir = _resolve_measure_output_dir(output)
     task_for_measure = gen._task
     walk_direction = compute_walk_direction(bundle, z0)
     shifted_zs = make_shifted_zs(
@@ -906,8 +998,8 @@ def _append_latent_result_csv(
         existing_deterministic_samples = load_existing_deterministic_sample_ids(csv_path)
         if record.sample_id in existing_deterministic_samples:
             print(
-                "[latent-walk] skip csv append because deterministic record already exists "
-                f"sample_id={record.sample_id}"
+                "[latent-walk] skip csv append because deterministic record already exists."
+                # f"sample_id={record.sample_id}"
             )
             return
 
@@ -949,7 +1041,7 @@ def _append_latent_result_csv(
 
 def run_latent_walk(
     checkpoint_path: str | Path,
-    record_json_path: str | Path,
+    record_json_path: Optional[str | Path],
     *,
     network_info_folder: Optional[str] = None,
     device: str = "cuda",
@@ -963,11 +1055,6 @@ def run_latent_walk(
     latent_gradient: bool = False,
     deterministic_start: bool = False,
 ) -> List[WalkRecord]:
-    walk_output_path, _ = _resolve_output_layout(
-        checkpoint_path=checkpoint_path,
-        record_json_path=record_json_path,
-        output=output,
-    )
     bundle = load_bundle(
         checkpoint_path,
         network_info_folder=network_info_folder,
@@ -977,7 +1064,21 @@ def run_latent_walk(
     if bundle.cost_source == "missing_cost_vector":
         print("[latent-walk] checkpoint에 저장된 cost vector가 없습니다.")
         return []
+    record_json_path = _resolve_record_json_path(record_json_path, bundle)
     record = _select_record_from_path(record_json_path, best_cost=best_cost)
+    task_index = _resolve_record_task_index(bundle, record)
+    task_output_root = _resolve_task_output_root(
+        script_path=__file__,
+        output=output,
+        task_index=task_index,
+    )
+    if task_index is None:
+        print(f"[latent-walk] task_index를 해석하지 못해 {task_output_root} 아래에 저장합니다.")
+    walk_output_path, measure_output_dir = _resolve_output_layout(
+        checkpoint_path=checkpoint_path,
+        record_json_path=record_json_path,
+        output_root=task_output_root,
+    )
     records, start_ctx = build_walk_records(
         bundle,
         record,
@@ -986,16 +1087,14 @@ def run_latent_walk(
         normalize_direction=normalize_direction,
         random_z=random_z,
         seed=seed,
-        output=output,
+        measure_output_dir=measure_output_dir,
         deterministic_start=deterministic_start,
     )
-    if walk_output_path is not None:
-        save_walk_records(records, walk_output_path)
-    csv_output_path = resolve_results_csv_path(
-        __file__,
-        "by_latent",
-        checkpoint_path,
-        bundle.checkpoint_payload,
+    save_walk_records(records, walk_output_path)
+    csv_output_path = _resolve_task_results_csv_path(
+        task_output_root=task_output_root,
+        checkpoint_path=checkpoint_path,
+        checkpoint_payload=bundle.checkpoint_payload,
     )
     _append_latent_result_csv(
         csv_path=csv_output_path,
@@ -1013,8 +1112,8 @@ def run_latent_walk(
 
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT_PATH, type=str)
-    p.add_argument("--record-json", required=True, type=str)
+    p.add_argument("--checkpoint", type=str)
+    p.add_argument("--record-json", default=None, type=str)
     p.add_argument("--network-info-folder", type=str, default=None)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--num-steps", type=int, default=30)

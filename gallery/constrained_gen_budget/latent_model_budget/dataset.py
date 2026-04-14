@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set
 
@@ -15,8 +17,15 @@ from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples, spl
 from .tokenizer import ParamTokenizer
 
 
-_CANDIDATE_MASK_CACHE_VERSION = "v3"
+_CANDIDATE_MASK_CACHE_VERSION = "v4"
 _CANDIDATE_MASK_CACHE_FLUSH_EVERY = 100
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 @dataclass
@@ -364,6 +373,20 @@ def _normalize_param_signature(signature: Sequence[str] | None) -> tuple[str, ..
     return tuple(normalized)
 
 
+def _oracle_group_key(record: JsonSampleRecord) -> tuple:
+    key = (
+        record.workload_key,
+        record.target_kind,
+        record.task_index,
+        record.sketch_index,
+        tuple(record.param_signature or ()),
+    )
+    if isinstance(record.raw, dict) and "i" in record.raw and "r" in record.raw:
+        split_signature = tuple(sorted(_measure_record_split_extents(record).items()))
+        return key + (split_signature,)
+    return key
+
+
 def _extend_domain_values(
     domain_values_by_name: Dict[str, Set[int]],
     name: str,
@@ -377,6 +400,116 @@ def _extend_domain_values(
     bucket = domain_values_by_name.setdefault(str(name), set())
     for value in values:
         bucket.add(int(value))
+
+
+@lru_cache(maxsize=None)
+def _divisors(n: int) -> List[int]:
+    if n <= 0:
+        return [1]
+    values = []
+    for divisor in range(1, int(n**0.5) + 1):
+        if n % divisor == 0:
+            values.append(divisor)
+            pair = n // divisor
+            if pair != divisor:
+                values.append(pair)
+    return sorted(values)
+
+
+def _measure_record_split_extents(record: JsonSampleRecord) -> Dict[int, int]:
+    if not (isinstance(record.raw, dict) and "i" in record.raw and "r" in record.raw):
+        return {}
+    payload = record.raw.get("i")
+    if not isinstance(payload, list) or len(payload) < 2:
+        return {}
+    state_payload = payload[1]
+    if not isinstance(state_payload, list) or len(state_payload) < 2:
+        return {}
+    steps = state_payload[1]
+    if not isinstance(steps, list):
+        return {}
+
+    split_extents: Dict[int, int] = {}
+    for step_idx, step in enumerate(steps):
+        if not isinstance(step, list) or len(step) < 4:
+            continue
+        if step[0] != "SP":
+            continue
+        split_extents[int(step_idx)] = int(step[3])
+    return split_extents
+
+
+def _collect_record_domain_values(
+    record: JsonSampleRecord,
+    order: Sequence[str],
+    meta: Dict[str, object],
+    *,
+    include_budget: bool = True,
+    split_extents: Optional[Dict[int, int]] = None,
+) -> Dict[str, List[int]]:
+    domain_values_by_name: Dict[str, Set[int]] = {}
+    split_candidate_values: Dict[str, List[int]] = {}
+    if split_extents is None:
+        split_extents = _measure_record_split_extents(record)
+
+    innermost_names = set(meta.get("innermost_names", ()))
+    exception_split_names = set(meta.get("exception_split_names", ()))
+    innermost_limit = int(meta.get("max_innermost_split_factor", 64))
+    warp_size = int(meta.get("warp_size", 32))
+    unroll_candidates = [int(v) for v in meta.get("unroll_candidates", ())]
+
+    for name in order:
+        if name.startswith("ur_"):
+            domain_values_by_name.setdefault(name, set()).update(unroll_candidates)
+            continue
+        if not name.startswith("sp_"):
+            continue
+
+        step_idx = int(name.split("_")[1])
+        extent = split_extents.get(step_idx)
+        if extent is None:
+            continue
+
+        candidates = set(_divisors(int(extent)))
+        if name in exception_split_names and 1 <= warp_size <= int(extent):
+            candidates.add(warp_size)
+        if name in innermost_names:
+            candidates = {value for value in candidates if value <= innermost_limit}
+        ordered_candidates = sorted(int(value) for value in candidates if 1 <= int(value) <= int(extent))
+        split_candidate_values[name] = ordered_candidates
+        domain_values_by_name.setdefault(name, set()).update(ordered_candidates)
+
+    if include_budget:
+        for spec in meta.get("budget_specs_raw", ()):
+            budget_name = str(spec["name"])
+            factor_lists: List[List[int]] = []
+            for factor_name in spec.get("factor_names", ()):
+                factor_values = split_candidate_values.get(str(factor_name))
+                if not factor_values:
+                    factor_lists = []
+                    break
+                factor_lists.append(list(factor_values))
+            if not factor_lists:
+                continue
+            reachable = {1}
+            limit = int(spec["limit"])
+            for candidates in factor_lists:
+                next_reachable = set()
+                for product in reachable:
+                    for candidate in candidates:
+                        new_product = int(product) * int(candidate)
+                        if new_product <= limit:
+                            next_reachable.add(new_product)
+                reachable = next_reachable
+                if not reachable:
+                    break
+            if reachable:
+                domain_values_by_name.setdefault(budget_name, set()).update(int(v) for v in reachable)
+
+    return {
+        name: sorted(values)
+        for name, values in domain_values_by_name.items()
+    }
 
 
 def _collect_generator_domain_values(
@@ -499,8 +632,21 @@ def _save_candidate_mask_cache_files(
         )
 
 
+def _restore_oracle_snapshot(oracle, snapshot) -> None:
+    oracle.assignment.clear()
+    oracle.assignment.update(snapshot[0])
+    oracle._domains = oracle.generator.param_sampler._copy_domains(snapshot[1])
+    oracle._group_remaining = oracle.generator.param_sampler._copy_group_remaining(snapshot[2])
+    oracle._budget_remaining = oracle.generator.param_sampler._copy_budget_remaining(snapshot[3])
+    oracle._sym_map = dict(snapshot[4])
+    oracle.generator.param_sampler._restore_sym_map(snapshot[4])
+    oracle.last_report = None
+
+
 def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     include_budget = budget_enabled(config)
+    use_record_domain_precompute = _env_flag("CGB_USE_RECORD_DOMAIN_PRECOMPUTE", True)
+    use_oracle_domain_sweep = _env_flag("CGB_USE_ORACLE_DOMAIN_SWEEP", True)
     raw_paths = _expand_json_paths(config.data.json_paths)
     if not raw_paths:
         raise ValueError("No json_paths were provided")
@@ -514,6 +660,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
 
     prepared_cache: Dict[int, tuple[List[str], List[int]]] = {}
     order_cache: Dict[tuple, Dict[str, object]] = {}
+    record_domain_cache: Dict[tuple, Dict[str, List[int]]] = {}
     domain_values_by_name: Dict[str, Set[int]] = {}
     print("[dataset] building ordered parameter cache")
     for idx, record in enumerate(records, start=1):
@@ -532,22 +679,46 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             cached_meta = {
                 "order": list(order),
                 "budget_specs": list(budget_specs),
+                "budget_specs_raw": [dict(spec) for spec in getattr(gen, "_budget_specs", ())],
+                "innermost_names": tuple(sorted(str(name) for name in gen._innermost_names)),
+                "exception_split_names": tuple(sorted(str(name) for name in gen.s._exception_split_names)),
+                "max_innermost_split_factor": int(gen.hw["max_innermost_split_factor"]),
+                "warp_size": int(gen.hw["warp_size"]),
+                "unroll_candidates": tuple(int(v) for v in gen.pm.UNROLL_CANDIDATES),
             }
             order_cache[order_key] = cached_meta
-            generator_domain_values = _collect_generator_domain_values(
+            coarse_domain_values = _collect_generator_domain_values(
                 gen,
                 order,
                 include_budget=include_budget,
             )
-            for name, values in generator_domain_values.items():
-                domain_values_by_name.setdefault(name, set()).update(int(v) for v in values)
+            for name, domain_values in coarse_domain_values.items():
+                domain_values_by_name.setdefault(name, set()).update(int(v) for v in domain_values)
         order = list(cached_meta["order"])
         budget_specs = list(cached_meta["budget_specs"])
+        split_extents = _measure_record_split_extents(record)
+        split_signature = tuple(sorted(split_extents.items()))
+        record_domain_key = (order_key, split_signature, bool(include_budget))
+        if use_record_domain_precompute:
+            record_domain_values = record_domain_cache.get(record_domain_key)
+            if record_domain_values is None:
+                record_domain_values = _collect_record_domain_values(
+                    record,
+                    order,
+                    cached_meta,
+                    include_budget=include_budget,
+                    split_extents=split_extents,
+                )
+                record_domain_cache[record_domain_key] = record_domain_values
+            for name, domain_values in record_domain_values.items():
+                domain_values_by_name.setdefault(name, set()).update(int(v) for v in domain_values)
         _apply_cached_order_metadata(record, order, budget_specs)
         missing = [name for name in order if name not in record.params]
         if missing:
             raise ValueError(f"{record.sample_id} is missing ordered params: {missing}")
         values = [int(record.params[name]) for name in order]
+        for name, value in zip(order, values):
+            domain_values_by_name.setdefault(str(name), set()).add(int(value))
         prepared_cache[id(record)] = (order, values)
         if idx == len(records):
             print(
@@ -581,6 +752,69 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         if not filtered_records:
             raise ValueError("No valid records remain after legality filtering")
         valid_records = filtered_records
+
+    if use_oracle_domain_sweep:
+        print("[dataset] collecting oracle candidate domains from valid records")
+        sorted_valid_records = sorted(
+            valid_records,
+            key=lambda record: (
+                record.workload_key or "",
+                record.target_kind or "",
+                -1 if record.task_index is None else int(record.task_index),
+                int(record.sketch_index),
+                tuple(record.param_signature or ()),
+                tuple(sorted(_measure_record_split_extents(record).items())),
+                tuple(prepared_cache[id(record)][1]),
+            ),
+        )
+        current_group_key = None
+        current_oracle = None
+        current_order: List[str] = []
+        current_values: List[int] = []
+        for idx, record in enumerate(sorted_valid_records, start=1):
+            order, values = prepared_cache[id(record)]
+            group_key = _oracle_group_key(record)
+            prefix_len = 0
+
+            if current_group_key != group_key:
+                current_group_key = group_key
+                current_oracle = registry.build_oracle_from_record(record)
+                current_order = list(order)
+                current_values = []
+            else:
+                limit = min(len(current_order), len(current_values), len(order), len(values))
+                while (
+                    prefix_len < limit
+                    and current_order[prefix_len] == order[prefix_len]
+                    and current_values[prefix_len] == int(values[prefix_len])
+                ):
+                    prefix_len += 1
+
+                prefix_key = tuple(
+                    (order[pos], int(values[pos]))
+                    for pos in range(prefix_len)
+                )
+                snapshot = current_oracle.generator._lpm_prefix_state_cache.get(prefix_key)
+                if snapshot is None:
+                    current_oracle = registry.build_oracle_from_record(record)
+                    prefix_len = 0
+                else:
+                    _restore_oracle_snapshot(current_oracle, snapshot)
+
+            for pos, (name, value) in enumerate(zip(order, values)):
+                if pos < prefix_len:
+                    continue
+                candidates = current_oracle.candidate_values(name)
+                domain_values_by_name.setdefault(str(name), set()).update(int(v) for v in candidates)
+                domain_values_by_name.setdefault(str(name), set()).add(int(value))
+                current_oracle.assign(name, int(value))
+
+            current_order = list(order)
+            current_values = list(values)
+            if idx % 500 == 0 or idx == len(sorted_valid_records):
+                print(f"[dataset] collected oracle domains {idx}/{len(sorted_valid_records)}")
+    else:
+        print("[dataset] skipping oracle candidate domain sweep")
 
     train_records, val_records, test_records = split_records(
         valid_records,
@@ -680,6 +914,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 -1 if record.task_index is None else int(record.task_index),
                 int(record.sketch_index),
                 tuple(record.param_signature or ()),
+                tuple(sorted(_measure_record_split_extents(record).items())),
                 tuple(prepared_cache[id(record)][1]),
             ),
         )
@@ -709,19 +944,10 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 current_order = []
                 current_values = []
                 reused_cache_count += 1
-                if idx % 500 == 0 or idx == total:
-                    print(
-                        f"[dataset] precomputed masks {idx}/{total} "
-                        f"(reused={reused_cache_count} computed={computed_cache_count})"
-                    )
                 continue
 
             group_key = (
-                record.workload_key,
-                record.target_kind,
-                record.task_index,
-                record.sketch_index,
-                tuple(record.param_signature or ()),
+                _oracle_group_key(record)
             )
             prefix_len = 0
 
@@ -748,14 +974,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                     current_oracle = registry.build_oracle_from_record(record)
                     prefix_len = 0
                 else:
-                    current_oracle.assignment.clear()
-                    current_oracle.assignment.update(snapshot[0])
-                    current_oracle._domains = current_oracle.generator.param_sampler._copy_domains(snapshot[1])
-                    current_oracle._group_remaining = current_oracle.generator.param_sampler._copy_group_remaining(snapshot[2])
-                    current_oracle._budget_remaining = current_oracle.generator.param_sampler._copy_budget_remaining(snapshot[3])
-                    current_oracle._sym_map = dict(snapshot[4])
-                    current_oracle.generator.param_sampler._restore_sym_map(snapshot[4])
-                    current_oracle.last_report = None
+                    _restore_oracle_snapshot(current_oracle, snapshot)
 
             items_by_id[id(record)] = _build_prepared_sample(
                 record,

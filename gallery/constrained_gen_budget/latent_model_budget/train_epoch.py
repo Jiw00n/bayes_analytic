@@ -178,4 +178,12 @@ def train_one_epoch(
         "lambda_latent_use": float(getattr(cfg.train, "lambda_latent_use", 0.0)),
         "latent_use_margin": float(getattr(cfg.train, "latent_use_margin", 1.0)),
         "latent_wrong_top1_margin": float(getattr(cfg.train, "latent_wrong_top1_margin", 0.0)),
+        "token_accuracy": (
+            float(total_token_correct) / float(total_token_count)
+            if total_token_count > 0 else 0.0
+        ),
+        "full_sequence_exact_match": (
+            float(total_exact_count) / float(total_sample_count)
+            if total_sample_count > 0 else 0.0
+        ),
     }

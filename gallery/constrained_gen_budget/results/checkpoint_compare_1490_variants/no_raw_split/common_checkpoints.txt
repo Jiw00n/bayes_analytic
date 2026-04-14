@@ -1,0 +1,15 @@
+lr0.0005_nce0.1_tau0.2_kl0.002_warm20.pt
+lr0.0005_nce0.1_tau0.2_kl0.002_warm20_nce_mu.pt
+lr0.0005_nce0.1_tau0.2_kl0.002_warm20_order.pt
+lr0.0005_nce0.2_tau0.2_kl0.002_warm20.pt
+lr0.0005_nce0.2_tau0.2_kl0.002_warm20_nce_mu.pt
+lr0.0005_nce0.2_tau0.2_kl0.002_warm20_order.pt
+lr0.0005_nce0.2_tau0.2_kl0.002_warm20_order_nce_mu.pt
+lr0.0007_nce0.1_tau0.2_kl0.002_warm20.pt
+lr0.0007_nce0.1_tau0.2_kl0.002_warm20_nce_mu.pt
+lr0.0007_nce0.1_tau0.2_kl0.002_warm20_order.pt
+lr0.0007_nce0.1_tau0.2_kl0.002_warm20_order_nce_mu.pt
+lr0.0007_nce0.2_tau0.2_kl0.002_warm20.pt
+lr0.0007_nce0.2_tau0.2_kl0.002_warm20_nce_mu.pt
+lr0.0007_nce0.2_tau0.2_kl0.002_warm20_order.pt
+lr0.0007_nce0.2_tau0.2_kl0.002_warm20_order_nce_mu.pt

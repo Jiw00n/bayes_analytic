@@ -719,7 +719,7 @@ def main() -> None:
     device = resolve_device(config.train.device)
     configure_runtime(config, device)
 
-    tokenizer = ParamTokenizer.from_state_dict(raw_payload["tokenizer"])
+    tokenizer = ParamTokenizer.from_checkpoint_payload(raw_payload)
     model = LatentParamVAE(
         vocab_size=len(tokenizer.id_to_token),
         num_vars=len(tokenizer.id_to_var),

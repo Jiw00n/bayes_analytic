@@ -247,13 +247,25 @@ class ScheduleGenerator:
         return result
 
 
+    def _max_legal_domain_hi(self, name, extent):
+        extent = int(extent)
+        candidates = self.pm._divisors(extent)
+        if name in self._innermost_names:
+            limit = int(self.hw['max_innermost_split_factor'])
+            candidates = [v for v in candidates if v <= limit]
+        return candidates[-1] if candidates else 1
+
     def _build_split_domains(self):
         """모든 split 변수의 초기 도메인 사전을 만든다."""
         domains = {}
         for name in self._all_sp_names:
             step_idx = int(name.split("_")[1])
             extent = self._sp_extents.get(step_idx)
-            domains[name] = [1, extent] if extent is not None else 1
+            if extent is None:
+                domains[name] = 1
+                continue
+            hi = self._max_legal_domain_hi(name, extent)
+            domains[name] = [1, hi]
         return domains
 
     def _enumerate_split_candidates(self, name, remaining):

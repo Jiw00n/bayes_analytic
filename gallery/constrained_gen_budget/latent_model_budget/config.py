@@ -8,10 +8,11 @@ from typing import List, Optional
 
 DEFAULT_JSON_PATH = [
     # "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor/584_([cb7a0e9e733d26ffc00e7f6c9cc0f879,[1,128,128,32],[1,1,32,16],[1,1,1,16],[1,128,128,16]],cuda).json",
-    "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor/1490_([3eda1939e30b947e921f5e1814346365,[1,56,56,128],[6,6,32,128],[1,56,56,32]],cuda).json"
+    # "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor/1490_([3eda1939e30b947e921f5e1814346365,[1,56,56,128],[6,6,32,128],[1,56,56,32]],cuda).json"
+    # "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_family_ansor/415_([e7c984cba151d5c7c1e081f0b1910087,[1,112,112,32],[3,3,32,1],[1,1,1,32],[1,112,112,32]],cuda).json"
 ]
 DEFAULT_NETWORK_INFO_FOLDER = "/root/work/tvm-ansor/gallery/dataset/network_info_all"
-DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget/checkpoints/grid_search"
+DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget/checkpoints_all"
 
 
 @dataclass
@@ -37,13 +38,14 @@ class ModelConfig:
     dropout: float = 0.1
     latent_dim: int = 64
     latent_token_count: int = 4
+    adaln: bool = True
 
 
 @dataclass
 class TrainConfig:
     batch_size: int = 128
-    num_epochs: int = 90
-    learning_rate: float = 3e-4
+    num_epochs: int = 100
+    learning_rate: float = 5e-4
     scheduler_name: str = "plateau"   # "none" | "multistep" | "plateau"
     scheduler_milestones: List[int] = field(default_factory=lambda: [70])
     scheduler_gamma: float = 1.0 / 3.0
@@ -58,9 +60,9 @@ class TrainConfig:
     grad_clip_norm: float = 1.0
     beta_start: float = 1e-4
     beta_end: float = 0.002
-    beta_warmup_epochs: int = 10
+    beta_warmup_epochs: int = 20
     lambda_cost: float = 0.01
-    lambda_nce: float = 0.1
+    lambda_nce: float = 0.2
     tau_nce: float = 0.2
     cost_ridge_vec: bool = True
     ridge_alpha: float | List[float] = 0.1
@@ -75,6 +77,10 @@ class TrainConfig:
     device: str = "cuda"
     debug_invalid_step: bool = False
     precompute_candidate_masks: bool = True
+    evaluate_train_teacher_forcing_each_epoch: bool = True
+    evaluate_cost_metrics_each_epoch: bool = True
+    evaluate_final_checkpoint_metrics: bool = True
+    print_reconstruction_after_train: bool = True
     order_nce: bool = False
     nce_mu: bool = False
     lambda_latent_use: float = 0.0
@@ -83,6 +89,7 @@ class TrainConfig:
 
     best_metric_name: str = "val_full_sequence_exact_match"
     best_metric_mode: str = "max"   # "max" or "min"
+    evaluate_autoregressive_each_epoch: int = 0
 
 
 @dataclass
@@ -94,7 +101,7 @@ class EvalConfig:
 
 @dataclass
 class WandbConfig:
-    project: Optional[str] = "single_budget_grid_search"
+    project: Optional[str] = "single_grid_search"
 
 
 @dataclass

@@ -311,3 +311,6 @@ analysis/
 checkpoints/
 walk_records/
 trash_can/
+*.jsonl
+*.png
+*.csv

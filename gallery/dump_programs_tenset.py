@@ -83,7 +83,7 @@ if __name__ == "__main__":
 
     # Dump programs for all tasks
     # for task in tqdm(tasks[start_idx:end_idx]):
-    selected_tasks = [(i, task) for i, task in enumerate(tasks) if i in [110, 145, 169, 208, 249, 262, 302, 317, 575, 648, 1179, 1194, 2010, 2012, 2018, 2177, 2194, 2400]]
+    selected_tasks = [(i, task) for i, task in enumerate(tasks) if i in [415, 534]]
     for i, task in tqdm(selected_tasks):
         dump_program(task, size=args.size, output_dir=args.output_dir, task_idx=i)
         gc.collect()

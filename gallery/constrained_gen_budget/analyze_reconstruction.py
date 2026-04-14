@@ -11,6 +11,7 @@ import torch
 
 try:
     from latent_model_budget.adapter import GeneratorRegistry
+    from latent_model_budget.config import build_config
     from latent_model_budget.dataset import build_dataset_bundle, collate_prepared_samples
     from latent_model_budget.model import LatentParamVAE
     from latent_model_budget.tokenizer import ParamTokenizer
@@ -28,6 +29,7 @@ except ImportError:  # pragma: no cover
         sys.path.insert(0, str(_HERE))
 
     from .latent_model_budget.adapter import GeneratorRegistry
+    from .latent_model_budget.config import build_config
     from .latent_model_budget.dataset import build_dataset_bundle, collate_prepared_samples
     from .latent_model_budget.model import LatentParamVAE
     from .latent_model_budget.tokenizer import ParamTokenizer
@@ -45,6 +47,12 @@ def _dict_to_namespace(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_dict_to_namespace(v) for v in obj]
     return obj
+
+
+def _make_model_cfg_namespace(payload: Dict[str, Any]) -> Any:
+    merged = {k: v for k, v in vars(build_config().model).items()}
+    merged.update(dict(payload))
+    return _dict_to_namespace(merged)
 
 
 def _resolve_device(device_name: str) -> torch.device:
@@ -396,10 +404,10 @@ def _load_model_and_bundle(
     registry = GeneratorRegistry(cfg.data.network_info_folder)
     bundle = build_dataset_bundle(cfg, registry)
 
-    tokenizer = ParamTokenizer.from_state_dict(payload["tokenizer"])
+    tokenizer = ParamTokenizer.from_checkpoint_payload(payload)
     _assert_same_tokenizer(tokenizer, bundle.tokenizer)
 
-    model_cfg = _dict_to_namespace(payload["config"]["model"])
+    model_cfg = _make_model_cfg_namespace(payload["config"]["model"])
     model = LatentParamVAE(
         vocab_size=len(tokenizer.id_to_token),
         num_vars=len(tokenizer.id_to_var),

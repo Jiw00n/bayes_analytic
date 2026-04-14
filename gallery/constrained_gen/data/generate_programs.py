@@ -26,6 +26,16 @@ from modules.schedule_generator import ScheduleGenerator
 
 TASK_NETWORK_INFO_FOLDER = "/root/work/tvm-ansor/gallery/dataset/network_info_all"
 _WORKER_TASKS = None
+ENABLED_CONSTRAINTS_NO_VECTORIZE = (
+    'shared_memory',
+    'max_threads',
+    'max_vthread',
+    'innermost_split',
+    'split_structure',
+    # 'max_threads_per_block',
+    # 'max_vector_bytes',
+)
+
 
 
 def _task_prefix(task_index, task):
@@ -200,7 +210,7 @@ def process_task(task_index, task, records_per_task=1, emit_logs=True, show_reco
                 break
 
             try:
-                gen = ScheduleGenerator.from_task_state(task, state)
+                gen = ScheduleGenerator.from_task_state(task, state, enabled_constraints=ENABLED_CONSTRAINTS_NO_VECTORIZE)
             except Exception as err:  # pylint: disable=broad-except
                 _emit_failure(task_index, task, "construct_schedule_generator", sketch_index, err)
                 continue

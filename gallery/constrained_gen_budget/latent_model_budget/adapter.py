@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,29 @@ class JsonSampleRecord:
     task_index: Optional[int] = None
     record_index: Optional[int] = None
     param_signature: Optional[Tuple[str, ...]] = None
+
+ENABLED_CONSTRAINTS = (
+    'shared_memory',
+    'max_threads',
+    'max_vthread',
+    'innermost_split',
+    'split_structure',
+    # 'max_threads_per_block',
+    # 'max_vector_bytes',
+)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _runtime_enabled_constraints():
+    if _env_flag("CGB_USE_DEFAULT_ENABLED_CONSTRAINTS", False):
+        return None
+    return ENABLED_CONSTRAINTS
 
 
 # -----------------------------------------------------------------------------
@@ -138,6 +162,63 @@ def _extract_measure_record_params(state) -> Tuple[Dict[str, int], Tuple[str, ..
     return params, tuple(param_signature)
 
 
+def _extract_measure_record_params_from_payload(payload: dict) -> Tuple[Dict[str, int], Tuple[str, ...]]:
+    steps = payload["i"][1][1]
+    params: Dict[str, int] = {}
+    param_signature: List[str] = []
+
+    for step_idx, step in enumerate(steps):
+        if not isinstance(step, list) or not step:
+            continue
+        step_code = str(step[0])
+        if step_code == "SP":
+            lengths = step[4] if len(step) > 4 else []
+            for length_idx, length in enumerate(lengths):
+                name = f"sp_{step_idx}_{length_idx}"
+                params[name] = int(length)
+                param_signature.append(name)
+            continue
+
+        if step_code != "PR" or len(step) <= 3:
+            continue
+        pragma_type = str(step[3])
+        if not pragma_type.startswith("auto_unroll_max_step$"):
+            continue
+        name = f"ur_{step_idx}"
+        params[name] = int(pragma_type.split("$")[-1])
+        param_signature.append(name)
+
+    if not params:
+        raise ValueError("No concrete modeled parameters found in measure record payload")
+
+    return params, tuple(param_signature)
+
+
+def _bind_raw_step_extents(record: JsonSampleRecord, generator) -> None:
+    """Override generator's per-step recorded extents with the raw JSON values.
+
+    Sketch-time extents (e.g. vectorize splits on cache_read after FuseStep)
+    are frozen in the raw record's SP step entry but cannot be re-derived from
+    sym_map alone. This binds those frozen values into the shared generator
+    so per-record lookups via ``_get_dynamic_split_extent`` return the
+    sketch-time extent regardless of substituted sym_map.
+    """
+    from modules.sym_types import SymExpr
+
+    raw_steps = record.raw.get("i", [None, [None, None]])[1][1]
+    sym_state = generator.s
+    for step_idx, raw_step in enumerate(raw_steps):
+        if not isinstance(raw_step, list) or not raw_step or raw_step[0] != "SP":
+            continue
+        if len(raw_step) < 4:
+            continue
+        try:
+            extent_val = int(raw_step[3])
+        except (TypeError, ValueError):
+            continue
+        sym_state._split_step_extents[step_idx] = SymExpr(extent_val)
+
+
 def _augment_record_budget_params(record: JsonSampleRecord, generator) -> None:
     params = record.params
     budget_specs = list(getattr(generator, "_budget_specs", ()))
@@ -184,6 +265,18 @@ def _extract_search_task_signature(task) -> Tuple[Optional[str], Optional[str], 
     return workload_key, target_kind, target_model, task_desc
 
 
+def _extract_measure_task_signature_from_payload(
+    payload: dict,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    inp_payload = payload["i"][0]
+    workload_key = str(inp_payload[0]) if len(inp_payload) > 0 else None
+    target_desc = str(inp_payload[1]) if len(inp_payload) > 1 else ""
+    target_kind = target_desc.split(" ", 1)[0] if target_desc else None
+    target_model = "unknown"
+    task_desc = ""
+    return workload_key, target_kind, target_model, task_desc
+
+
 def _transform_cost_for_training(cost: Optional[float]) -> Optional[float]:
     if cost is None:
         return None
@@ -213,6 +306,26 @@ def _extract_measure_cost(result) -> Optional[float]:
     if not costs:
         return None
     mean_cost = float(sum(costs) / len(costs))
+    return _transform_cost_for_training(mean_cost)
+
+
+def _extract_measure_cost_from_payload(payload: dict) -> Optional[float]:
+    result = payload.get("r")
+    if not isinstance(result, list) or len(result) < 2:
+        return None
+
+    error_no = _maybe_int(result[1])
+    if error_no is None or error_no != 0:
+        return None
+
+    costs = result[0]
+    if not isinstance(costs, list) or not costs:
+        return None
+
+    try:
+        mean_cost = float(sum(float(x) for x in costs) / len(costs))
+    except (TypeError, ValueError):
+        return None
     return _transform_cost_for_training(mean_cost)
 
 
@@ -254,12 +367,21 @@ def _load_custom_json_sample(path: Path, payload: dict, record_index: Optional[i
 
 
 def _load_measure_record_sample(path: Path, line: str, record_index: int) -> JsonSampleRecord:
-    from tvm.auto_scheduler.measure_record import load_record_from_string
-
     payload = json.loads(line)
-    inp, res = load_record_from_string(line)
-    params, param_signature = _extract_measure_record_params(inp.state)
-    workload_key, target_kind, target_model, task_desc = _extract_search_task_signature(inp.task)
+
+    try:
+        params, param_signature = _extract_measure_record_params_from_payload(payload)
+        workload_key, target_kind, target_model, task_desc = (
+            _extract_measure_task_signature_from_payload(payload)
+        )
+        cost = _extract_measure_cost_from_payload(payload)
+    except (KeyError, TypeError, ValueError, IndexError):
+        from tvm.auto_scheduler.measure_record import load_record_from_string
+
+        inp, res = load_record_from_string(line)
+        params, param_signature = _extract_measure_record_params(inp.state)
+        workload_key, target_kind, target_model, task_desc = _extract_search_task_signature(inp.task)
+        cost = _extract_measure_cost(res)
 
     return JsonSampleRecord(
         sample_id=_build_sample_id(
@@ -273,7 +395,7 @@ def _load_measure_record_sample(path: Path, line: str, record_index: int) -> Jso
         json_path=str(path),
         sketch_index=0,
         params=params,
-        cost=_extract_measure_cost(res),
+        cost=cost,
         raw=payload,
         workload_key=workload_key,
         target_kind=target_kind,
@@ -395,6 +517,7 @@ class GeneratorRegistry:
         self._tasks = None
         self._tasks_by_index: Dict[int, object] = {}
         self._tasks_by_signature: Dict[Tuple[str, str], object] = {}
+        self._task_index_by_signature: Dict[Tuple[str, str], int] = {}
         self._sketch_cache: Dict[Tuple[str, str], list] = {}
         self._generator_cache: Dict[Tuple[str, str, int], object] = {}
         self._sketch_index_by_param_signature: Dict[Tuple[str, str, Tuple[str, ...]], int] = {}
@@ -424,6 +547,10 @@ class GeneratorRegistry:
 
         self._tasks_by_signature = {
             sig: self._tasks_by_index[ids[0]]
+            for sig, ids in by_sig.items()
+        }
+        self._task_index_by_signature = {
+            sig: ids[0]
             for sig, ids in by_sig.items()
         }
         return tasks
@@ -474,6 +601,35 @@ class GeneratorRegistry:
         self._sketch_cache[sig] = sketches
         return sketches
 
+    def get_task_index(
+        self,
+        *,
+        workload_key: Optional[str] = None,
+        target_kind: Optional[str] = None,
+        task_index: Optional[int] = None,
+    ) -> int:
+        self._load_tasks()
+
+        if task_index is not None:
+            normalized = int(task_index)
+            if normalized not in self._tasks_by_index:
+                raise KeyError(f"Task index not found: task_index={task_index}")
+            return normalized
+
+        if workload_key is not None and target_kind is not None:
+            sig = (str(workload_key), str(target_kind))
+            resolved = self._task_index_by_signature.get(sig)
+            if resolved is None:
+                raise KeyError(
+                    "Task not found by workload signature: "
+                    f"workload_key={workload_key}, target_kind={target_kind}"
+                )
+            return int(resolved)
+
+        raise ValueError(
+            "Need either (workload_key, target_kind) or task_index to resolve task index"
+        )
+
     def get_generator(
         self,
         *,
@@ -505,7 +661,11 @@ class GeneratorRegistry:
                 f"available={len(sketches)}"
             ) from err
 
-        gen = ScheduleGenerator.from_task_state(task, state)
+        gen = ScheduleGenerator.from_task_state(
+            task,
+            state,
+            enabled_constraints=_runtime_enabled_constraints(),
+        )
         self._generator_cache[cache_key] = gen
         return gen
 
@@ -515,30 +675,6 @@ class GeneratorRegistry:
             target_kind=record.target_kind,
             task_index=record.task_index,
         )
-        if isinstance(record.raw, dict) and "i" in record.raw and "r" in record.raw:
-            cache_key = ("__record__", record.sample_id)
-            cached = self._generator_cache.get(cache_key)
-            if cached is not None:
-                _augment_record_budget_params(record, cached)
-                return cached
-
-            from tvm.auto_scheduler.measure_record import load_record_from_string
-            from modules.schedule_generator import ScheduleGenerator
-
-            # When a ground-truth measure record is available, reconstruct the generator
-            # from that exact record so params_to_state can patch the original payload
-            # instead of re-deriving dynamic SP extents from a matched sketch.
-            record_line = json.dumps(record.raw, separators=(",", ":"))
-            base_inp, base_res = load_record_from_string(record_line)
-            gen = ScheduleGenerator.from_task_state(
-                task,
-                base_inp.state,
-                base_input=base_inp,
-                base_result=base_res,
-            )
-            _augment_record_budget_params(record, gen)
-            self._generator_cache[cache_key] = gen
-            return gen
 
         if record.param_signature:
             task_workload_key, task_target_kind = self._task_signature(task)
@@ -584,6 +720,7 @@ class GeneratorRegistry:
             sketch_index=record.sketch_index,
         )
         _augment_record_budget_params(record, gen)
+        _bind_raw_step_extents(record, gen)
         return gen
 
     def get_generator_from_payload(self, payload: dict):

@@ -11,11 +11,22 @@ class VarOrderPlanner:
     # ------------------------------------------------------------------
 
     def compute_var_order(self):
-        """phase 우선 순서를 구한 뒤 legacy fallback을 붙여 제너레이터에 var_order를 저장한다."""
         g = self.gen
         phase_entries = self._build_var_order_phase_entries()
         normalized_entries, ordered = self._build_phase_first_order(phase_entries)
-        # self._append_legacy_fallback_vars(ordered, seen, self._compute_legacy_var_order())
+
+        all_params = self._order_param_names_by_step_index(
+            list(g._all_sp_names) + list(g._ur_names)
+        )
+        missing = [name for name in all_params if name not in set(ordered)]
+        if missing:
+            normalized_entries.append({
+                'name': 'grid_fallback__remaining_params',
+                'family': 'fallback_remaining',
+                'grid_scope': tuple(),
+                'vars': missing,
+            })
+            ordered.extend(missing)
 
         g._var_order_phase_entries = normalized_entries
         g._var_order = ordered
@@ -51,13 +62,13 @@ class VarOrderPlanner:
     def _build_var_order_phase_entries(self):
         """execution, memory, instruction phase를 grid scope 단위로 조립한다."""
         g = self.gen
-        vectorize_items = []
-        if 'vectorize' in g._enabled:
-            vectorize_items = g.constraint_set._build_vectorize_constraints()['items']
+        # vectorize_items = []
+        # if 'vectorize' in g._enabled:
+        vectorize_items = g.constraint_set._build_vectorize_constraints()['items']
 
-        shared_vars = set()
-        if 'shared_memory' in g._enabled:
-            shared_vars = set(g.constraint_set._build_shared_memory_constraints()['tree'].variables())
+        # shared_vars = set()
+        # if 'shared_memory' in g._enabled:
+        shared_vars = set(g.constraint_set._build_shared_memory_constraints()['tree'].variables())
 
         scope_context = g.constraint_set._build_grid_scope_context()
         scope_infos = scope_context['scope_infos']

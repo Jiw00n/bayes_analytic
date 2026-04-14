@@ -17,7 +17,7 @@ from tvm.auto_scheduler.utils import to_str_round
 # Path and task-loading helpers
 # -----------------------------------------------------------------------------
 
-NETWORK_INFO_FOLDER = '/root/work/tvm-ansor/gallery/dataset/network_info'
+NETWORK_INFO_FOLDER = '/root/work/tvm-ansor/gallery/dataset/network_info_all'
 TO_MEASURE_PROGRAM_FOLDER = '/root/work/tvm-ansor/gallery/dataset/to_measure_programs'
 TO_MEASURE_GEN_PROGRAM_FOLDER = '/root/work/tvm-ansor/gallery/dataset/to_measure_gen_programs'
 TO_MEASURE_NETWORK_FOLDER = '/root/work/tvm-ansor/gallery/dataset/to_measure_networks'

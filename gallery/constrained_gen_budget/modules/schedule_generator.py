@@ -65,7 +65,8 @@ class ScheduleGenerator:
         ('execution_non_product_direct_arm', 'execution: non-product direct-arm'),
         ('execution_non_product_gate_vars', 'execution: non-product gate-vars'),
         ('memory_split_structure', 'memory: shared-memory-linked split_structure'),
-        ('instruction_vectorize_unroll', 'instruction: vectorize + unroll'),
+        ('instruction_vectorize', 'instruction: vectorize'),
+        ('instruction_unroll', 'instruction: unroll'),
     )
     _FORMAT_WRAP_LIMIT = 100
 
@@ -129,6 +130,9 @@ class ScheduleGenerator:
         self._budget_spec_by_factor = {}
         self._all_budget_names = []
         self._concrete_final_cache = {}
+        self._vectorize_split_step_indices = None
+        self._concrete_extent_cache = {}
+        self._concrete_extent_warned = set()
         self.constraint_set = ConstraintSet(self)
         self.var_order_planner = VarOrderPlanner(self)
         self.domain_propagator = DomainPropagator(self)
@@ -279,6 +283,74 @@ class ScheduleGenerator:
         if name in self.s._exception_split_names:
             candidates.add(int(self.hw['warp_size']))
         return sorted(value for value in candidates if 1 <= value <= remaining)
+
+    def _get_vectorize_split_step_indices(self):
+        """vectorize 제약식이 의존하는 sp_* step index들의 집합을 lazily 계산해 반환한다."""
+        if self._vectorize_split_step_indices is None:
+            indices = set()
+            try:
+                items = self.constraint_set._build_vectorize_constraints().get('items', [])
+            except Exception:
+                items = []
+            for item in items:
+                tree = item.get('tree') if isinstance(item, dict) else None
+                if tree is None:
+                    continue
+                for name in self.constraint_set._ordered_unique_tree_variables(tree):
+                    if not name.startswith('sp_'):
+                        continue
+                    parts = name.split('_')
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        indices.add(int(parts[1]))
+                    except ValueError:
+                        continue
+            self._vectorize_split_step_indices = indices
+        return self._vectorize_split_step_indices
+
+    def _concrete_shadow_extent(self, step_idx, sym_map):
+        """record base + 현재 sym_map 기반 concrete state에 InferBound를 돌려 iter extent를 반환한다."""
+        if self._task is None:
+            return None
+        if self._base_input is None or self._base_result is None:
+            if self._base_state is None:
+                return None
+        concrete_params = {}
+        for key, value in sym_map.items():
+            if not isinstance(value, int):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    continue
+            concrete_params[key] = value
+        cache_key = (step_idx, tuple(sorted(concrete_params.items())))
+        if cache_key in self._concrete_extent_cache:
+            return self._concrete_extent_cache[cache_key]
+        try:
+            from .concrete_gpu_verify import infer_bound_state_partial
+            from tvm import auto_scheduler
+            if self._base_input is not None and self._base_result is not None:
+                base_inp, base_res = self._base_input, self._base_result
+            else:
+                import tvm
+                base_inp = auto_scheduler.MeasureInput(self._task, self._base_state)
+                base_res = auto_scheduler.MeasureResult(
+                    [tvm.tir.FloatImm("float32", 1.0)], 0, "", 0.0, 0)
+            bound_state = infer_bound_state_partial(
+                self._task, base_inp, base_res, concrete_params, step_idx)
+            step = self.s._state.transform_steps[step_idx]
+            iter_obj = bound_state.stages[step.stage_id].iters[step.iter_id]
+            extent = iter_obj.range.extent if iter_obj.range is not None else None
+            result = int(extent) if extent is not None else None
+        except Exception:
+            if step_idx not in self._concrete_extent_warned:
+                self._concrete_extent_warned.add(step_idx)
+                import sys
+                print(f"[concrete-extent] failed at step_idx={step_idx}", file=sys.stderr)
+            result = None
+        self._concrete_extent_cache[cache_key] = result
+        return result
 
     def _get_dynamic_split_extent(self, step_idx, sym_map=None):
         """현재 sym_map 기준으로 split step의 동적 extent를 계산한다."""

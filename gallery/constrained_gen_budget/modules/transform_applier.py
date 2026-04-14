@@ -1,6 +1,7 @@
 """
 transform_applier — TransformApplier: SymbolicState에 transform step을 적용하는 로직.
 """
+
 import tvm
 from tvm import tir
 from tvm.auto_scheduler.loop_state import StateObject
@@ -136,24 +137,8 @@ class TransformApplier:
     def _get_cache_read_restore_ctx(self, stage_id):
         s = self.s
         if stage_id not in s._cache_read_consumer:
-            return None, None, None
-
-        cr_sym_candidates = self._get_consumer_split_sym_products(stage_id)
-        cr_stencil = s._cache_read_stencil_info.get(stage_id)
-        cr_ordered_splits = None
-        if cr_stencil:
-            consumer_sid = s._cache_read_consumer[stage_id]
-            ordered = [
-                (si, prod)
-                for (sid, si), prod in s._split_sym_products.items()
-                if sid == consumer_sid
-            ]
-            ordered.sort(key=lambda x: x[0])
-            cr_ordered_splits = [
-                (SymExpr(prod.val), eval_sym_extent(prod, s.sym_map))
-                for si, prod in ordered
-            ]
-        return cr_sym_candidates, cr_stencil, cr_ordered_splits
+            return None
+        return s._cache_read_stencil_info.get(stage_id)
 
     def _get_safe_saved_extent(self, stage_id, iter_id, real_ext):
         del real_ext
@@ -168,42 +153,26 @@ class TransformApplier:
             return None
         return SymExpr(saved.val)
 
-    def _recover_iter_extent(self, stage_id, iter_id, real_ext,
-                             cr_sym_candidates=None, cr_stencil=None, cr_ordered_splits=None):
+    def _recover_iter_extent(self, stage_id, iter_id, real_ext, cr_stencil=None):
         stage = self.s.stages[stage_id]
         saved_present = (stage_id, iter_id) in self.s._ca_saved_extents
 
-        if cr_sym_candidates is not None:
-            if cr_stencil and cr_ordered_splits and iter_id in cr_stencil:
-                pattern_kind, pattern_value, sp_order, rd_order = cr_stencil[iter_id]
-                if pattern_kind == "direct":
-                    order = sp_order if sp_order is not None else rd_order
-                    if order is not None and order < len(cr_ordered_splits):
-                        sym_expr, eval_val = cr_ordered_splits[order]
-                        for ci_idx, (ev, se) in enumerate(cr_sym_candidates):
-                            if ev == eval_val and se.val == sym_expr.val:
-                                cr_sym_candidates.pop(ci_idx)
-                                break
-                        return sym_expr
-                elif pattern_kind == "linear" and sp_order is not None and rd_order is not None:
-                    stride = pattern_value
-                    sp_sym, sp_eval = cr_ordered_splits[sp_order]
-                    rd_sym, rd_eval = cr_ordered_splits[rd_order]
-                    predicted = (sp_eval - 1) * stride + rd_eval
-                    if predicted == real_ext:
-                        return SymExpr(f"({sp_sym.val} - 1)*{stride} + {rd_sym.val}")
-                elif pattern_kind == "grouped" and sp_order is not None and rd_order is not None:
-                    block = pattern_value
-                    sp_sym, sp_eval = cr_ordered_splits[sp_order]
-                    rd_sym, rd_eval = cr_ordered_splits[rd_order]
-                    predicted = (((sp_eval + block - 1) // block) - 1) * block + rd_eval
-                    if predicted == real_ext:
-                        return SymExpr(f"(ceil({sp_sym.val}/({block})) - 1)*{block} + {rd_sym.val}")
-
-            matched_sym = self._match_cr_extent(real_ext, cr_sym_candidates)
-            if matched_sym is not None:
-                cr_sym_candidates.remove((real_ext, matched_sym))
-                return matched_sym
+        if cr_stencil and iter_id in cr_stencil:
+            pattern_kind, pattern_value, sp_name, rd_name = cr_stencil[iter_id]
+            if pattern_kind == "direct":
+                axis_name = sp_name if sp_name is not None else rd_name
+                if axis_name is not None:
+                    return self._inner_tile_sym_product(stage_id, axis_name)
+            elif pattern_kind == "linear" and sp_name is not None and rd_name is not None:
+                stride = int(pattern_value)
+                sp_sym = self._inner_tile_sym_product(stage_id, sp_name)
+                rd_sym = self._inner_tile_sym_product(stage_id, rd_name)
+                return SymExpr(f"({sp_sym.val} - 1)*{stride} + {rd_sym.val}")
+            elif pattern_kind == "grouped" and sp_name is not None and rd_name is not None:
+                block = int(pattern_value)
+                sp_sym = self._inner_tile_sym_product(stage_id, sp_name)
+                rd_sym = self._inner_tile_sym_product(stage_id, rd_name)
+                return SymExpr(f"(ceil({sp_sym.val}/({block})) - 1)*{block} + {rd_sym.val}")
 
         saved = self._get_safe_saved_extent(stage_id, iter_id, real_ext)
         if saved is not None:
@@ -237,49 +206,48 @@ class TransformApplier:
     def _restore_stage_extents_if_needed(self, stage_id, step_idx):
         s = self.s
         stage = s.stages[stage_id]
-        has_none = any(it.extent is None for it in stage.iters)
-        if not has_none:
-            return
 
         bounded = self._infer_bound_partial_from_state(s._state, step_idx)
         if bounded is None or stage_id >= len(bounded.stages):
             return
 
-        cr_sym_candidates, cr_stencil, cr_ordered_splits = self._get_cache_read_restore_ctx(stage_id)
+        cr_stencil = self._get_cache_read_restore_ctx(stage_id)
 
         real_stage = bounded.stages[stage_id]
-        for iid in range(len(stage.iters)):
-            if stage.iters[iid].extent is None and iid < len(real_stage.iters):
-                real_it = real_stage.iters[iid]
-                if real_it.range is not None:
-                    real_ext = int(real_it.range.extent)
-                    stage.iters[iid].min_value = self._recover_iter_min(stage_id, iid)
-                    stage.iters[iid].extent = self._recover_iter_extent(
-                        stage_id, iid, real_ext,
-                        cr_sym_candidates=cr_sym_candidates,
-                        cr_stencil=cr_stencil,
-                        cr_ordered_splits=cr_ordered_splits,
-                    )
+        for iid in range(min(len(stage.iters), len(real_stage.iters))):
+            real_it = real_stage.iters[iid]
+            if real_it.range is None:
+                continue
+            real_ext = int(real_it.range.extent)
+            stage.iters[iid].min_value = self._recover_iter_min(stage_id, iid)
 
-    def _get_consumer_split_sym_products(self, cache_read_stage_id):
-        s = self.s
-        consumer_sid = s._cache_read_consumer.get(cache_read_stage_id)
-        if consumer_sid is None:
-            return None
-        candidates = []
-        for (sid, step_idx), sym_prod in s._split_sym_products.items():
-            if sid == consumer_sid:
-                eval_val = eval_sym_extent(sym_prod, s.sym_map)
-                if isinstance(eval_val, int):
-                    candidates.append((eval_val, SymExpr(sym_prod.val)))
-        return candidates
+            current_extent = stage.iters[iid].extent
+            keep_current = False
+            if current_extent is not None:
+                eval_extent = eval_sym_extent(current_extent, s.sym_map)
+                if eval_extent is not None:
+                    try:
+                        keep_current = int(eval_extent) == real_ext
+                    except (TypeError, ValueError):
+                        keep_current = False
 
-    @staticmethod
-    def _match_cr_extent(real_ext, candidates):
-        for eval_val, sym_expr in candidates:
-            if eval_val == real_ext:
-                return sym_expr
-        return None
+            if keep_current:
+                continue
+
+            recovered_extent = self._recover_iter_extent(
+                stage_id, iid, real_ext, cr_stencil=cr_stencil,
+            )
+            recovered_eval = eval_sym_extent(recovered_extent, s.sym_map)
+            if recovered_eval is None:
+                stage.iters[iid].extent = SymExpr(real_ext)
+                continue
+            try:
+                recovered_matches = int(recovered_eval) == real_ext
+            except (TypeError, ValueError):
+                recovered_matches = False
+            stage.iters[iid].extent = (
+                recovered_extent if recovered_matches else SymExpr(real_ext)
+            )
 
     @staticmethod
     def _iter_base_name(name):
@@ -291,6 +259,28 @@ class TransformApplier:
         if "." in name:
             return name.split(".", 1)[0]
         return name
+
+    def _inner_tile_sym_product(self, stage_id, iter_base_name):
+        s = self.s
+        stage = s.stages[stage_id]
+        if stage.compute_at != CA_ITER or stage.attach_stage_id is None:
+            return SymExpr(1)
+
+        target_sid = stage.attach_stage_id
+        target_iid = stage.attach_iter_id
+        target_stage = s.stages[target_sid]
+        product = SymExpr(1)
+        found = False
+        for tiid in range(target_iid + 1, len(target_stage.iters)):
+            t_it = target_stage.iters[tiid]
+            target_base = self._iter_base_name(t_it.name)
+            if target_base != iter_base_name:
+                continue
+            if t_it.extent is None:
+                continue
+            product = SymExpr.mul(product, t_it.extent)
+            found = True
+        return product if found else SymExpr(1)
 
     def _match_compute_at_inner_extent(self, sid, iid, real_ext):
         """compute_at된 stage의 iter에 대해, target stage의 inner iter 중
@@ -327,7 +317,7 @@ class TransformApplier:
                 continue
             real_stage = bounded.stages[sid]
 
-            cr_sym_candidates, cr_stencil, cr_ordered_splits = self._get_cache_read_restore_ctx(sid)
+            cr_stencil = self._get_cache_read_restore_ctx(sid)
 
             for iid in range(len(sym_stage.iters)):
                 sym_it = sym_stage.iters[iid]
@@ -340,10 +330,7 @@ class TransformApplier:
                 if sym_it.extent is None:
                     real_ext = int(real_it.range.extent)
                     sym_it.extent = self._recover_iter_extent(
-                        sid, iid, real_ext,
-                        cr_sym_candidates=cr_sym_candidates,
-                        cr_stencil=cr_stencil,
-                        cr_ordered_splits=cr_ordered_splits,
+                        sid, iid, real_ext, cr_stencil=cr_stencil,
                     )
 
     # ─── AnnotationStep ───
@@ -451,14 +438,22 @@ class TransformApplier:
 
         orig_iter = stage.iters[iid]
 
-        if orig_iter.extent is not None:
-            tosplit_extent = orig_iter.extent
-        elif step.extent is not None:
-            tosplit_extent = SymExpr(int(step.extent))
-        else:
-            tosplit_extent = None
+        tosplit_extent = orig_iter.extent
+        if tosplit_extent is None:
+            raise AssertionError(
+                f"SplitStep replay could not recover extent before step {step_idx} "
+                f"(stage_id={sid}, iter_id={iid})"
+            )
         if tosplit_extent is not None:
-            s._split_step_extents[step_idx] = SymExpr(tosplit_extent.val)
+            raw_step_ext = getattr(step, "extent", None)
+            if raw_step_ext is not None:
+                try:
+                    recorded_val = int(raw_step_ext)
+                except (TypeError, ValueError):
+                    recorded_val = tosplit_extent.val
+            else:
+                recorded_val = tosplit_extent.val
+            s._split_step_extents[step_idx] = SymExpr(recorded_val)
 
         sym_lengths = []
         for li, length in enumerate(lengths):
@@ -749,9 +744,11 @@ class TransformApplier:
             if result is None:
                 continue
             pattern_kind, pattern_value, sp_name, rd_name = result
-            sp_order = spatial_vars.get(sp_name) if sp_name else None
-            rd_order = reduce_vars.get(rd_name) if rd_name else None
-            stencil_info[ax_idx] = (pattern_kind, pattern_value, sp_order, rd_order)
+            if sp_name is not None and sp_name not in spatial_vars:
+                sp_name = None
+            if rd_name is not None and rd_name not in reduce_vars:
+                rd_name = None
+            stencil_info[ax_idx] = (pattern_kind, pattern_value, sp_name, rd_name)
 
         if stencil_info:
             s._cache_read_stencil_info[cr_stage_id] = stencil_info

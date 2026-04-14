@@ -15,7 +15,19 @@ class VarOrderPlanner:
         g = self.gen
         phase_entries = self._build_var_order_phase_entries()
         normalized_entries, ordered = self._build_phase_first_order(phase_entries)
-        # self._append_legacy_fallback_vars(ordered, seen, self._compute_legacy_var_order())
+
+        all_params = self._order_param_names_by_step_index(
+            list(g._all_sp_names) + list(g._ur_names)
+        )
+        missing = [name for name in all_params if name not in set(ordered)]
+        if missing:
+            normalized_entries.append({
+                'name': 'grid_fallback__remaining_params',
+                'family': 'fallback_remaining',
+                'grid_scope': tuple(),
+                'vars': missing,
+            })
+            ordered.extend(missing)
 
         g._var_order_phase_entries = normalized_entries
         g._var_order = ordered
@@ -51,13 +63,13 @@ class VarOrderPlanner:
     def _build_var_order_phase_entries(self):
         """execution, memory, instruction phase를 grid scope 단위로 조립한다."""
         g = self.gen
-        vectorize_items = []
-        if 'vectorize' in g._enabled:
-            vectorize_items = g.constraint_set._build_vectorize_constraints()['items']
+        # vectorize_items = []
+        # if 'vectorize' in g._enabled:
+        vectorize_items = g.constraint_set._build_vectorize_constraints()['items']
 
-        shared_vars = set()
-        if 'shared_memory' in g._enabled:
-            shared_vars = set(g.constraint_set._build_shared_memory_constraints()['tree'].variables())
+        # shared_vars = set()
+        # if 'shared_memory' in g._enabled:
+        shared_vars = set(g.constraint_set._build_shared_memory_constraints()['tree'].variables())
 
         scope_context = g.constraint_set._build_grid_scope_context()
         scope_infos = scope_context['scope_infos']
@@ -192,17 +204,6 @@ class VarOrderPlanner:
 
         for scope in memory_dependent_scopes:
             phase_entries.extend(execution_phase_entries_by_scope.get(scope, []))
-            phase_entries.append(
-                self._make_phase_entry(
-                    self._find_scope_info(scope_infos, scope),
-                    'instruction_vectorize_unroll',
-                    family_labels['instruction_vectorize_unroll'],
-                    self._merge_instruction_phase_vars(
-                        vectorize_vars_by_scope.get(scope, []),
-                        unroll_vars_by_scope.get(scope, []),
-                    ),
-                )
-            )
 
         if main_scope_info is not None:
             phase_entries.append(
@@ -216,29 +217,48 @@ class VarOrderPlanner:
                     ),
                 )
             )
-            phase_entries.append(
-                self._make_phase_entry(
-                    main_scope_info,
-                    'instruction_vectorize_unroll',
-                    family_labels['instruction_vectorize_unroll'],
-                    self._merge_instruction_phase_vars(
-                        vectorize_vars_by_scope.get(main_scope, []),
-                        unroll_vars_by_scope.get(main_scope, []),
-                    ),
-                )
-            )
 
         for scope in remaining_non_main_scopes:
             phase_entries.extend(execution_phase_entries_by_scope.get(scope, []))
+
+        # vectorize split의 extent는 prior split factor 할당에 의해 동적으로 결정되므로
+        # 모든 execution/memory split이 끝난 뒤(= 가장 마지막) 할당한다. unroll은 그 뒤에 둔다.
+        vectorize_phase_order = []
+        unroll_phase_order = []
+        ordered_scopes = []
+        if main_scope_info is not None:
+            ordered_scopes.append(main_scope)
+        ordered_scopes.extend(memory_dependent_scopes)
+        ordered_scopes.extend(remaining_non_main_scopes)
+        seen_scopes = set()
+        for scope in ordered_scopes:
+            if scope in seen_scopes:
+                continue
+            seen_scopes.add(scope)
+            vectorize_phase_order.append((scope, vectorize_vars_by_scope.get(scope, [])))
+            unroll_phase_order.append((scope, unroll_vars_by_scope.get(scope, [])))
+
+        for scope, vec_vars in vectorize_phase_order:
+            if not vec_vars:
+                continue
             phase_entries.append(
                 self._make_phase_entry(
                     self._find_scope_info(scope_infos, scope),
-                    'instruction_vectorize_unroll',
-                    family_labels['instruction_vectorize_unroll'],
-                    self._merge_instruction_phase_vars(
-                        vectorize_vars_by_scope.get(scope, []),
-                        unroll_vars_by_scope.get(scope, []),
-                    ),
+                    'instruction_vectorize',
+                    family_labels.get('instruction_vectorize', 'instruction_vectorize'),
+                    list(vec_vars),
+                )
+            )
+
+        for scope, unr_vars in unroll_phase_order:
+            if not unr_vars:
+                continue
+            phase_entries.append(
+                self._make_phase_entry(
+                    self._find_scope_info(scope_infos, scope),
+                    'instruction_unroll',
+                    family_labels.get('instruction_unroll', 'instruction_unroll'),
+                    list(unr_vars),
                 )
             )
 

@@ -28,6 +28,7 @@ if __package__ in (None, ""):
             load_json_samples,
             split_records,
         )
+        from latent_model_budget.config import build_config
         from latent_model_budget.dataset import budget_enabled, get_model_param_order
         from latent_model_budget.model import LatentParamVAE
         from latent_model_budget.tokenizer import ParamTokenizer
@@ -40,6 +41,7 @@ if __package__ in (None, ""):
             load_json_samples,
             split_records,
         )
+        from latent_model_budget.config import build_config
         from latent_model_budget.dataset import budget_enabled, get_model_param_order
         from latent_model_budget.model import LatentParamVAE
         from latent_model_budget.tokenizer import ParamTokenizer
@@ -62,6 +64,7 @@ else:
             load_json_samples,
             split_records,
         )
+        from .latent_model_budget.config import build_config
         from .latent_model_budget.dataset import budget_enabled, get_model_param_order
         from .latent_model_budget.model import LatentParamVAE
         from .latent_model_budget.tokenizer import ParamTokenizer
@@ -74,6 +77,7 @@ else:
             load_json_samples,
             split_records,
         )
+        from .latent_model_budget.config import build_config
         from .latent_model_budget.dataset import budget_enabled, get_model_param_order
         from .latent_model_budget.model import LatentParamVAE
         from .latent_model_budget.tokenizer import ParamTokenizer
@@ -372,7 +376,13 @@ def _resolve_device(device: str) -> torch.device:
 
 
 def _make_model_cfg(cfg_payload: Dict[str, Any]) -> Any:
-    return SimpleNamespace(**cfg_payload)
+    default_model_cfg = build_config().model
+    merged = {
+        key: value
+        for key, value in vars(default_model_cfg).items()
+    }
+    merged.update(dict(cfg_payload))
+    return SimpleNamespace(**merged)
 
 
 def load_bundle(
@@ -384,7 +394,7 @@ def load_bundle(
     checkpoint_path = Path(checkpoint_path)
     payload = torch.load(checkpoint_path, map_location="cpu")
 
-    tokenizer = ParamTokenizer.from_state_dict(payload["tokenizer"])
+    tokenizer = ParamTokenizer.from_checkpoint_payload(payload)
     model_cfg = _make_model_cfg(payload["config"]["model"])
     model = LatentParamVAE(
         vocab_size=len(tokenizer.id_to_token),
