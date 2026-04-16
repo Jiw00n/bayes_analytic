@@ -12,7 +12,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(HERE.parent))
+    sys.path.insert(0, str(HERE))
     from latent_model_budget.config import build_config
     from latent_model_budget.model import LatentParamVAE
     import latent_model_budget.train as train_module
@@ -23,13 +23,14 @@ else:
 
 
 SEARCH_SPACE = {
-    "train.learning_rate": [3e-4, 5e-4, 7e-4],
-    "train.lambda_nce": [0.05, 0.1, 0.2],
-    "train.tau_nce": [0.2, 0.3],
+    "train.learning_rate": [5e-4, 7e-4],
+    "train.lambda_nce": [0.1, 0.2],
+    "train.tau_nce": [0.2],
     "train.beta_end": [0.002, 0.003],
     "train.beta_warmup_epochs": [10, 20],
-    "train.order_nce": [True, False],
-    "train.nce_mu": [True, False],
+    "train.order_nce": [False],
+    "train.nce_mu": [False, True],
+    "model.adaln": [False, True],
 }
 
 BEST_METRIC = "val_full_sequence_exact_match"
@@ -131,8 +132,8 @@ def main():
     combos = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
 
     for idx, params in enumerate(combos, start=1):
-        if idx <= 186: 
-            continue
+        # if idx <= 186: 
+        #     continue
         print(f"\n===== [{idx}/{len(combos)}] {params} =====")
         run_one(idx, deepcopy(params))
 

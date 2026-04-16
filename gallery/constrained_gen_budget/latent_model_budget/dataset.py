@@ -663,7 +663,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     record_domain_cache: Dict[tuple, Dict[str, List[int]]] = {}
     domain_values_by_name: Dict[str, Set[int]] = {}
     print("[dataset] building ordered parameter cache")
-    for idx, record in enumerate(records, start=1):
+    for idx, record in tqdm(enumerate(records, start=1), total=len(records)):
         order_key = (
             record.workload_key,
             record.target_kind,
@@ -771,7 +771,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         current_oracle = None
         current_order: List[str] = []
         current_values: List[int] = []
-        for idx, record in enumerate(sorted_valid_records, start=1):
+        for idx, record in tqdm(enumerate(sorted_valid_records, start=1), total=len(sorted_valid_records)):
             order, values = prepared_cache[id(record)]
             group_key = _oracle_group_key(record)
             prefix_len = 0
@@ -813,8 +813,8 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
 
             current_order = list(order)
             current_values = list(values)
-            if idx % 500 == 0 or idx == len(sorted_valid_records):
-                print(f"[dataset] collected oracle domains {idx}/{len(sorted_valid_records)}")
+            # if idx % 500 == 0 or idx == len(sorted_valid_records):
+            #     print(f"[dataset] collected oracle domains {idx}/{len(sorted_valid_records)}")
     else:
         print("[dataset] skipping oracle candidate domain sweep")
 

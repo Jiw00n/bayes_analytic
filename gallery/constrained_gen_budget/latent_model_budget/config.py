@@ -101,7 +101,8 @@ class EvalConfig:
 
 @dataclass
 class WandbConfig:
-    project: Optional[str] = "single_grid_search"
+    # project: Optional[str] = "single_grid_search"
+    project: Optional[str] = None
 
 
 @dataclass

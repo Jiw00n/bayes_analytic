@@ -38,7 +38,7 @@ class ScheduleGenerator:
         'max_thread_x': 1024,
         'max_thread_y': 1024,
         'max_thread_z': 64,
-        'max_vthread_extent': 8,
+        'max_vthread_extent': 15,
         'max_innermost_split_factor': 64,
         'warp_size': 32,
     }
@@ -48,7 +48,7 @@ class ScheduleGenerator:
         'max_vthread', 'innermost_split', 'split_structure', 'min_thread_extent',
     )
     DEFAULT_ENABLED_CONSTRAINT_KINDS = (
-        'vectorize',
+        # 'vectorize',
         'shared_memory',
         'max_threads',
         'max_vthread',

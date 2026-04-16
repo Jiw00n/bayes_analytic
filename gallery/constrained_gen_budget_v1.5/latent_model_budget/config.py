@@ -57,7 +57,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     grad_clip_norm: float = 1.0
     beta_start: float = 1e-4
-    beta_end: float = 0.002
+    beta_end: float = 0.003
     beta_warmup_epochs: int = 20
     lambda_cost: float = 0.01
     lambda_nce: float = 0.2
@@ -82,6 +82,13 @@ class TrainConfig:
     latent_wrong_top1_margin: float = 0.0
     best_metric_name: str = "val_full_sequence_exact_match"
     best_metric_mode: str = "max"   # "max" or "min"
+    latent_walk_every_n_epochs: int = 10
+    latent_walk_on_final: bool = True
+    latent_walk_record_json: Optional[str] = None
+    latent_walk_output_dir: Optional[str] = None
+    latent_walk_top_k: int = 1
+    latent_walk_num_steps: int = 40
+    latent_walk_step_size: float = 0.25
 
 
 @dataclass
@@ -93,7 +100,7 @@ class EvalConfig:
 
 @dataclass
 class WandbConfig:
-    project: Optional[str] = None
+    project: Optional[str] = "V1.5_grid_search"
 
 
 @dataclass

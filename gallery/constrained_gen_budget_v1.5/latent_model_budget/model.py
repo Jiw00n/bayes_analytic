@@ -36,7 +36,7 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
 
 
 class AdaptiveDecoderLayer(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, latent_dim: int):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, latent_dim: int, adaln: bool=True):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(
             embed_dim=d_model,
@@ -58,6 +58,7 @@ class AdaptiveDecoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(d_model, elementwise_affine=False)
         self.act = nn.GELU()
+        self.adaln = adaln
         self.ada_mod = nn.Sequential(
             nn.SiLU(),
             nn.Linear(latent_dim, 9 * d_model),
@@ -72,49 +73,83 @@ class AdaptiveDecoderLayer(nn.Module):
         tgt_key_padding_mask: torch.Tensor | None = None,
         memory_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mca,
-            scale_mca,
-            gate_mca,
-            shift_ff,
-            scale_ff,
-            gate_ff,
-        ) = self.ada_mod(latent_cond).chunk(9, dim=-1)
 
-        x = tgt
+        if self.adaln:
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mca,
+                scale_mca,
+                gate_mca,
+                shift_ff,
+                scale_ff,
+                gate_ff,
+            ) = self.ada_mod(latent_cond).chunk(9, dim=-1)
 
-        x_norm = _modulate(self.norm1(x), shift_msa, scale_msa)
-        self_attn_out, _ = self.self_attn(
-            x_norm,
-            x_norm,
-            x_norm,
-            attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_padding_mask,
-            need_weights=False,
-        )
-        x = x + gate_msa.unsqueeze(1) * self.dropout(self_attn_out)
+            x = tgt
 
-        x_norm = _modulate(self.norm2(x), shift_mca, scale_mca)
-        cross_attn_out, _ = self.cross_attn(
-            x_norm,
-            memory,
-            memory,
-            key_padding_mask=memory_key_padding_mask,
-            need_weights=False,
-        )
-        x = x + gate_mca.unsqueeze(1) * self.dropout(cross_attn_out)
+            x_norm = _modulate(self.norm1(x), shift_msa, scale_msa)
+            self_attn_out, _ = self.self_attn(
+                x_norm,
+                x_norm,
+                x_norm,
+                attn_mask=tgt_mask,
+                key_padding_mask=tgt_key_padding_mask,
+                need_weights=False,
+            )
+            x = x + gate_msa.unsqueeze(1) * self.dropout(self_attn_out)
 
-        x_norm = _modulate(self.norm3(x), shift_ff, scale_ff)
-        ff_out = self.linear2(self.dropout_ff(self.act(self.linear1(x_norm))))
-        x = x + gate_ff.unsqueeze(1) * self.dropout(ff_out)
-        return x
+            x_norm = _modulate(self.norm2(x), shift_mca, scale_mca)
+            cross_attn_out, _ = self.cross_attn(
+                x_norm,
+                memory,
+                memory,
+                key_padding_mask=memory_key_padding_mask,
+                need_weights=False,
+            )
+            x = x + gate_mca.unsqueeze(1) * self.dropout(cross_attn_out)
+
+            x_norm = _modulate(self.norm3(x), shift_ff, scale_ff)
+            ff_out = self.linear2(self.dropout_ff(self.act(self.linear1(x_norm))))
+            x = x + gate_ff.unsqueeze(1) * self.dropout(ff_out)
+            return x
+
+        elif not self.adaln:
+
+            del latent_cond
+
+            x = tgt
+
+            x_norm = self.norm1(x)
+            self_attn_out, _ = self.self_attn(
+                x_norm,
+                x_norm,
+                x_norm,
+                attn_mask=tgt_mask,
+                key_padding_mask=tgt_key_padding_mask,
+                need_weights=False,
+            )
+            x = x + self.dropout(self_attn_out)
+
+            x_norm = self.norm2(x)
+            cross_attn_out, _ = self.cross_attn(
+                x_norm,
+                memory,
+                memory,
+                key_padding_mask=memory_key_padding_mask,
+                need_weights=False,
+            )
+            x = x + self.dropout(cross_attn_out)
+
+            x_norm = self.norm3(x)
+            ff_out = self.linear2(self.dropout_ff(self.act(self.linear1(x_norm))))
+            x = x + self.dropout(ff_out)
+            return x
 
 
 class PerLayerCrossAttentionDecoder(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, num_layers: int, latent_dim: int):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, num_layers: int, latent_dim: int, adaln: bool):
         super().__init__()
         self.layers = nn.ModuleList(
             [
@@ -124,6 +159,7 @@ class PerLayerCrossAttentionDecoder(nn.Module):
                     dim_feedforward=dim_feedforward,
                     dropout=dropout,
                     latent_dim=latent_dim,
+                    adaln=adaln,
                 )
                 for _ in range(num_layers)
             ]
@@ -188,6 +224,7 @@ class LatentParamVAE(nn.Module):
             dropout=cfg.dropout,
             num_layers=cfg.num_decoder_layers,
             latent_dim=cfg.latent_dim,
+            adaln=cfg.adaln,
         )
 
         # replace masked mean with attention-weighted mean pooling

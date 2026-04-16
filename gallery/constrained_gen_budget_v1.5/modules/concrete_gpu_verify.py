@@ -31,8 +31,8 @@ GPU_VERIFY_CONSTRAINTS = {
     "max_thread_x": 1024,
     "max_thread_y": 1024,
     "max_thread_z": 64,
-    "max_vthread": 8,
-    "max_vector_bytes": 16,
+    "max_vthread": 15,
+    # "max_vector_bytes": 16,
 }
 
 

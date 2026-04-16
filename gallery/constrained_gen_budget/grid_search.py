@@ -25,19 +25,19 @@ TASK_INDEX = 1490
 
 
 SEARCH_SPACE = {
-    "train.learning_rate": [5e-4, 7e-4],
-    "train.lambda_nce": [0.1, 0.2],
+    "train.learning_rate": [7e-4],
+    "train.lambda_nce": [0.2],
     "train.tau_nce": [0.2],
     "train.beta_end": [0.002],
     "train.beta_warmup_epochs": [20],
-    "train.order_nce": [False, True],
-    "train.nce_mu": [False, True],
-    "model.adaln": [False, True],
+    "train.order_nce": [False],
+    "train.nce_mu": [False],
+    "model.adaln": [True],
 }
 
 BEST_METRIC = "val_full_sequence_exact_match"
 BEST_MODE = "max"
-EVALUATE_AUTOREGRESSIVE_EACH_EPOCH = 10
+EVALUATE_AUTOREGRESSIVE_EACH_EPOCH = 0
 
 
 _SHARED_DATASET_ARTIFACTS: dict[str, dict] = {}

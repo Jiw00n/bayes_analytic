@@ -779,7 +779,7 @@ class ConstraintSet:
                     'tree': parse_expr_tree(str(it.extent)),
                     'anchor_stage_id': anchor_stage_id,
                     'anchor_iter_id': anchor_iter_id,
-                    'limit': 15,     # 수정하지 말 것.
+                    'limit': g.hw['max_vthread_extent'],     # 수정하지 말 것.
                     'desc': (
                         f"{ANNOTATION_STR[ann]} extent "
                         f"{stage.op_name}:{it.name} ≤ {g.hw['max_vthread_extent']}"

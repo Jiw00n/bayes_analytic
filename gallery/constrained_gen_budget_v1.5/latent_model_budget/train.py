@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import json
+import sys
 from pathlib import Path
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -38,6 +40,268 @@ from .train_eval import (
 )
 
 
+def _wandb_section(key: str) -> str:
+    """Group metric keys into wandb sections (train/, val/, walk/, ...).
+
+    wandb groups panels on the Charts page by the prefix before the first '/'.
+    Training-phase metrics like ``loss``/``recon_loss`` come from
+    ``train_one_epoch`` without any prefix, so we route them to ``train/``.
+    """
+    if "/" in key:
+        return key
+    if key == "epoch":
+        return key
+    section_prefixes = (
+        ("train_", "train/"),
+        ("val_", "val/"),
+        ("eval_val_", "eval_val/"),
+        ("eval_test_", "eval_test/"),
+        ("test_", "test/"),
+        ("final_", "final/"),
+    )
+    for old, new in section_prefixes:
+        if key.startswith(old):
+            return new + key[len(old):]
+    return f"train/{key}"
+
+
+def _remap_for_wandb(metrics: Dict) -> Dict:
+    return {_wandb_section(k): v for k, v in metrics.items()}
+
+
+def _resolve_walk_record_json(config) -> Optional[str]:
+    """Pick the record JSON used for the periodic latent walk. Fall back to the
+    first data.json_paths entry when the dedicated field is unset."""
+    explicit = getattr(config.train, "latent_walk_record_json", None)
+    if explicit:
+        return str(explicit)
+    json_paths = list(getattr(config.data, "json_paths", []) or [])
+    return str(json_paths[0]) if json_paths else None
+
+
+def _summarize_walk_records(
+    records,
+    *,
+    reference_params: Optional[Dict[str, int]] = None,
+) -> Dict[str, float]:
+    """Reduce a list of WalkRecord into scalar metrics for wandb logging.
+
+    ``mean_cost`` and ``predicted_score`` are both ``-log(latency)``, so higher
+    is better (faster kernel). ``best_measured_mean_cost`` excludes the
+    trivial alpha=0 step and any step whose decoded params match
+    ``reference_params`` (walk did not move away from the starting point).
+    """
+    summary: Dict[str, float] = {}
+    if not records:
+        return summary
+
+    ref = (
+        {str(k): int(v) for k, v in reference_params.items()}
+        if reference_params
+        else None
+    )
+
+    def _is_reference(params) -> bool:
+        if ref is None or not params:
+            return False
+        shared = set(ref) & set(params)
+        if not shared:
+            return False
+        return all(int(params[k]) == ref[k] for k in shared)
+
+    pred_costs = [float(r.predicted_score) for r in records]
+    summary["walk/num_steps"] = float(len(records))
+    if pred_costs:
+        summary["walk/best_predicted_cost"] = float(max(pred_costs))
+        summary["walk/mean_predicted_cost"] = float(sum(pred_costs) / len(pred_costs))
+
+    measured_all: list[tuple[float, float]] = []
+    measured_novel: list[tuple[float, float]] = []
+    true_cost_at_alpha0: Optional[float] = None
+    for r in records:
+        meas = r.measurement or {}
+        if meas.get("ok") and meas.get("usable_measurement"):
+            mc = meas.get("mean_cost")
+            if mc is not None:
+                entry = (float(r.alpha), float(mc))
+                measured_all.append(entry)
+                if abs(entry[0]) >= 1e-12 and not _is_reference(r.params):
+                    measured_novel.append(entry)
+        if abs(float(r.alpha)) < 1e-12:
+            true_mc = meas.get("true_mean_cost") if meas else None
+            if true_mc is not None:
+                true_cost_at_alpha0 = float(true_mc)
+
+    summary["walk/num_usable"] = float(len(measured_all))
+    summary["walk/num_novel"] = float(len(measured_novel))
+    summary["walk/num_unique_sym_map"] = float(
+        len({frozenset((str(k), int(v)) for k, v in r.sym_map.items()) for r in records})
+    )
+    if measured_novel:
+        best_alpha, best_mc = max(measured_novel, key=lambda x: x[1])
+        summary["walk/best_measured_mean_cost"] = best_mc
+        summary["walk/alpha_at_best"] = best_alpha
+    if true_cost_at_alpha0 is not None:
+        summary["walk/true_cost_at_alpha0"] = true_cost_at_alpha0
+    return summary
+
+
+def _merge_walk_summaries(summaries: list) -> Dict[str, float]:
+    """Aggregate per-rank walk summaries into a single dict for wandb.
+
+    - ``best_*`` costs take the max across ranks (higher ``-log(latency)`` = faster).
+    - ``alpha_at_best`` is carried from whichever rank produced the overall best
+      ``best_measured_mean_cost``.
+    - Count metrics sum across ranks.
+    - ``mean_predicted_cost`` is re-averaged by ``num_steps`` so the aggregate
+      reflects all steps equally regardless of rank.
+    """
+    merged: Dict[str, float] = {}
+    if not summaries:
+        return merged
+
+    num_records = 0
+    total_steps = 0.0
+    total_usable = 0.0
+    total_novel = 0.0
+    total_unique_sym = 0.0
+    pred_weighted_sum = 0.0
+    pred_weight = 0.0
+    best_pred: Optional[float] = None
+    best_measured: Optional[float] = None
+    best_measured_alpha: Optional[float] = None
+    best_true_alpha0: Optional[float] = None
+
+    for s in summaries:
+        if not s:
+            continue
+        num_records += 1
+        n_steps = float(s.get("walk/num_steps", 0.0))
+        total_steps += n_steps
+        total_usable += float(s.get("walk/num_usable", 0.0))
+        total_novel += float(s.get("walk/num_novel", 0.0))
+        total_unique_sym += float(s.get("walk/num_unique_sym_map", 0.0))
+        mp = s.get("walk/mean_predicted_cost")
+        if mp is not None and n_steps > 0:
+            pred_weighted_sum += float(mp) * n_steps
+            pred_weight += n_steps
+        bp = s.get("walk/best_predicted_cost")
+        if bp is not None and (best_pred is None or bp > best_pred):
+            best_pred = float(bp)
+        bm = s.get("walk/best_measured_mean_cost")
+        if bm is not None and (best_measured is None or bm > best_measured):
+            best_measured = float(bm)
+            ab = s.get("walk/alpha_at_best")
+            best_measured_alpha = float(ab) if ab is not None else None
+        ta0 = s.get("walk/true_cost_at_alpha0")
+        if ta0 is not None and (best_true_alpha0 is None or ta0 > best_true_alpha0):
+            best_true_alpha0 = float(ta0)
+
+    merged["walk/num_records"] = float(num_records)
+    merged["walk/num_steps"] = total_steps
+    merged["walk/num_usable"] = total_usable
+    merged["walk/num_novel"] = total_novel
+    merged["walk/num_unique_sym_map"] = total_unique_sym
+    if pred_weight > 0:
+        merged["walk/mean_predicted_cost"] = pred_weighted_sum / pred_weight
+    if best_pred is not None:
+        merged["walk/best_predicted_cost"] = best_pred
+    if best_measured is not None:
+        merged["walk/best_measured_mean_cost"] = best_measured
+        if best_measured_alpha is not None:
+            merged["walk/alpha_at_best"] = best_measured_alpha
+    if best_true_alpha0 is not None:
+        merged["walk/true_cost_at_alpha0"] = best_true_alpha0
+    return merged
+
+
+def _run_periodic_latent_walk(
+    *,
+    model,
+    device,
+    checkpoint_path,
+    record_json_path: str,
+    walk_output_dir: str,
+    network_info_folder: Optional[str],
+    epoch_label: str,
+    top_k: int = 1,
+    num_steps: int = 8,
+    step_size: float = 0.25,
+) -> Dict[str, float]:
+    """Run the tune.sh-equivalent latent walk against ``checkpoint_path``.
+
+    Training model is moved to CPU for the duration of the walk so the GPU is
+    free both for the walk's own forward passes and for the TVM measurement
+    subprocess, which needs exclusive GPU access for accurate timings. When
+    ``top_k > 1`` the walk is repeated per top-k reference record and the
+    per-rank summaries are merged. Returns summary metrics for wandb logging.
+    """
+    here = Path(__file__).resolve().parent.parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    try:
+        from tune_by_latent import run_latent_walk, _select_topk_records_from_path
+    except Exception as err:  # pragma: no cover
+        print(f"[train] latent walk unavailable: {type(err).__name__}: {err}")
+        return {}
+
+    try:
+        ref_records = _select_topk_records_from_path(record_json_path, k=max(1, int(top_k)))
+    except Exception as err:  # pragma: no cover
+        print(f"[train] could not resolve reference records: {err}")
+        return {}
+    if not ref_records:
+        return {}
+
+    print(
+        f"[train] latent walk ({epoch_label}) using checkpoint={checkpoint_path} "
+        f"top_k={len(ref_records)}"
+    )
+    model.to("cpu")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    walk_device = "cuda" if (device.type == "cuda" and torch.cuda.is_available()) else "cpu"
+    per_rank_summaries: list = []
+    base_output_dir = Path(walk_output_dir)
+    try:
+        for rank, ref_record in enumerate(ref_records):
+            reference_params = {
+                str(k): int(v) for k, v in (ref_record.params or {}).items()
+            }
+            rank_output_dir = (
+                base_output_dir / f"rank{rank}" if len(ref_records) > 1 else base_output_dir
+            )
+            try:
+                walk_records = run_latent_walk(
+                    checkpoint_path=str(checkpoint_path),
+                    record_json_path=str(record_json_path),
+                    network_info_folder=network_info_folder,
+                    device=walk_device,
+                    output=str(rank_output_dir),
+                    num_steps=int(num_steps),
+                    step_size=float(step_size),
+                    deterministic_start=True,
+                    preselected_record=ref_record,
+                ) or []
+            except Exception as err:  # pragma: no cover
+                print(f"[train] latent walk rank={rank} failed: {type(err).__name__}: {err}")
+                walk_records = []
+            per_rank_summaries.append(
+                _summarize_walk_records(walk_records, reference_params=reference_params)
+            )
+    finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        model.to(device)
+
+    return _merge_walk_summaries(per_rank_summaries)
+
+
 def build_everything(config):
     print(f"[build] loading registry from {config.data.network_info_folder}")
     registry = GeneratorRegistry(config.data.network_info_folder)
@@ -58,9 +322,24 @@ def build_everything(config):
 
 
 def _resolve_run_task_index(bundle: DatasetBundle) -> str:
-    for record in list(bundle.train_records) + list(bundle.val_records) + list(bundle.test_records):
+    import re
+
+    all_records = (
+        list(bundle.train_records) + list(bundle.val_records) + list(bundle.test_records)
+    )
+    for record in all_records:
         if record.task_index is not None:
             return str(int(record.task_index))
+    # Fall back: leading digits of the record JSON filename (e.g.
+    # "1490_([...],cuda).json" → "1490"). Measure-record JSONs don't carry a
+    # task_index field, so this keeps wandb project names meaningful.
+    for record in all_records:
+        json_path = getattr(record, "json_path", None)
+        if not json_path:
+            continue
+        m = re.match(r"^(\d+)", Path(json_path).stem)
+        if m:
+            return m.group(1)
     return "na"
 
 
@@ -350,6 +629,25 @@ def train_main(config) -> Dict[str, float]:
     latent_cost_ridges: list[dict] = []
     timestamp = time.strftime("%m%d%H%M")
 
+    latent_walk_every_n = int(getattr(config.train, "latent_walk_every_n_epochs", 0) or 0)
+    latent_walk_on_final = bool(getattr(config.train, "latent_walk_on_final", False))
+    latent_walk_top_k = int(getattr(config.train, "latent_walk_top_k", 1) or 1)
+    latent_walk_num_steps = int(getattr(config.train, "latent_walk_num_steps", 8) or 8)
+    latent_walk_step_size = float(getattr(config.train, "latent_walk_step_size", 0.25) or 0.25)
+    latent_walk_record_json = _resolve_walk_record_json(config)
+    latent_walk_output_dir = (
+        getattr(config.train, "latent_walk_output_dir", None)
+        or str(checkpoint_dir)
+    )
+    latent_walk_network_info = getattr(config.data, "network_info_folder", None)
+    if (latent_walk_every_n > 0 or latent_walk_on_final) and not latent_walk_record_json:
+        print(
+            "[train] latent walk requested but no record JSON resolvable from "
+            "config.train.latent_walk_record_json or config.data.json_paths; disabling"
+        )
+        latent_walk_every_n = 0
+        latent_walk_on_final = False
+
     for epoch in range(start_epoch, config.train.num_epochs + 1):
         print(f"[train] starting epoch {epoch}/{config.train.num_epochs}")
         train_metrics = train_one_epoch(
@@ -469,13 +767,30 @@ def train_main(config) -> Dict[str, float]:
 
         save_checkpoint(last_checkpoint_path, **checkpoint_kwargs)
 
+        walk_summary: Dict[str, float] = {}
+        if latent_walk_every_n > 0 and (epoch % latent_walk_every_n == 0):
+            walk_summary = _run_periodic_latent_walk(
+                model=model,
+                device=device,
+                checkpoint_path=last_checkpoint_path,
+                record_json_path=latent_walk_record_json,
+                walk_output_dir=latent_walk_output_dir,
+                network_info_folder=latent_walk_network_info,
+                epoch_label=f"epoch {epoch}",
+                top_k=latent_walk_top_k,
+                num_steps=latent_walk_num_steps,
+                step_size=latent_walk_step_size,
+            )
+            if walk_summary:
+                summary.update(walk_summary)
+
         if wandb_run is not None:
             wandb.log(
                 {
                     "epoch": epoch,
                     "early_stop/best_metric_value": best_metric_value,
                     "early_stop/epochs_without_improve": epochs_without_improve,
-                    **summary,
+                    **_remap_for_wandb(summary),
                 },
                 step=epoch,
             )
@@ -507,6 +822,28 @@ def train_main(config) -> Dict[str, float]:
         )
     )
     print("[final]", json.dumps(final_metrics, indent=2))
+    print("[train] checkpoint :", checkpoint_path)
+
+    if latent_walk_on_final and latent_walk_record_json:
+        final_walk_checkpoint = (
+            best_checkpoint_path if best_checkpoint_path.exists() else last_checkpoint_path
+        )
+        final_walk_summary = _run_periodic_latent_walk(
+            model=model,
+            device=device,
+            checkpoint_path=final_walk_checkpoint,
+            record_json_path=latent_walk_record_json,
+            walk_output_dir=latent_walk_output_dir,
+            network_info_folder=latent_walk_network_info,
+            epoch_label="final",
+            top_k=latent_walk_top_k,
+            num_steps=latent_walk_num_steps,
+            step_size=latent_walk_step_size,
+        )
+        if final_walk_summary:
+            final_metrics.update(
+                {f"final_{k}": v for k, v in final_walk_summary.items()}
+            )
 
     if bundle.val_dataset.samples:
         sample = bundle.val_dataset.samples[0]
@@ -524,8 +861,8 @@ def train_main(config) -> Dict[str, float]:
             if isinstance(value, (int, float))
         }
         if final_log_metrics:
-            wandb.log(final_log_metrics, step=epoch)
-        wandb_run.summary.update(final_metrics)
+            wandb.log(_remap_for_wandb(final_log_metrics), step=epoch)
+        wandb_run.summary.update(_remap_for_wandb(final_metrics))
         wandb_run.finish()
 
     return final_metrics

@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 from tvm import auto_scheduler
@@ -340,6 +340,27 @@ def _select_record_from_path(
     return max(records_with_cost, key=lambda record: float(record.cost))
 
 
+def _select_topk_records_from_path(
+    record_json_path: str | Path,
+    *,
+    k: int,
+) -> List[JsonSampleRecord]:
+    """Return the top-k records ranked by ``cost`` (higher ``-log(latency)`` = faster)."""
+    if k <= 0:
+        return []
+    records = load_json_samples(record_json_path)
+    if not records:
+        return []
+    records_with_cost = [
+        record for record in records
+        if record.cost is not None and math.isfinite(float(record.cost))
+    ]
+    if not records_with_cost:
+        return []
+    records_with_cost.sort(key=lambda record: float(record.cost), reverse=True)
+    return records_with_cost[: int(k)]
+
+
 def _release_measurement_environment(
     bundle: LoadedBundle,
     *,
@@ -607,6 +628,15 @@ def _resolve_decoded_value(
     return int(candidate_values[0])
 
 
+def _fixed_token_id_for_value(
+    tokenizer: ParamTokenizer,
+    var_name: str,
+    value: int,
+) -> int:
+    token = tokenizer.value_to_token(var_name, int(value))
+    return int(tokenizer.token_to_id.get(token, tokenizer.unk_id))
+
+
 @torch.no_grad()
 def greedy_decode_from_z(
     bundle: LoadedBundle,
@@ -659,7 +689,7 @@ def greedy_decode_from_z(
         decoder_input_ids.append(pred_token_id)
 
     sym_map = dict(oracle.generator.s.sym_map)
-    
+
     for name, value in decoded_params.items():
         sym_map[name] = int(value)
 
@@ -669,6 +699,136 @@ def greedy_decode_from_z(
         final_violations=list(oracle.final_violations()),
     )
 
+
+@torch.no_grad()
+def greedy_decode_many_from_z(
+    bundle: LoadedBundle,
+    record: JsonSampleRecord,
+    ordered_names: Sequence[str],
+    z_batch: torch.Tensor,
+) -> List[DecodeRecord]:
+    model = bundle.model
+    tokenizer = bundle.tokenizer
+    device = bundle.device
+
+    if z_batch.dim() == 1:
+        z_batch = z_batch.unsqueeze(0)
+    z_batch = z_batch.to(device=device, dtype=torch.float32)
+    batch_size = int(z_batch.shape[0])
+    if batch_size <= 0:
+        return []
+
+    memory = model.latent_to_memory(z_batch).view(
+        batch_size,
+        model.cfg.latent_token_count,
+        model.cfg.d_model,
+    )
+    oracles = [bundle.registry.build_oracle_from_record(record) for _ in range(batch_size)]
+
+    max_steps = len(ordered_names)
+    ordered_var_ids = [int(tokenizer.var_to_id[name]) for name in ordered_names]
+    decoder_input_ids = torch.full(
+        (batch_size, max_steps + 1),
+        tokenizer.pad_id,
+        dtype=torch.long,
+        device=device,
+    )
+    decoder_var_ids = torch.full(
+        (batch_size, max_steps + 1),
+        tokenizer.var_pad_id,
+        dtype=torch.long,
+        device=device,
+    )
+    decoder_input_ids[:, 0] = tokenizer.bos_id
+    current_lengths = torch.ones(batch_size, dtype=torch.long, device=device)
+    if ordered_var_ids:
+        decoder_var_ids[:, 0] = ordered_var_ids[0]
+
+    decoded_params: List[Dict[str, int]] = [dict() for _ in range(batch_size)]
+
+    for var_name in ordered_names:
+        variable_indices: List[int] = []
+        candidate_lists: List[List[int]] = []
+        for sample_idx in range(batch_size):
+            candidate_values = list(oracles[sample_idx].candidate_values(var_name))
+            if not candidate_values:
+                raise RuntimeError(f"No legal candidates returned for {var_name}")
+
+            if len(candidate_values) == 1:
+                pred_value = int(candidate_values[0])
+                pred_token_id = _fixed_token_id_for_value(tokenizer, var_name, pred_value)
+                oracles[sample_idx].assign(var_name, pred_value)
+                decoded_params[sample_idx][var_name] = int(pred_value)
+
+                pos = int(current_lengths[sample_idx].item())
+                decoder_input_ids[sample_idx, pos] = pred_token_id
+                if pos < len(ordered_var_ids):
+                    decoder_var_ids[sample_idx, pos] = ordered_var_ids[pos]
+                current_lengths[sample_idx] = pos + 1
+                continue
+
+            variable_indices.append(sample_idx)
+            candidate_lists.append(candidate_values)
+
+        if not variable_indices:
+            continue
+
+        subset_indices = torch.tensor(variable_indices, dtype=torch.long, device=device)
+        subset_lengths = current_lengths.index_select(0, subset_indices)
+        current_width = int(subset_lengths.max().item())
+        step_input = decoder_input_ids.index_select(0, subset_indices)[:, :current_width]
+        step_var = decoder_var_ids.index_select(0, subset_indices)[:, :current_width]
+        logits = model.decode(
+            step_input,
+            step_var,
+            memory.index_select(0, subset_indices),
+            z_batch.index_select(0, subset_indices),
+            decoder_pad_mask=step_input.eq(tokenizer.pad_id),
+        )
+        gather_pos = (subset_lengths - 1).to(dtype=torch.long)
+        step_logits = logits[torch.arange(len(variable_indices), device=device), gather_pos, :]
+        step_masks = torch.zeros_like(step_logits, dtype=torch.bool)
+        for local_idx, _ in enumerate(variable_indices):
+            step_masks[local_idx] = tokenizer.candidate_mask_from_values(
+                var_name,
+                candidate_lists[local_idx],
+                device=device,
+            )
+            if not step_masks[local_idx].any():
+                raise RuntimeError(
+                    f"Token vocab cannot represent any legal candidate for {var_name}. "
+                    f"candidates={candidate_lists[local_idx]}"
+                )
+
+        masked_logits = step_logits.masked_fill(~step_masks, float("-inf"))
+        pred_token_ids = torch.argmax(masked_logits, dim=-1).tolist()
+        for local_idx, sample_idx in enumerate(variable_indices):
+            candidate_values = candidate_lists[local_idx]
+            pred_token_id = int(pred_token_ids[local_idx])
+            pred_value = _resolve_decoded_value(tokenizer, var_name, pred_token_id, candidate_values)
+
+            oracles[sample_idx].assign(var_name, pred_value)
+            decoded_params[sample_idx][var_name] = int(pred_value)
+
+            pos = int(current_lengths[sample_idx].item())
+            decoder_input_ids[sample_idx, pos] = pred_token_id
+            if pos < len(ordered_var_ids):
+                decoder_var_ids[sample_idx, pos] = ordered_var_ids[pos]
+            current_lengths[sample_idx] = pos + 1
+
+    results: List[DecodeRecord] = []
+    for sample_idx in range(batch_size):
+        sym_map = dict(oracles[sample_idx].generator.s.sym_map)
+        for name, value in decoded_params[sample_idx].items():
+            sym_map[name] = int(value)
+        results.append(
+            DecodeRecord(
+                params=dict(decoded_params[sample_idx]),
+                sym_map={k: int(v) for k, v in sym_map.items() if isinstance(v, int)},
+                final_violations=list(oracles[sample_idx].final_violations()),
+            )
+        )
+    return results
 
 
 def make_shifted_zs(
@@ -750,15 +910,17 @@ def build_walk_records(
         step_size=step_size,
         normalize_direction=normalize_direction,
     )
+    decoded_batch: List[DecodeRecord] = []
+    if shifted_zs:
+        z_batch = torch.stack([z for _, _, z in shifted_zs], dim=0)
+        decoded_batch = greedy_decode_many_from_z(bundle, record, ordered_names, z_batch)
 
     results: List[WalkRecord] = []
     pending_measure_indices_by_key: Dict[tuple[tuple[str, int], ...], List[int]] = {}
     pending_measure_states: List[Any] = []
     pending_measure_metas: List[Dict[str, Any]] = []
     pending_measure_keys: List[tuple[tuple[str, int], ...]] = []
-    for step_index, alpha, z in shifted_zs:
-        oracle = bundle.registry.build_oracle_from_record(record)
-        decoded = greedy_decode_from_z(bundle, oracle, ordered_names, z)
+    for (step_index, alpha, z), decoded in zip(shifted_zs, decoded_batch):
 
         state = None
         state_build_ok = False
@@ -954,6 +1116,7 @@ def run_latent_walk(
     output: Optional[str | Path] = None,
     latent_gradient: bool = False,
     deterministic_start: bool = False,
+    preselected_record: Optional[JsonSampleRecord] = None,
 ) -> List[WalkRecord]:
     walk_output_path, _ = _resolve_output_layout(
         checkpoint_path=checkpoint_path,
@@ -969,7 +1132,10 @@ def run_latent_walk(
     if bundle.cost_source == "missing_cost_vector":
         print("[latent-walk] checkpoint에 저장된 cost vector가 없습니다.")
         return []
-    record = _select_record_from_path(record_json_path, best_cost=best_cost)
+    if preselected_record is not None:
+        record = preselected_record
+    else:
+        record = _select_record_from_path(record_json_path, best_cost=best_cost)
     records, start_ctx = build_walk_records(
         bundle,
         record,
