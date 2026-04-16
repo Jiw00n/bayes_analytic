@@ -17,8 +17,8 @@ from .tokenizer import ParamTokenizer
 from .train_eval import (
     _batch_to_device,
     _build_early_param_position_weights,
+    _build_singleton_position_mask,
     _build_teacher_forcing_candidate_masks,
-    _compress_teacher_forcing_batch,
     _teacher_forcing_accuracy_stats,
 )
 from .train_losses import (
@@ -70,14 +70,20 @@ def train_one_epoch(
             device=device,
             debug_invalid_step=cfg.train.debug_invalid_step,
         )
-        compressed = _compress_teacher_forcing_batch(batch, candidate_masks, tokenizer)
+        singleton_mask = _build_singleton_position_mask(
+            batch["target_ids"], candidate_masks, tokenizer.pad_id
+        )
         position_weights = _build_early_param_position_weights(
-            compressed["seq_lens"],
-            max_len=int(compressed["target_ids"].shape[1]),
+            batch["seq_lens"],
+            max_len=int(batch["target_ids"].shape[1]),
             max_weight=float(getattr(cfg.train, "early_param_weight_max", 1.0)),
             power=float(getattr(cfg.train, "early_param_weight_power", 1.0)),
             device=device,
         )
+        # Singleton positions are already determined by the oracle; keep them in
+        # the sequence so the decoder's causal context matches inference, but
+        # zero their loss contribution.
+        position_weights = position_weights * (~singleton_mask).to(position_weights.dtype)
 
         optimizer.zero_grad(set_to_none=True)
         use_amp = bool(cfg.train.use_amp and device.type == "cuda")
@@ -85,14 +91,14 @@ def train_one_epoch(
             out = model(
                 batch["encoder_token_ids"],
                 batch["encoder_var_ids"],
-                compressed["decoder_input_ids"],
-                compressed["decoder_var_ids"],
+                batch["decoder_input_ids"],
+                batch["decoder_var_ids"],
                 pad_token_id=tokenizer.pad_id,
             )
             recon_loss = masked_cross_entropy(
                 out.logits,
-                compressed["target_ids"],
-                compressed["candidate_masks"],
+                batch["target_ids"],
+                candidate_masks,
                 tokenizer.pad_id,
                 position_weights=position_weights,
             )
@@ -101,13 +107,13 @@ def train_one_epoch(
             latent_use_loss, latent_use_rank_loss, latent_use_top1_drop_loss = latent_use_margin_loss(
                 model,
                 out.logits,
-                compressed["decoder_input_ids"],
-                compressed["decoder_var_ids"],
-                compressed["decoder_input_ids"].eq(tokenizer.pad_id),
+                batch["decoder_input_ids"],
+                batch["decoder_var_ids"],
+                batch["decoder_input_ids"].eq(tokenizer.pad_id),
                 out.z,
                 out.memory,
-                compressed["target_ids"],
-                compressed["candidate_masks"],
+                batch["target_ids"],
+                candidate_masks,
                 tokenizer.pad_id,
                 position_weights,
                 margin=float(getattr(cfg.train, "latent_use_margin", 1.0)),
@@ -131,8 +137,8 @@ def train_one_epoch(
             batch_token_correct, batch_token_total, batch_exact_count, batch_sample_total = (
                 _teacher_forcing_accuracy_stats(
                     out.logits,
-                    compressed["target_ids"],
-                    compressed["candidate_masks"],
+                    batch["target_ids"],
+                    candidate_masks,
                     tokenizer.pad_id,
                 )
             )

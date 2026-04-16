@@ -17,9 +17,7 @@ try:
     from latent_model_budget.tokenizer import ParamTokenizer
     from latent_model_budget.train_eval import (
         _batch_to_device,
-        _build_singleton_position_mask,
         _build_teacher_forcing_candidate_masks,
-        _compress_teacher_forcing_batch,
     )
 except ImportError:  # pragma: no cover
     import sys
@@ -35,9 +33,7 @@ except ImportError:  # pragma: no cover
     from .latent_model_budget.tokenizer import ParamTokenizer
     from .latent_model_budget.train_eval import (
         _batch_to_device,
-        _build_singleton_position_mask,
         _build_teacher_forcing_candidate_masks,
-        _compress_teacher_forcing_batch,
     )
 
 
@@ -302,9 +298,7 @@ def analyze_reconstruction(
 ) -> Dict[str, Any]:
     model.eval()
     full_tf_analyzer = SplitAnalyzer(topk_samples=topk_samples)
-    compressed_tf_analyzer = SplitAnalyzer(topk_samples=topk_samples)
     full_ar_analyzer = SplitAnalyzer(topk_samples=topk_samples)
-    compressed_ar_analyzer = SplitAnalyzer(topk_samples=topk_samples)
 
     samples = list(dataset.samples)
     stride = max(int(batch_size), 1)
@@ -321,13 +315,6 @@ def analyze_reconstruction(
             device=device,
             debug_invalid_step=False,
         )
-        singleton_mask = _build_singleton_position_mask(
-            batch["target_ids"],
-            candidate_masks,
-            tokenizer.pad_id,
-        )
-        keep_mask = batch["target_ids"].ne(tokenizer.pad_id) & (~singleton_mask)
-        compressed = _compress_teacher_forcing_batch(batch, candidate_masks, tokenizer)
 
         logits_full = _run_model(
             model,
@@ -338,18 +325,6 @@ def analyze_reconstruction(
         )
         pred_full = torch.argmax(
             logits_full.masked_fill(~candidate_masks, float("-inf")),
-            dim=-1,
-        )
-
-        logits_compressed = _run_model(
-            model,
-            batch,
-            compressed["decoder_input_ids"],
-            compressed["decoder_var_ids"],
-            tokenizer.pad_id,
-        )
-        pred_compressed = torch.argmax(
-            logits_compressed.masked_fill(~compressed["candidate_masks"], float("-inf")),
             dim=-1,
         )
 
@@ -376,25 +351,7 @@ def analyze_reconstruction(
                 cost=cost,
             )
 
-            # compressed teacher forcing (matches current validation TF metric path)
-            kept_positions = torch.nonzero(keep_mask[row_idx], as_tuple=False).flatten().tolist()
-            comp_len = len(kept_positions)
-            comp_var_names = [ordered_names[pos] for pos in kept_positions]
-            gold_comp = compressed["target_ids"][row_idx, :comp_len]
-            pred_row_comp = pred_compressed[row_idx, :comp_len]
-            correctness_comp = [bool(x) for x in pred_row_comp.eq(gold_comp).tolist()]
-            wrong_positions_comp = [idx for idx, ok in enumerate(correctness_comp) if not ok]
-            wrong_vars_comp = [comp_var_names[idx] for idx in wrong_positions_comp]
-            compressed_tf_analyzer.add_sample(
-                sample_id=sample.sample_id,
-                wrong_vars=wrong_vars_comp,
-                wrong_positions=wrong_positions_comp,
-                ordered_var_names=comp_var_names,
-                correctness=correctness_comp,
-                cost=cost,
-            )
-
-            # autoregressive full / compressed
+            # autoregressive full
             pred_values_full = [
                 int(ar_result.predicted_param_dict[name]) for name in ordered_names
             ]
@@ -407,22 +364,9 @@ def analyze_reconstruction(
                 cost=cost,
             )
 
-            comp_gold_values = [gold_values[pos] for pos in kept_positions]
-            comp_pred_values = [pred_values_full[pos] for pos in kept_positions]
-            _add_sample_stats(
-                compressed_ar_analyzer,
-                sample_id=sample.sample_id,
-                ordered_names=comp_var_names,
-                gold_values=comp_gold_values,
-                pred_values=comp_pred_values,
-                cost=cost,
-            )
-
     return {
         "full_teacher_forcing": full_tf_analyzer.to_dict(),
-        "compressed_teacher_forcing": compressed_tf_analyzer.to_dict(),
         "full_autoregressive": full_ar_analyzer.to_dict(),
-        "compressed_autoregressive": compressed_ar_analyzer.to_dict(),
     }
 
 

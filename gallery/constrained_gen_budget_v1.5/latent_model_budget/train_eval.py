@@ -17,26 +17,6 @@ from .model import LatentParamVAE
 from .tokenizer import ParamTokenizer
 
 
-def _teacher_forcing_accuracy_stats(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    candidate_masks: torch.Tensor,
-    pad_id: int,
-) -> tuple[int, int, int, int]:
-    masked_logits = logits.masked_fill(~candidate_masks, float("-inf"))
-    pred_ids = torch.argmax(masked_logits, dim=-1)
-    valid_mask = targets.ne(int(pad_id))
-    token_correct = int((pred_ids.eq(targets) & valid_mask).sum().item())
-    token_total = int(valid_mask.sum().item())
-    if targets.dim() != 2:
-        raise ValueError("teacher forcing accuracy expects [batch, seq] targets")
-    sample_valid = valid_mask.any(dim=-1)
-    sample_all_correct = pred_ids.eq(targets) | (~valid_mask)
-    exact_count = int((sample_all_correct.all(dim=-1) & sample_valid).sum().item())
-    sample_total = int(sample_valid.sum().item())
-    return token_correct, token_total, exact_count, sample_total
-
-
 def _build_singleton_position_mask(
     targets: torch.Tensor,
     candidate_masks: torch.Tensor,
@@ -47,65 +27,25 @@ def _build_singleton_position_mask(
     return singleton_mask & valid_mask
 
 
-def _compress_teacher_forcing_batch(
-    batch: Dict[str, object],
+def _teacher_forcing_accuracy_stats(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
     candidate_masks: torch.Tensor,
-    tokenizer: ParamTokenizer,
-) -> Dict[str, torch.Tensor]:
-    target_ids: torch.Tensor = batch["target_ids"]
-    decoder_input_ids: torch.Tensor = batch["decoder_input_ids"]
-    decoder_var_ids: torch.Tensor = batch["decoder_var_ids"]
-
-    keep_mask = target_ids.ne(tokenizer.pad_id) & (
-        ~_build_singleton_position_mask(target_ids, candidate_masks, tokenizer.pad_id)
-    )
-    seq_lens = keep_mask.sum(dim=-1)
-    batch_size = int(target_ids.shape[0])
-    vocab_size = int(candidate_masks.shape[-1])
-    max_len = max(int(seq_lens.max().item()), 1)
-
-    new_decoder_input_ids = torch.full(
-        (batch_size, max_len),
-        tokenizer.pad_id,
-        dtype=decoder_input_ids.dtype,
-        device=decoder_input_ids.device,
-    )
-    new_decoder_var_ids = torch.full(
-        (batch_size, max_len),
-        tokenizer.var_pad_id,
-        dtype=decoder_var_ids.dtype,
-        device=decoder_var_ids.device,
-    )
-    new_target_ids = torch.full(
-        (batch_size, max_len),
-        tokenizer.pad_id,
-        dtype=target_ids.dtype,
-        device=target_ids.device,
-    )
-    new_candidate_masks = torch.zeros(
-        (batch_size, max_len, vocab_size),
-        dtype=torch.bool,
-        device=candidate_masks.device,
-    )
-    new_candidate_masks[:, :, tokenizer.pad_id] = True
-
-    for row_idx in range(batch_size):
-        keep_indices = torch.nonzero(keep_mask[row_idx], as_tuple=False).flatten()
-        if int(keep_indices.numel()) <= 0:
-            continue
-        length = int(keep_indices.numel())
-        new_decoder_input_ids[row_idx, :length] = decoder_input_ids[row_idx, keep_indices]
-        new_decoder_var_ids[row_idx, :length] = decoder_var_ids[row_idx, keep_indices]
-        new_target_ids[row_idx, :length] = target_ids[row_idx, keep_indices]
-        new_candidate_masks[row_idx, :length] = candidate_masks[row_idx, keep_indices]
-
-    return {
-        "decoder_input_ids": new_decoder_input_ids,
-        "decoder_var_ids": new_decoder_var_ids,
-        "target_ids": new_target_ids,
-        "candidate_masks": new_candidate_masks,
-        "seq_lens": seq_lens.to(dtype=torch.long),
-    }
+    pad_id: int,
+) -> tuple[int, int, int, int]:
+    masked_logits = logits.masked_fill(~candidate_masks, float("-inf"))
+    pred_ids = torch.argmax(masked_logits, dim=-1)
+    singleton_mask = _build_singleton_position_mask(targets, candidate_masks, pad_id)
+    valid_mask = targets.ne(int(pad_id)) & (~singleton_mask)
+    token_correct = int((pred_ids.eq(targets) & valid_mask).sum().item())
+    token_total = int(valid_mask.sum().item())
+    if targets.dim() != 2:
+        raise ValueError("teacher forcing accuracy expects [batch, seq] targets")
+    sample_valid = valid_mask.any(dim=-1)
+    sample_all_correct = pred_ids.eq(targets) | (~valid_mask)
+    exact_count = int((sample_all_correct.all(dim=-1) & sample_valid).sum().item())
+    sample_total = int(sample_valid.sum().item())
+    return token_correct, token_total, exact_count, sample_total
 
 
 def _build_teacher_forcing_candidate_masks(
@@ -289,19 +229,18 @@ def evaluate_teacher_forcing(
             device=device,
             debug_invalid_step=False,
         )
-        compressed = _compress_teacher_forcing_batch(batch, candidate_masks, tokenizer)
         out = model(
             batch["encoder_token_ids"],
             batch["encoder_var_ids"],
-            compressed["decoder_input_ids"],
-            compressed["decoder_var_ids"],
+            batch["decoder_input_ids"],
+            batch["decoder_var_ids"],
             pad_token_id=tokenizer.pad_id,
         )
         batch_token_correct, batch_token_total, batch_exact_count, batch_sample_total = (
             _teacher_forcing_accuracy_stats(
                 out.logits,
-                compressed["target_ids"],
-                compressed["candidate_masks"],
+                batch["target_ids"],
+                candidate_masks,
                 tokenizer.pad_id,
             )
         )

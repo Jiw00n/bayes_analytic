@@ -87,7 +87,7 @@ class TrainConfig:
     latent_walk_record_json: Optional[str] = None
     latent_walk_output_dir: Optional[str] = None
     latent_walk_top_k: int = 1
-    latent_walk_num_steps: int = 40
+    latent_walk_num_steps: int = 30
     latent_walk_step_size: float = 0.25
 
 
@@ -100,7 +100,8 @@ class EvalConfig:
 
 @dataclass
 class WandbConfig:
-    project: Optional[str] = "V1.5_grid_search"
+    # project: Optional[str] = "V1.5_grid_search"
+    project: Optional[str] = None
 
 
 @dataclass
