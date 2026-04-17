@@ -112,6 +112,7 @@ def train_one_epoch(
                 tokenizer.pad_id,
                 position_weights=position_weights,
                 sample_weights=cobo_sw,
+                label_smoothing=float(getattr(cfg.train, "label_smoothing", 0.0)),
             )
             kl_loss = kl_divergence(out.mu, out.logvar)
             cost_loss = weighted_cost_loss(out.cost_pred, batch["costs"], batch["cost_mask"], sample_weights=cobo_sw)

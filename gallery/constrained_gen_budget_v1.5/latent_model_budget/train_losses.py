@@ -57,14 +57,34 @@ def masked_cross_entropy(
     pad_id: int,
     position_weights: torch.Tensor | None = None,
     sample_weights: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     masked_logits = logits.masked_fill(~candidate_masks, float("-inf"))
-    token_losses = F.cross_entropy(
-        masked_logits.reshape(-1, masked_logits.size(-1)),
-        targets.reshape(-1),
-        ignore_index=pad_id,
-        reduction="none",
-    ).view_as(targets)
+
+    if label_smoothing > 0.0:
+        # Custom label smoothing: distribute smoothing mass only over valid
+        # candidates (not the -inf masked ones).
+        #   loss = (1 - eps) * NLL(target) + eps * mean_valid(-log p_j)
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        nll_target = F.nll_loss(
+            log_probs.reshape(-1, log_probs.size(-1)),
+            targets.reshape(-1),
+            ignore_index=pad_id,
+            reduction="none",
+        ).view_as(targets)
+        # Mean NLL over valid candidates per position
+        valid_log_probs = log_probs.masked_fill(~candidate_masks, 0.0)
+        num_valid = candidate_masks.float().sum(dim=-1).clamp_min(1.0)
+        mean_nll_valid = -valid_log_probs.sum(dim=-1) / num_valid
+        token_losses = (1.0 - label_smoothing) * nll_target + label_smoothing * mean_nll_valid
+    else:
+        token_losses = F.cross_entropy(
+            masked_logits.reshape(-1, masked_logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=pad_id,
+            reduction="none",
+        ).view_as(targets)
+
     valid_mask = targets.ne(pad_id)
     if position_weights is None:
         position_weights = torch.ones_like(token_losses)

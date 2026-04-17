@@ -252,7 +252,7 @@ class LatentParamVAE(nn.Module):
         self.cost_head = nn.Sequential(
             nn.Linear(cfg.latent_dim, cfg.dim_feedforward),
             nn.GELU(),
-            nn.Linear(cfg.latent_dim, 1),
+            nn.Linear(cfg.dim_feedforward, 1),
         )
         # self.cost_w = nn.Parameter(torch.randn(cfg.latent_dim) * 0.02)
         # self.cost_bias = nn.Parameter(torch.zeros(()))
@@ -321,11 +321,11 @@ class LatentParamVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
     
-    def predict_cost(self, z: torch.Tensor) -> torch.Tensor:
-        gamma = F.softplus(self.cost_gamma) + 1e-6
-        w = self.cost_w / (self.cost_w.norm() + 1e-12)
-        score = gamma * (z @ w) + self.cost_bias
-        return score
+    # def predict_cost(self, z: torch.Tensor) -> torch.Tensor:
+    #     gamma = F.softplus(self.cost_gamma) + 1e-6
+    #     w = self.cost_w / (self.cost_w.norm() + 1e-12)
+    #     score = gamma * (z @ w) + self.cost_bias
+    #     return score
 
     def forward(
         self,

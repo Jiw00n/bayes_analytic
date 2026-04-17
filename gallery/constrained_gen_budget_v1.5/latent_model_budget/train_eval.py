@@ -342,7 +342,7 @@ def evaluate_cost_ranking(
         enc_ids = batch["encoder_token_ids"].to(device, non_blocking=device.type == "cuda")
         enc_var_ids = batch["encoder_var_ids"].to(device, non_blocking=device.type == "cuda")
         enc_pad = enc_ids.eq(tokenizer.pad_id)
-        _, _, z, _ = model.encode(enc_ids, enc_var_ids, enc_pad, deterministic=True)
+        mu, _, z, _ = model.encode(enc_ids, enc_var_ids, enc_pad, deterministic=True)
         cost_head_pred = model.cost_head(z).squeeze(-1).detach().cpu().tolist()
         vector_preds = {
             source_name: (z @ weight + bias).detach().cpu().tolist()

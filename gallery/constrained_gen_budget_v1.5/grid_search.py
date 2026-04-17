@@ -23,14 +23,18 @@ else:
 
 
 SEARCH_SPACE = {
-    "train.learning_rate": [7e-4],
-    "train.lambda_nce": [0.2],
+    "train.learning_rate": [5e-4, 7e-4],
+    "train.lambda_nce": [0.2, 0.1],
     "train.tau_nce": [0.2],
     "train.beta_end": [0.002],
-    "train.beta_warmup_epochs": [20],
-    "train.order_nce": [True],
-    "train.nce_mu": [True],
+    "train.beta_warmup_epochs": [30],
+    "train.order_nce": [True, False],
+    "train.nce_mu": [False],
     "model.adaln": [True],
+    "train.lambda_cost": [0.01],
+    "train.label_smoothing": [0.1, 0.05],
+    "train.latent_walk_top_k": [1],
+    "train.cost_ridge_vec": [True],
     # "train.cobo_sample_weighting": [True],
     # "train.cobo_weight_sigma": [1.0, 1.5],
 }

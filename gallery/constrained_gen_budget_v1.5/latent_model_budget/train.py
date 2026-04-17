@@ -367,6 +367,9 @@ def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
         name += "_adaln"
     if bool(getattr(config.train, "cobo_sample_weighting", False)):
         name += f"_w{config.train.cobo_weight_quantile:.1f}_s{config.train.cobo_weight_sigma:.1f}"
+    ls = float(getattr(config.train, "label_smoothing", 0.0))
+    if ls > 0.0:
+        name += f"_ls{ls}"
     return f"{name}"
 
 
