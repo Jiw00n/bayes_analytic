@@ -15,7 +15,7 @@ from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples, spl
 from .tokenizer import ParamTokenizer
 
 
-_CANDIDATE_MASK_CACHE_VERSION = "v5"
+_CANDIDATE_MASK_CACHE_VERSION = "v6"
 _CANDIDATE_MASK_CACHE_FLUSH_EVERY = 100
 
 
@@ -681,6 +681,17 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 "budget_specs": list(budget_specs),
             }
             order_cache[order_key] = cached_meta
+            # Union the maximal per-variable domain so tokenizer vocab covers
+            # candidate values that no record's gold walk would exercise
+            # (e.g. the factor=1 path when every record has factor>1 in a
+            # split group). Gold-path walks alone can miss div(E) entries.
+            initial_domains = _collect_generator_domain_values(
+                gen, order, include_budget=include_budget
+            )
+            for name, values in initial_domains.items():
+                domain_values_by_name.setdefault(str(name), set()).update(
+                    int(v) for v in values
+                )
         order = list(cached_meta["order"])
         budget_specs = list(cached_meta["budget_specs"])
         _apply_cached_order_metadata(record, order, budget_specs)
@@ -691,11 +702,11 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         prepared_cache[id(record)] = (order, values)
         record_order_keys.append(order_key)
 
-        if idx % 2000 == 0 or idx == len(records):
-            print(
-                f"[dataset] prepared {idx}/{len(records)} record(s); "
-                f"unique_orders={len(order_cache)}"
-            )
+        # if idx % 2000 == 0 or idx == len(records):
+        #     print(
+        #         f"[dataset] prepared {idx}/{len(records)} record(s); "
+        #         f"unique_orders={len(order_cache)}"
+        #     )
 
     # Try to short-circuit the propagation walk by loading cached outputs from
     # prior runs (step candidates + validity + domain_values per workload).
