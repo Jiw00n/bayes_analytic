@@ -134,6 +134,7 @@ class ScheduleGenerator:
         self.domain_propagator = DomainPropagator(self)
         self.param_sampler = ParamSampler(self)
         self._inspector = _ScheduleGeneratorInspector(self)
+        self._vectorize_split_step_indices = self._find_vectorize_split_step_indices()
 
         self.constraint_set.preprocess()
 
@@ -247,6 +248,21 @@ class ScheduleGenerator:
         self._concrete_final_cache[cache_key] = dict(result)
         return result
 
+
+    def _find_vectorize_split_step_indices(self):
+        """SplitStep 바로 뒤에 vectorize AnnotationStep이 오는 step index 집합을 반환한다."""
+        indices = set()
+        if self.s._state is None:
+            return indices
+        steps = self.s._state.transform_steps
+        for i in range(len(steps) - 1):
+            s = steps[i]
+            ns = steps[i + 1]
+            if (s.type_key.split(".")[-1] == "SplitStep"
+                    and ns.type_key.split(".")[-1] == "AnnotationStep"
+                    and int(ns.annotation) == 2):
+                indices.add(i)
+        return indices
 
     def _build_split_domains(self):
         """모든 split 변수의 초기 도메인 사전을 만든다."""
@@ -529,13 +545,19 @@ class ScheduleGenerator:
             raise ValueError("params_to_state requires concrete integer sp_/ur_ values")
 
         from .concrete_gpu_verify import params_to_state_from_record, params_to_state_from_state
+        split_extents = self._build_dynamic_split_extents(normalized)
+        # Vectorize split steps have a dynamic extent that depends on
+        # upstream factors; set their extent to 1 so TVM does not
+        # misinterpret the factor relative to a stale base-record extent.
+        for si in self._vectorize_split_step_indices:
+            split_extents[si] = 1
         if self._base_input is not None and self._base_result is not None:
             return params_to_state_from_record(
                 self._task,
                 self._base_input,
                 self._base_result,
                 normalized,
-                split_extents=None,
+                split_extents=split_extents,
             )
         split_extents = self._build_dynamic_split_extents(normalized)
         if self._base_state is not None:

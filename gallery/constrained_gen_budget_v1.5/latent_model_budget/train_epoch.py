@@ -23,6 +23,7 @@ from .train_eval import (
 )
 from .train_losses import (
     beta_by_epoch,
+    compute_cobo_sample_weights,
     kl_divergence,
     latent_use_margin_loss,
     masked_cross_entropy,
@@ -95,15 +96,25 @@ def train_one_epoch(
                 batch["decoder_var_ids"],
                 pad_token_id=tokenizer.pad_id,
             )
+            # CoBO-style sample weighting
+            cobo_sw = None
+            if getattr(cfg.train, "cobo_sample_weighting", False):
+                cobo_sw = compute_cobo_sample_weights(
+                    batch["costs"],
+                    batch["cost_mask"],
+                    quantile=float(getattr(cfg.train, "cobo_weight_quantile", 0.95)),
+                    sigma=float(getattr(cfg.train, "cobo_weight_sigma", 0.1)),
+                )
             recon_loss = masked_cross_entropy(
                 out.logits,
                 batch["target_ids"],
                 candidate_masks,
                 tokenizer.pad_id,
                 position_weights=position_weights,
+                sample_weights=cobo_sw,
             )
             kl_loss = kl_divergence(out.mu, out.logvar)
-            cost_loss = weighted_cost_loss(out.cost_pred, batch["costs"], batch["cost_mask"])
+            cost_loss = weighted_cost_loss(out.cost_pred, batch["costs"], batch["cost_mask"], sample_weights=cobo_sw)
             latent_use_loss, latent_use_rank_loss, latent_use_top1_drop_loss = latent_use_margin_loss(
                 model,
                 out.logits,
@@ -124,9 +135,9 @@ def train_one_epoch(
             else:
                 nce_z = out.z
             if cfg.train.order_nce:
-                nce_loss = ordered_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce)
+                nce_loss = ordered_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce, sample_weights=cobo_sw)
             else:
-                nce_loss = soft_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce)
+                nce_loss = soft_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce, sample_weights=cobo_sw)
             loss = (
                 recon_loss
                 + beta * kl_loss

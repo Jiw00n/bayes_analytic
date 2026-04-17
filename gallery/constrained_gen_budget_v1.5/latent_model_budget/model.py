@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -251,9 +252,12 @@ class LatentParamVAE(nn.Module):
         self.cost_head = nn.Sequential(
             nn.Linear(cfg.latent_dim, cfg.dim_feedforward),
             nn.GELU(),
-            nn.Linear(cfg.dim_feedforward, 1),
+            nn.Linear(cfg.latent_dim, 1),
         )
-        # self.cost_head = nn.Parameter(torch.randn(cfg.latent_dim))
+        # self.cost_w = nn.Parameter(torch.randn(cfg.latent_dim) * 0.02)
+        # self.cost_bias = nn.Parameter(torch.zeros(()))
+        # self.cost_gamma = nn.Parameter(torch.zeros(()))
+        # self.cost_head = self.predict_cost
 
         self.lm_head = nn.Linear(d_model, vocab_size)
 
@@ -289,6 +293,62 @@ class LatentParamVAE(nn.Module):
         z = mu if deterministic else self.reparameterize(mu, logvar)
         memory = self.latent_to_memory(z).view(z.size(0), self.cfg.latent_token_count, self.cfg.d_model)
         return mu, logvar, z, memory
+
+
+    def decode(
+        self,
+        decoder_input_ids: torch.Tensor,
+        decoder_var_ids: torch.Tensor,
+        memory: torch.Tensor,
+        latent_cond: torch.Tensor,
+        decoder_pad_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        y = self._embed(decoder_input_ids, decoder_var_ids)
+        seq_len = y.size(1)
+        causal_mask = self._causal_mask(seq_len, y.device)
+        dec = self.decoder(
+            tgt=y,
+            memory=memory,
+            latent_cond=latent_cond,
+            tgt_mask=causal_mask,
+            tgt_key_padding_mask=decoder_pad_mask,
+        )
+        return self.lm_head(dec)
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def predict_cost(self, z: torch.Tensor) -> torch.Tensor:
+        gamma = F.softplus(self.cost_gamma) + 1e-6
+        w = self.cost_w / (self.cost_w.norm() + 1e-12)
+        score = gamma * (z @ w) + self.cost_bias
+        return score
+
+    def forward(
+        self,
+        encoder_token_ids: torch.Tensor,
+        encoder_var_ids: torch.Tensor,
+        decoder_input_ids: torch.Tensor,
+        decoder_var_ids: torch.Tensor,
+        pad_token_id: int,
+    ) -> ModelOutput:
+        enc_pad = encoder_token_ids.eq(pad_token_id)
+        dec_pad = decoder_input_ids.eq(pad_token_id)
+        mu, logvar, z, memory = self.encode(encoder_token_ids, encoder_var_ids, enc_pad)
+        logits = self.decode(decoder_input_ids, decoder_var_ids, memory, z, dec_pad)
+        cost_pred = self.cost_head(mu)
+        return ModelOutput(
+            logits=logits,
+            mu=mu,
+            logvar=logvar,
+            z=z,
+            memory=memory,
+            cost_pred=cost_pred,
+        )
+
 
     # cls token prepend + transformer pooling
     # def encode(
@@ -328,51 +388,3 @@ class LatentParamVAE(nn.Module):
     #     memory = self.latent_to_memory(z).view(z.size(0), self.cfg.latent_token_count, self.cfg.d_model)
     #     return mu, logvar, z, memory
 
-
-    def decode(
-        self,
-        decoder_input_ids: torch.Tensor,
-        decoder_var_ids: torch.Tensor,
-        memory: torch.Tensor,
-        latent_cond: torch.Tensor,
-        decoder_pad_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        y = self._embed(decoder_input_ids, decoder_var_ids)
-        seq_len = y.size(1)
-        causal_mask = self._causal_mask(seq_len, y.device)
-        dec = self.decoder(
-            tgt=y,
-            memory=memory,
-            latent_cond=latent_cond,
-            tgt_mask=causal_mask,
-            tgt_key_padding_mask=decoder_pad_mask,
-        )
-        return self.lm_head(dec)
-
-    @staticmethod
-    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(
-        self,
-        encoder_token_ids: torch.Tensor,
-        encoder_var_ids: torch.Tensor,
-        decoder_input_ids: torch.Tensor,
-        decoder_var_ids: torch.Tensor,
-        pad_token_id: int,
-    ) -> ModelOutput:
-        enc_pad = encoder_token_ids.eq(pad_token_id)
-        dec_pad = decoder_input_ids.eq(pad_token_id)
-        mu, logvar, z, memory = self.encode(encoder_token_ids, encoder_var_ids, enc_pad)
-        logits = self.decode(decoder_input_ids, decoder_var_ids, memory, z, dec_pad)
-        cost_pred = self.cost_head(z).squeeze(-1)
-        return ModelOutput(
-            logits=logits,
-            mu=mu,
-            logvar=logvar,
-            z=z,
-            memory=memory,
-            cost_pred=cost_pred,
-        )

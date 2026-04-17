@@ -15,7 +15,7 @@ from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples, spl
 from .tokenizer import ParamTokenizer
 
 
-_CANDIDATE_MASK_CACHE_VERSION = "v6"
+_CANDIDATE_MASK_CACHE_VERSION = "v7"
 _CANDIDATE_MASK_CACHE_FLUSH_EVERY = 100
 
 
@@ -676,22 +676,37 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             gen = _get_generator_for_record(record, registry)
             order = get_model_param_order(gen, include_budget=include_budget)
             budget_specs = _extract_budget_specs(gen)
+            # Split steps followed by a vectorize annotation have a dynamic
+            # extent that varies per record.  Divisor-based domain computation
+            # is meaningless for them; instead we collect every gold value
+            # from the dataset.
+            _vec_step_indices = gen._vectorize_split_step_indices
+            dynamic_sp_names = set()
+            for _name in order:
+                if _name.startswith("sp_"):
+                    _step_idx = int(_name.split("_")[1])
+                    if _step_idx in _vec_step_indices:
+                        dynamic_sp_names.add(_name)
             cached_meta = {
                 "order": list(order),
                 "budget_specs": list(budget_specs),
+                "dynamic_sp_names": dynamic_sp_names,
             }
             order_cache[order_key] = cached_meta
             # Union the maximal per-variable domain so tokenizer vocab covers
             # candidate values that no record's gold walk would exercise
             # (e.g. the factor=1 path when every record has factor>1 in a
             # split group). Gold-path walks alone can miss div(E) entries.
+            # Dynamic-extent names are excluded — they are handled below
+            # by collecting gold values directly.
             initial_domains = _collect_generator_domain_values(
                 gen, order, include_budget=include_budget
             )
             for name, values in initial_domains.items():
-                domain_values_by_name.setdefault(str(name), set()).update(
-                    int(v) for v in values
-                )
+                if name not in dynamic_sp_names:
+                    domain_values_by_name.setdefault(str(name), set()).update(
+                        int(v) for v in values
+                    )
         order = list(cached_meta["order"])
         budget_specs = list(cached_meta["budget_specs"])
         _apply_cached_order_metadata(record, order, budget_specs)
@@ -701,6 +716,13 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         values = [int(record.params[name]) for name in order]
         prepared_cache[id(record)] = (order, values)
         record_order_keys.append(order_key)
+        # For dynamic-extent split names, union the gold value from every
+        # record so the tokenizer vocab covers all observed factor values.
+        for dyn_name in cached_meta.get("dynamic_sp_names", ()):
+            if dyn_name in record.params:
+                domain_values_by_name.setdefault(str(dyn_name), set()).add(
+                    int(record.params[dyn_name])
+                )
 
         # if idx % 2000 == 0 or idx == len(records):
         #     print(

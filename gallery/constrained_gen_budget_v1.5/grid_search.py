@@ -23,14 +23,16 @@ else:
 
 
 SEARCH_SPACE = {
-    "train.learning_rate": [5e-4, 7e-4],
-    "train.lambda_nce": [0.1, 0.2],
+    "train.learning_rate": [7e-4],
+    "train.lambda_nce": [0.2],
     "train.tau_nce": [0.2],
-    "train.beta_end": [0.002, 0.003],
-    "train.beta_warmup_epochs": [10, 20],
-    "train.order_nce": [False],
-    "train.nce_mu": [False, True],
-    "model.adaln": [False, True],
+    "train.beta_end": [0.002],
+    "train.beta_warmup_epochs": [20],
+    "train.order_nce": [True],
+    "train.nce_mu": [True],
+    "model.adaln": [True],
+    # "train.cobo_sample_weighting": [True],
+    # "train.cobo_weight_sigma": [1.0, 1.5],
 }
 
 BEST_METRIC = "val_full_sequence_exact_match"

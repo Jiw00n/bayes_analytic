@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -13,6 +15,37 @@ def beta_by_epoch(cfg, epoch: int) -> float:
     return float(cfg.beta_start + (cfg.beta_end - cfg.beta_start) * progress)
 
 
+def compute_cobo_sample_weights(
+    costs: torch.Tensor,
+    cost_mask: torch.Tensor,
+    quantile: float = 0.95,
+    sigma: float = 0.5,
+) -> torch.Tensor:
+    """CoBO-style CDF weighting: λ(y) = Φ((y − y_q) / σ_abs).
+
+    Higher cost (= faster kernel) gets weight closer to 1,
+    lower cost gets weight closer to 0.
+
+    ``sigma`` is a multiplier of the cost standard deviation, so the
+    transition smoothness adapts to the actual cost distribution.
+    Samples without valid cost receive a neutral weight of 1.
+    """
+    valid_costs = costs[cost_mask]
+    if valid_costs.numel() < 2:
+        return torch.ones_like(costs)
+    y_q = torch.quantile(valid_costs.float(), float(quantile))
+    sigma_abs = valid_costs.float().std().clamp_min(1e-6) * max(float(sigma), 1e-8)
+    z_scores = (costs - y_q) / sigma_abs
+    weights = 0.5 * (1.0 + torch.erf(z_scores / math.sqrt(2.0)))
+    weights = weights.clamp(min=0.01)
+    # normalise so valid weights average to 1 (keep loss scale stable)
+    valid_mean = weights[cost_mask].mean().clamp_min(1e-8)
+    weights = weights / valid_mean
+    # invalid-cost samples → neutral weight 1
+    weights = torch.where(cost_mask, weights, torch.ones_like(weights))
+    return weights.detach()
+
+
 def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return 0.5 * torch.mean(torch.sum(torch.exp(logvar) + mu * mu - 1.0 - logvar, dim=-1))
 
@@ -23,6 +56,7 @@ def masked_cross_entropy(
     candidate_masks: torch.Tensor,
     pad_id: int,
     position_weights: torch.Tensor | None = None,
+    sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     masked_logits = logits.masked_fill(~candidate_masks, float("-inf"))
     token_losses = F.cross_entropy(
@@ -34,13 +68,25 @@ def masked_cross_entropy(
     valid_mask = targets.ne(pad_id)
     if position_weights is None:
         position_weights = torch.ones_like(token_losses)
+    if sample_weights is not None:
+        # sample_weights: [B] → [B, 1] broadcast over sequence length
+        position_weights = position_weights * sample_weights.unsqueeze(1)
     weighted_mask = position_weights * valid_mask.to(dtype=token_losses.dtype)
     return (token_losses * weighted_mask).sum() / weighted_mask.sum().clamp_min(1.0)
 
 
-def weighted_cost_loss(cost_pred: torch.Tensor, costs: torch.Tensor, cost_mask: torch.Tensor) -> torch.Tensor:
+def weighted_cost_loss(
+    cost_pred: torch.Tensor,
+    costs: torch.Tensor,
+    cost_mask: torch.Tensor,
+    sample_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     if not cost_mask.any():
         return cost_pred.new_tensor(0.0)
+    if sample_weights is not None:
+        sq_err = (cost_pred[cost_mask] - costs[cost_mask]) ** 2
+        sw = sample_weights[cost_mask]
+        return (sq_err * sw).sum() / sw.sum().clamp_min(1e-8)
     return F.mse_loss(cost_pred[cost_mask], costs[cost_mask])
 
 
@@ -145,10 +191,20 @@ def latent_use_margin_loss(
     return total_loss, rank_margin_loss, top1_drop_loss
 
 
-def soft_infonce_loss(z: torch.Tensor, costs: torch.Tensor, cost_mask: torch.Tensor, tau: float) -> torch.Tensor:
+def soft_infonce_loss(
+    z: torch.Tensor,
+    costs: torch.Tensor,
+    cost_mask: torch.Tensor,
+    tau: float,
+    sample_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     valid_idx = torch.nonzero(cost_mask, as_tuple=False).flatten()
     if valid_idx.numel() < 2:
         return z.new_tensor(0.0)
+
+    sw = None
+    if sample_weights is not None:
+        sw = sample_weights[valid_idx]
 
     z = F.normalize(z[valid_idx], dim=-1)
     y = costs[valid_idx]
@@ -163,8 +219,10 @@ def soft_infonce_loss(z: torch.Tensor, costs: torch.Tensor, cost_mask: torch.Ten
 
     log_probs = F.log_softmax(sim.masked_fill(eye, float("-inf")), dim=-1)
     log_probs = log_probs.masked_fill(eye, 0.0)
-    loss = -(weights * log_probs).sum(dim=-1).mean()
-    return loss
+    per_anchor = -(weights * log_probs).sum(dim=-1)
+    if sw is not None:
+        return (per_anchor * sw).sum() / sw.sum().clamp_min(1e-8)
+    return per_anchor.mean()
 
 
 def ordered_infonce_loss(
@@ -173,10 +231,15 @@ def ordered_infonce_loss(
     cost_mask: torch.Tensor,
     tau: float,
     eps: float = 1e-12,
+    sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     valid_idx = torch.nonzero(cost_mask, as_tuple=False).flatten()
     if valid_idx.numel() < 2:
         return z.new_tensor(0.0)
+
+    sw = None
+    if sample_weights is not None:
+        sw = sample_weights[valid_idx]
 
     z = z[valid_idx]
     cost = costs[valid_idx]
@@ -206,4 +269,7 @@ def ordered_infonce_loss(
         return z.sum() * 0.0
 
     loss = -(num - den)
+    if sw is not None:
+        sw_valid = sw[valid]
+        return (loss[valid] * sw_valid).sum() / sw_valid.sum().clamp_min(1e-8)
     return loss[valid].mean()

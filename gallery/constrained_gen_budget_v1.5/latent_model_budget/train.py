@@ -227,6 +227,7 @@ def _run_periodic_latent_walk(
     top_k: int = 1,
     num_steps: int = 8,
     step_size: float = 0.25,
+    use_cost_head: bool = False,
 ) -> Dict[str, float]:
     """Run the tune.sh-equivalent latent walk against ``checkpoint_path``.
 
@@ -283,6 +284,7 @@ def _run_periodic_latent_walk(
                     output=str(rank_output_dir),
                     num_steps=int(num_steps),
                     step_size=float(step_size),
+                    use_cost_head=bool(use_cost_head),
                     deterministic_start=True,
                     preselected_record=ref_record,
                 ) or []
@@ -363,6 +365,8 @@ def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
         name += "_nce_mu"
     if bool(config.model.adaln):
         name += "_adaln"
+    if bool(getattr(config.train, "cobo_sample_weighting", False)):
+        name += f"_w{config.train.cobo_weight_quantile:.1f}_s{config.train.cobo_weight_sigma:.1f}"
     return f"{name}"
 
 
@@ -634,6 +638,7 @@ def train_main(config) -> Dict[str, float]:
     latent_walk_top_k = int(getattr(config.train, "latent_walk_top_k", 1) or 1)
     latent_walk_num_steps = int(getattr(config.train, "latent_walk_num_steps", 8) or 8)
     latent_walk_step_size = float(getattr(config.train, "latent_walk_step_size", 0.25) or 0.25)
+    latent_walk_use_cost_head = not bool(getattr(config.train, "cost_ridge_vec", False))
     latent_walk_record_json = _resolve_walk_record_json(config)
     latent_walk_output_dir = (
         getattr(config.train, "latent_walk_output_dir", None)
@@ -780,6 +785,7 @@ def train_main(config) -> Dict[str, float]:
                 top_k=latent_walk_top_k,
                 num_steps=latent_walk_num_steps,
                 step_size=latent_walk_step_size,
+                use_cost_head=latent_walk_use_cost_head,
             )
             if walk_summary:
                 summary.update(walk_summary)
@@ -839,6 +845,7 @@ def train_main(config) -> Dict[str, float]:
             top_k=latent_walk_top_k,
             num_steps=latent_walk_num_steps,
             step_size=latent_walk_step_size,
+            use_cost_head=latent_walk_use_cost_head,
         )
         if final_walk_summary:
             final_metrics.update(

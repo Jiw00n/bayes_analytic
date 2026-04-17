@@ -280,9 +280,9 @@ def log_grouped_candidate_result(grouped_record: Dict[str, Any]) -> None:
     mean_cost = measurement.get("mean_cost")
     mean_cost_text = "n/a" if mean_cost is None else f"{mean_cost:.4f}"
     print(
-        f"[latent-walk] alphas={alpha_text} pred_mean={pred_mean_text} "
-        f"mean_cost={mean_cost_text} "
-        f"log={measurement.get('measure_record_path')}"
+        f"[latent-walk] alphas={alpha_text}\n"
+        f"mean_cost={mean_cost_text}\n"
+        f"pred_mean={pred_mean_text}\n"
     )
 
 
@@ -473,6 +473,7 @@ def load_bundle(
     *,
     network_info_folder: Optional[str] = None,
     device: str = "cuda",
+    use_cost_head: bool = False,
     use_latent_gradient: bool = False,
 ) -> LoadedBundle:
     checkpoint_path = Path(checkpoint_path)
@@ -495,7 +496,9 @@ def load_bundle(
     cost_weight = None
     cost_bias = 0.0
     cost_source = "missing_cost_vector"
-    if latent_cost_ridge is not None and "weight" in latent_cost_ridge:
+    if use_cost_head:
+        cost_source = "cost_head"
+    elif latent_cost_ridge is not None and "weight" in latent_cost_ridge:
         cost_weight = latent_cost_ridge["weight"].detach().to(
             dtype=torch.float32,
             device=torch_device,
@@ -855,26 +858,49 @@ def make_shifted_zs(
 
 
 
+def _get_cost_head_linear_layer(model: LatentParamVAE) -> Optional[torch.nn.Linear]:
+    cost_head = model.cost_head
+    if isinstance(cost_head, torch.nn.Linear):
+        return cost_head
+    if isinstance(cost_head, torch.nn.Sequential) and len(cost_head) == 1:
+        first = cost_head[0]
+        if isinstance(first, torch.nn.Linear):
+            return first
+    return None
+
+
+def _compute_cost_head_gradient(bundle: LoadedBundle, z0: torch.Tensor) -> torch.Tensor:
+    z = z0.detach().to(device=bundle.device, dtype=torch.float32).view(1, -1).requires_grad_(True)
+    cost_pred = bundle.model.cost_head(z).sum()
+    grad = torch.autograd.grad(cost_pred, z, retain_graph=False, create_graph=False)[0]
+    return grad[0].detach().to(device=z0.device, dtype=torch.float32)
+
+
 def predict_score(bundle: LoadedBundle, z: torch.Tensor) -> float:
-    if bundle.cost_source == "cost_head_gradient":
+    if bundle.cost_source in {"cost_head", "cost_head_gradient"}:
         z = z.to(device=bundle.device, dtype=torch.float32).view(1, -1)
         return float(bundle.model.cost_head(z).squeeze(-1).item())
     if bundle.cost_weight is None:
-        raise RuntimeError("No stored cost vector in checkpoint. Re-run with --latent-gradient.")
+        raise RuntimeError(
+            "No stored cost vector in checkpoint. Re-run with --cost-head or --latent-gradient."
+        )
     z = z.to(device=bundle.device, dtype=torch.float32)
     return float((z @ bundle.cost_weight + bundle.cost_bias).item())
 
 
 def compute_walk_direction(bundle: LoadedBundle, z0: torch.Tensor) -> torch.Tensor:
-    if bundle.cost_source == "missing_cost_vector":
-        raise RuntimeError("No stored cost vector in checkpoint. Re-run with --latent-gradient.")
     if bundle.cost_weight is not None:
         return bundle.cost_weight.detach().to(dtype=torch.float32, device=z0.device)
-
-    z = z0.detach().to(device=bundle.device, dtype=torch.float32).view(1, -1).requires_grad_(True)
-    cost_pred = bundle.model.cost_head(z).sum()
-    grad = torch.autograd.grad(cost_pred, z, retain_graph=False, create_graph=False)[0]
-    return grad[0].detach().to(device=z0.device, dtype=torch.float32)
+    if bundle.cost_source == "cost_head":
+        linear_layer = _get_cost_head_linear_layer(bundle.model)
+        if linear_layer is not None:
+            return linear_layer.weight[0].detach().to(dtype=torch.float32, device=z0.device)
+        return _compute_cost_head_gradient(bundle, z0)
+    if bundle.cost_source == "cost_head_gradient":
+        return _compute_cost_head_gradient(bundle, z0)
+    raise RuntimeError(
+        "No stored cost vector in checkpoint. Re-run with --cost-head or --latent-gradient."
+    )
 
 
 
@@ -1114,6 +1140,7 @@ def run_latent_walk(
     seed: Optional[int] = None,
     best_cost: bool = False,
     output: Optional[str | Path] = None,
+    use_cost_head: bool = False,
     latent_gradient: bool = False,
     deterministic_start: bool = False,
     preselected_record: Optional[JsonSampleRecord] = None,
@@ -1127,10 +1154,11 @@ def run_latent_walk(
         checkpoint_path,
         network_info_folder=network_info_folder,
         device=device,
+        use_cost_head=use_cost_head,
         use_latent_gradient=latent_gradient,
     )
     if bundle.cost_source == "missing_cost_vector":
-        print("[latent-walk] checkpoint에 저장된 cost vector가 없습니다.")
+        print("[latent-walk] checkpoint에 저장된 cost vector가 없습니다. --cost-head 옵션을 사용하세요.")
         return []
     if preselected_record is not None:
         record = preselected_record
@@ -1195,6 +1223,11 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="If --record-json contains multiple records, start from the one with the best recorded cost",
     )
     p.add_argument("--output", type=str, default=None)
+    p.add_argument(
+        "--cost-head",
+        action="store_true",
+        help="Use model.cost_head for score prediction and walk direction instead of latent_cost_ridge",
+    )
     p.add_argument("--latent-gradient", action="store_true")
     p.add_argument(
         "--deterministic",
@@ -1219,6 +1252,7 @@ def main() -> List[WalkRecord]:
         seed=args.seed,
         best_cost=bool(args.best_cost),
         output=args.output,
+        use_cost_head=bool(args.cost_head),
         latent_gradient=args.latent_gradient,
         deterministic_start=bool(args.deterministic),
     )
