@@ -339,7 +339,7 @@ class LatentParamVAE(nn.Module):
         dec_pad = decoder_input_ids.eq(pad_token_id)
         mu, logvar, z, memory = self.encode(encoder_token_ids, encoder_var_ids, enc_pad)
         logits = self.decode(decoder_input_ids, decoder_var_ids, memory, z, dec_pad)
-        cost_pred = self.cost_head(mu)
+        cost_pred = self.cost_head(z).squeeze(-1)
         return ModelOutput(
             logits=logits,
             mu=mu,

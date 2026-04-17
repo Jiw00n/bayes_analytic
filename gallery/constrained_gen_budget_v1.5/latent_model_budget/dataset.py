@@ -844,6 +844,26 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 f"walked_positions={walked_positions})"
             )
 
+    # For vectorize split steps, replace per-record oracle candidates with
+    # the full domain so the candidate mask is unrestricted.
+    for i, record in enumerate(records):
+        step_cands = record_step_candidates_by_sample_id.get(record.sample_id)
+        if step_cands is None:
+            continue
+        order_key = record_order_keys[i]
+        meta = order_cache.get(order_key)
+        if meta is None:
+            continue
+        dyn_names = meta.get("dynamic_sp_names", set())
+        if not dyn_names:
+            continue
+        order = meta["order"]
+        for pos, name in enumerate(order):
+            if name in dyn_names and pos < len(step_cands):
+                full_domain = sorted(domain_values_by_name.get(name, set()))
+                if full_domain:
+                    step_cands[pos] = full_domain
+
     valid_records = list(records)
     if getattr(config.data, "filter_invalid_records", False):
         print("[dataset] filtering invalid records (gold not in oracle candidates)")

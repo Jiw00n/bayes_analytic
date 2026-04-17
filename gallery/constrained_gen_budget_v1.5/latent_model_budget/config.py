@@ -106,7 +106,7 @@ class EvalConfig:
 @dataclass
 class WandbConfig:
     # project: Optional[str] = "V1.5_grid_search"
-    project: Optional[str] = "V1.5_no_dyn_extent"
+    project: Optional[str] = "V1.5_vt_v_constraints"
 
 
 @dataclass
