@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import gc
 import json
-import sys
 from pathlib import Path
+import sys
 import time
 from typing import Dict, Optional
 
@@ -14,7 +13,7 @@ try:
 except Exception:  # pragma: no cover
     wandb = None
 
-from .adapter import GeneratorRegistry
+from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples
 from .dataset import DatasetBundle, build_dataset_bundle
 from .inference import greedy_decode_sample, pretty_print_reconstruction
 from .model import LatentParamVAE
@@ -27,6 +26,7 @@ from .runtime_utils import (
     save_training_artifacts,
     seed_everything,
 )
+from .recon_predict_gp import fit_gp_recon_predictor
 from .tokenizer import ParamTokenizer
 from .train_epoch import train_one_epoch
 from .train_eval import (
@@ -41,12 +41,7 @@ from .train_eval import (
 
 
 def _wandb_section(key: str) -> str:
-    """Group metric keys into wandb sections (train/, val/, walk/, ...).
-
-    wandb groups panels on the Charts page by the prefix before the first '/'.
-    Training-phase metrics like ``loss``/``recon_loss`` come from
-    ``train_one_epoch`` without any prefix, so we route them to ``train/``.
-    """
+    """Group metric keys into wandb sections (train/, val/, walk/, ...)."""
     if "/" in key:
         return key
     if key == "epoch":
@@ -70,8 +65,6 @@ def _remap_for_wandb(metrics: Dict) -> Dict:
 
 
 def _resolve_walk_record_json(config) -> Optional[str]:
-    """Pick the record JSON used for the periodic latent walk. Fall back to the
-    first data.json_paths entry when the dedicated field is unset."""
     explicit = getattr(config.train, "latent_walk_record_json", None)
     if explicit:
         return str(explicit)
@@ -79,18 +72,31 @@ def _resolve_walk_record_json(config) -> Optional[str]:
     return str(json_paths[0]) if json_paths else None
 
 
+def _select_topk_records_from_path(
+    record_json_path: str | Path,
+    *,
+    k: int,
+) -> list[JsonSampleRecord]:
+    if k <= 0:
+        return []
+    records = load_json_samples(record_json_path)
+    if not records:
+        return []
+    records_with_cost = [
+        record for record in records
+        if record.cost is not None and torch.isfinite(torch.tensor(float(record.cost)))
+    ]
+    if not records_with_cost:
+        return []
+    records_with_cost.sort(key=lambda record: float(record.cost), reverse=True)
+    return records_with_cost[: int(k)]
+
+
 def _summarize_walk_records(
     records,
     *,
     reference_params: Optional[Dict[str, int]] = None,
 ) -> Dict[str, float]:
-    """Reduce a list of WalkRecord into scalar metrics for wandb logging.
-
-    ``mean_cost`` and ``predicted_score`` are both ``-log(latency)``, so higher
-    is better (faster kernel). ``best_measured_mean_cost`` excludes the
-    trivial alpha=0 step and any step whose decoded params match
-    ``reference_params`` (walk did not move away from the starting point).
-    """
     summary: Dict[str, float] = {}
     if not records:
         return summary
@@ -115,19 +121,25 @@ def _summarize_walk_records(
         summary["walk/best_predicted_cost"] = float(max(pred_costs))
         summary["walk/mean_predicted_cost"] = float(sum(pred_costs) / len(pred_costs))
 
-    measured_all: list[tuple[float, float]] = []
+    recon_costs = [
+        float(r.recon_predict_cost) for r in records
+        if getattr(r, "recon_predict_cost", None) is not None
+    ]
+    if recon_costs:
+        summary["walk/best_recon_predict_cost"] = float(max(recon_costs))
+        summary["walk/mean_recon_predict_cost"] = float(sum(recon_costs) / len(recon_costs))
+
     measured_novel: list[tuple[float, float]] = []
     true_cost_at_alpha0: Optional[float] = None
-    for r in records:
-        meas = r.measurement or {}
+    for record in records:
+        meas = record.measurement or {}
         if meas.get("ok") and meas.get("usable_measurement"):
-            mc = meas.get("mean_cost")
-            if mc is not None:
-                entry = (float(r.alpha), float(mc))
-                measured_all.append(entry)
-                if abs(entry[0]) >= 1e-12 and not _is_reference(r.params):
+            mean_cost = meas.get("mean_cost")
+            if mean_cost is not None:
+                entry = (float(record.alpha), float(mean_cost))
+                if abs(entry[0]) >= 1e-12 and not _is_reference(record.params):
                     measured_novel.append(entry)
-        if abs(float(r.alpha)) < 1e-12:
+        if abs(float(record.alpha)) < 1e-12:
             true_mc = meas.get("true_mean_cost") if meas else None
             if true_mc is not None:
                 true_cost_at_alpha0 = float(true_mc)
@@ -144,24 +156,13 @@ def _summarize_walk_records(
     return summary
 
 
-def _merge_walk_summaries(summaries: list) -> Dict[str, float]:
-    """Aggregate per-rank walk summaries into a single dict for wandb.
-
-    - ``best_*`` costs take the max across ranks (higher ``-log(latency)`` = faster).
-    - ``alpha_at_best`` is carried from whichever rank produced the overall best
-      ``best_measured_mean_cost``.
-    - Count metrics sum across ranks.
-    - ``mean_predicted_cost`` is re-averaged by ``num_steps`` so the aggregate
-      reflects all steps equally regardless of rank.
-    """
+def _merge_walk_summaries(summaries: list[Dict[str, float]]) -> Dict[str, float]:
     merged: Dict[str, float] = {}
     if not summaries:
         return merged
 
     num_records = 0
     total_steps = 0.0
-    total_usable = 0.0
-    total_novel = 0.0
     total_unique_sym = 0.0
     pred_weighted_sum = 0.0
     pred_weight = 0.0
@@ -169,29 +170,45 @@ def _merge_walk_summaries(summaries: list) -> Dict[str, float]:
     best_measured: Optional[float] = None
     best_measured_alpha: Optional[float] = None
     best_true_alpha0: Optional[float] = None
+    recon_weighted_sum = 0.0
+    recon_weight = 0.0
+    best_recon: Optional[float] = None
 
-    for s in summaries:
-        if not s:
+    for summary in summaries:
+        if not summary:
             continue
         num_records += 1
-        n_steps = float(s.get("walk/num_steps", 0.0))
+        n_steps = float(summary.get("walk/num_steps", 0.0))
         total_steps += n_steps
-        total_unique_sym += float(s.get("walk/num_unique_sym_map", 0.0))
-        mp = s.get("walk/mean_predicted_cost")
-        if mp is not None and n_steps > 0:
-            pred_weighted_sum += float(mp) * n_steps
+        total_unique_sym += float(summary.get("walk/num_unique_sym_map", 0.0))
+        mean_pred = summary.get("walk/mean_predicted_cost")
+        if mean_pred is not None and n_steps > 0:
+            pred_weighted_sum += float(mean_pred) * n_steps
             pred_weight += n_steps
-        bp = s.get("walk/best_predicted_cost")
-        if bp is not None and (best_pred is None or bp > best_pred):
-            best_pred = float(bp)
-        bm = s.get("walk/best_measured_mean_cost")
-        if bm is not None and (best_measured is None or bm > best_measured):
-            best_measured = float(bm)
-            ab = s.get("walk/alpha_at_best")
-            best_measured_alpha = float(ab) if ab is not None else None
-        ta0 = s.get("walk/true_cost_at_alpha0")
-        if ta0 is not None and (best_true_alpha0 is None or ta0 > best_true_alpha0):
-            best_true_alpha0 = float(ta0)
+        best_predicted = summary.get("walk/best_predicted_cost")
+        if best_predicted is not None and (best_pred is None or best_predicted > best_pred):
+            best_pred = float(best_predicted)
+        best_measured_summary = summary.get("walk/best_measured_mean_cost")
+        if best_measured_summary is not None and (
+            best_measured is None or best_measured_summary > best_measured
+        ):
+            best_measured = float(best_measured_summary)
+            alpha_at_best = summary.get("walk/alpha_at_best")
+            best_measured_alpha = float(alpha_at_best) if alpha_at_best is not None else None
+        true_alpha0 = summary.get("walk/true_cost_at_alpha0")
+        if true_alpha0 is not None and (
+            best_true_alpha0 is None or true_alpha0 > best_true_alpha0
+        ):
+            best_true_alpha0 = float(true_alpha0)
+        mean_recon = summary.get("walk/mean_recon_predict_cost")
+        if mean_recon is not None and n_steps > 0:
+            recon_weighted_sum += float(mean_recon) * n_steps
+            recon_weight += n_steps
+        best_recon_summary = summary.get("walk/best_recon_predict_cost")
+        if best_recon_summary is not None and (
+            best_recon is None or best_recon_summary > best_recon
+        ):
+            best_recon = float(best_recon_summary)
 
     merged["walk/num_records"] = float(num_records)
     merged["walk/num_steps"] = total_steps
@@ -206,6 +223,10 @@ def _merge_walk_summaries(summaries: list) -> Dict[str, float]:
             merged["walk/alpha_at_best"] = best_measured_alpha
     if best_true_alpha0 is not None:
         merged["walk/true_cost_at_alpha0"] = best_true_alpha0
+    if recon_weight > 0:
+        merged["walk/mean_recon_predict_cost"] = recon_weighted_sum / recon_weight
+    if best_recon is not None:
+        merged["walk/best_recon_predict_cost"] = best_recon
     return merged
 
 
@@ -218,48 +239,56 @@ def _run_periodic_latent_walk(
     walk_output_dir: str,
     network_info_folder: Optional[str],
     epoch_label: str,
+    config,
+    registry,
+    tokenizer,
+    latent_cost_ridge,
+    timestamp: Optional[str] = None,
     top_k: int = 1,
     num_steps: int = 8,
     step_size: float = 0.25,
-    use_cost_head: bool = False,
+    use_latent_gradient: bool = False,
+    include_recon_predict: bool = False,
+    include_measurement: bool = True,
+    recon_predictor=None,
 ) -> Dict[str, float]:
-    """Run the tune.sh-equivalent latent walk against ``checkpoint_path``.
-
-    Training model is moved to CPU for the duration of the walk so the GPU is
-    free both for the walk's own forward passes and for the TVM measurement
-    subprocess, which needs exclusive GPU access for accurate timings. When
-    ``top_k > 1`` the walk is repeated per top-k reference record and the
-    per-rank summaries are merged. Returns summary metrics for wandb logging.
-    """
     here = Path(__file__).resolve().parent.parent
     if str(here) not in sys.path:
         sys.path.insert(0, str(here))
     try:
-        from tune_by_latent import run_latent_walk, _select_topk_records_from_path
+        from tune_by_latent import make_bundle, run_latent_walk
     except Exception as err:  # pragma: no cover
         print(f"[train] latent walk unavailable: {type(err).__name__}: {err}")
         return {}
 
-    try:
-        ref_records = _select_topk_records_from_path(record_json_path, k=max(1, int(top_k)))
-    except Exception as err:  # pragma: no cover
-        print(f"[train] could not resolve reference records: {err}")
-        return {}
+    ref_records = _select_topk_records_from_path(record_json_path, k=max(1, int(top_k)))
     if not ref_records:
+        print(f"[train] no reference records available for latent walk: {record_json_path}")
         return {}
 
     print(
-        f"[train] latent walk ({epoch_label}) using checkpoint={checkpoint_path} "
-        f"top_k={len(ref_records)}"
+        f"[train] latent walk ({epoch_label}) reusing in-memory model "
+        f"(output stem={Path(checkpoint_path).stem}) top_k={len(ref_records)}"
     )
-    model.to("cpu")
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
 
-    walk_device = "cuda" if (device.type == "cuda" and torch.cuda.is_available()) else "cpu"
-    per_rank_summaries: list = []
+    # Reuse in-memory model + cached registry to skip checkpoint round-trip
+    # and GeneratorRegistry rebuild on every walk. The model stays on the
+    # training device — no CPU/GPU shuffling.
+    was_training = model.training
+    model.eval()
+    bundle = make_bundle(
+        model=model,
+        tokenizer=tokenizer,
+        registry=registry,
+        config_payload=config.to_dict(),
+        latent_cost_ridge=latent_cost_ridge,
+        device=device,
+        use_latent_gradient=bool(use_latent_gradient),
+        timestamp=timestamp,
+        recon_predictor=recon_predictor,
+    )
+
+    per_rank_summaries: list[Dict[str, float]] = []
     base_output_dir = Path(walk_output_dir)
     try:
         for rank, ref_record in enumerate(ref_records):
@@ -274,13 +303,17 @@ def _run_periodic_latent_walk(
                     checkpoint_path=str(checkpoint_path),
                     record_json_path=str(record_json_path),
                     network_info_folder=network_info_folder,
-                    device=walk_device,
+                    device=str(device),
                     output=str(rank_output_dir),
                     num_steps=int(num_steps),
                     step_size=float(step_size),
-                    use_cost_head=bool(use_cost_head),
+                    latent_gradient=bool(use_latent_gradient),
                     deterministic_start=True,
                     preselected_record=ref_record,
+                    include_recon_predict=bool(include_recon_predict),
+                    include_measurement=bool(include_measurement),
+                    bundle=bundle,
+                    keep_bundle=True,
                 ) or []
             except Exception as err:  # pragma: no cover
                 print(f"[train] latent walk rank={rank} failed: {type(err).__name__}: {err}")
@@ -289,11 +322,8 @@ def _run_periodic_latent_walk(
                 _summarize_walk_records(walk_records, reference_params=reference_params)
             )
     finally:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-        model.to(device)
+        if was_training:
+            model.train()
 
     combined: Dict[str, float] = {}
     for rank, rank_summary in enumerate(per_rank_summaries):
@@ -365,19 +395,20 @@ def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
         f"_kl{config.train.beta_end}"
         f"_warm{config.train.beta_warmup_epochs}"
     )
+    if config.train.lambda_cost != 0.01:
+        name += f"_cost{config.train.lambda_cost}"
+    name += f"_cdim{config.model.cost_hidden_dim}"
     if bool(config.train.order_nce):
         name += "_order"
     if bool(getattr(config.train, "nce_mu", False)):
         name += "_nce_mu"
     if bool(config.model.adaln):
         name += "_adaln"
-    if bool(getattr(config.train, "cobo_sample_weighting", False)):
-        name += f"_w{config.train.cobo_weight_quantile:.1f}_s{config.train.cobo_weight_sigma:.1f}"
+    if bool(getattr(config.train, "use_compressed_teacher_forcing", False)):
+        name += "_comp"
     ls = float(getattr(config.train, "label_smoothing", 0.0))
     if ls > 0.0:
         name += f"_ls{ls}"
-    if bool(getattr(config.train, "early_param_weight_max", 1.0)) and float(config.train.early_param_weight_max) > 1.0:
-        name += f"_early{config.train.early_param_weight_max:.1f}p{config.train.early_param_weight_power:.1f}"
     return f"{name}"
 
 
@@ -386,7 +417,7 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
         return [], None, {}
 
     ridge_alphas = _resolve_ridge_alphas(config)
-    print(f"[train] fitting latent cost ridge on train split for alphas={ridge_alphas}")
+    # print(f"[train] fitting latent cost ridge on train split for alphas={ridge_alphas}")
     latent_cost_ridges = fit_latent_cost_ridges(
         model,
         bundle.train_dataset,
@@ -415,7 +446,7 @@ def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, devic
     if not bundle.val_dataset.samples:
         return summary
 
-    print(f"[train] evaluating validation split with teacher forcing after epoch {epoch}")
+    # print(f"[train] evaluating validation split with teacher forcing after epoch {epoch}")
     val_tf_metrics = evaluate_teacher_forcing(
         model,
         bundle.val_dataset,
@@ -423,14 +454,15 @@ def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, devic
         tokenizer,
         device,
         batch_size=config.eval.batch_size,
+        use_compressed=bool(getattr(config.train, "use_compressed_teacher_forcing", False)),
     )
     summary.update({f"val_{k}": float(v) for k, v in val_tf_metrics.items()})
     print(
-        f"val_tok_acc={summary['val_token_accuracy']:.4f} "
+        f"[epoch {epoch}] val_tok_acc={summary['val_token_accuracy']:.4f} "
         f"val_exact={summary['val_full_sequence_exact_match']:.4f}"
     )
 
-    print("[train] evaluating validation cost ranking")
+    # print("[train] evaluating validation cost ranking")
     cost_metrics = evaluate_cost_ranking(
         model,
         bundle.val_dataset,
@@ -446,22 +478,26 @@ def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, devic
             f"val_cost_head_actual_top1_pred_rank : {int(cost_metrics['cost_head_actual_top1_pred_rank'])}\n"
             f"val_cost_head_pred_top1_actual_cost : {cost_metrics['cost_head_pred_top1_actual_cost']:.6f}\n"
             f"val_cost_head_pred_top10_mean_actual_cost : {cost_metrics['cost_head_pred_top10_mean_actual_cost']:.6f}\n"
+            f"val_cost_head_pred_top20_mean_actual_cost : {cost_metrics['cost_head_pred_top20_mean_actual_cost']:.6f}\n"
         )
     if "cost_vec_actual_top1_pred_rank" in cost_metrics:
         print(
             f"val_cost_vec_actual_top1_pred_rank : {int(cost_metrics['cost_vec_actual_top1_pred_rank'])}\n"
             f"val_cost_vec_pred_top1_actual_cost : {cost_metrics['cost_vec_pred_top1_actual_cost']:.6f}\n"
             f"val_cost_vec_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_pred_top10_mean_actual_cost']:.6f}\n"
+            f"val_cost_vec_pred_top20_mean_actual_cost : {cost_metrics['cost_vec_pred_top20_mean_actual_cost']:.6f}\n"
         )
     for key, value in sorted(cost_metrics.items()):
         if key.startswith("cost_vec_alpha_") and key.endswith("_actual_top1_pred_rank"):
             prefix = key[: -len("_actual_top1_pred_rank")]
             top1_cost_key = f"{prefix}_pred_top1_actual_cost"
             top10_key = f"{prefix}_pred_top10_mean_actual_cost"
+            top20_key = f"{prefix}_pred_top20_mean_actual_cost"
             print(
                 f"{'val_' + key} : {int(value)}\n"
                 f"{'val_' + top1_cost_key} : {cost_metrics[top1_cost_key]:.6f}\n"
                 f"{'val_' + top10_key} : {cost_metrics[top10_key]:.6f}\n"
+                f"{'val_' + top20_key} : {cost_metrics[top20_key]:.6f}\n"
             )
 
     return summary
@@ -469,6 +505,7 @@ def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, devic
 
 def _evaluate_final_checkpoint(model, bundle, registry, tokenizer, config, device, latent_cost_ridges):
     summary: Dict[str, float] = {}
+    run_full_ar = bool(getattr(config.eval, "final_full_autoregressive", True))
 
     if bundle.val_dataset.samples:
         print("[train] evaluating best checkpoint on val split")
@@ -479,6 +516,7 @@ def _evaluate_final_checkpoint(model, bundle, registry, tokenizer, config, devic
             tokenizer,
             device,
             batch_size=config.eval.batch_size,
+            use_compressed=bool(getattr(config.train, "use_compressed_teacher_forcing", False)),
         )
         summary.update({f"eval_val_{k}": float(v) for k, v in val_tf_metrics.items()})
 
@@ -492,15 +530,18 @@ def _evaluate_final_checkpoint(model, bundle, registry, tokenizer, config, devic
         )
         summary.update({f"eval_val_{k}": float(v) for k, v in val_cost_metrics.items()})
 
-        val_ar_metrics = evaluate_autoregressive(
-            model,
-            bundle.val_dataset,
-            registry,
-            tokenizer,
-            device,
-            batch_size=config.eval.batch_size,
-        )
-        summary.update({f"val_autoregressive_{k}": float(v) for k, v in val_ar_metrics.items()})
+        if run_full_ar:
+            val_ar_metrics = evaluate_autoregressive(
+                model,
+                bundle.val_dataset,
+                registry,
+                tokenizer,
+                device,
+                batch_size=config.eval.batch_size,
+            )
+            summary.update({f"val_autoregressive_{k}": float(v) for k, v in val_ar_metrics.items()})
+        else:
+            print("[train] skipping val full autoregressive eval (config.eval.final_full_autoregressive=False)")
 
     if bundle.test_dataset.samples:
         print("[train] evaluating best checkpoint on test split")
@@ -511,6 +552,7 @@ def _evaluate_final_checkpoint(model, bundle, registry, tokenizer, config, devic
             tokenizer,
             device,
             batch_size=config.eval.batch_size,
+            use_compressed=bool(getattr(config.train, "use_compressed_teacher_forcing", False)),
         )
         summary.update({f"eval_test_{k}": float(v) for k, v in test_tf_metrics.items()})
 
@@ -524,15 +566,18 @@ def _evaluate_final_checkpoint(model, bundle, registry, tokenizer, config, devic
         )
         summary.update({f"eval_test_{k}": float(v) for k, v in test_cost_metrics.items()})
 
-        test_ar_metrics = evaluate_autoregressive(
-            model,
-            bundle.test_dataset,
-            registry,
-            tokenizer,
-            device,
-            batch_size=config.eval.batch_size,
-        )
-        summary.update({f"eval_test_autoregressive_{k}": float(v) for k, v in test_ar_metrics.items()})
+        if run_full_ar:
+            test_ar_metrics = evaluate_autoregressive(
+                model,
+                bundle.test_dataset,
+                registry,
+                tokenizer,
+                device,
+                batch_size=config.eval.batch_size,
+            )
+            summary.update({f"eval_test_autoregressive_{k}": float(v) for k, v in test_ar_metrics.items()})
+        else:
+            print("[train] skipping test full autoregressive eval (config.eval.final_full_autoregressive=False)")
 
     return summary
 
@@ -551,6 +596,14 @@ def train_main(config) -> Dict[str, float]:
     model.to(device)
     print(f"[train] model moved to {device}")
 
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("[train] model architecture:")
+    print(model)
+    print(
+        f"[train] model parameters: total={total_params:,} trainable={trainable_params:,}"
+    )
+
     wandb_run = None
     wandb_project = getattr(config.wandb, "project", None)
     run_name = _build_wandb_run_name(config, bundle)
@@ -565,6 +618,9 @@ def train_main(config) -> Dict[str, float]:
                 name=run_name,
                 config=config.to_dict(),
             )
+            wandb_run.summary["model/architecture"] = str(model)
+            wandb_run.summary["model/total_params"] = total_params
+            wandb_run.summary["model/trainable_params"] = trainable_params
 
 
     train_loader = prepare_loader(
@@ -595,6 +651,8 @@ def train_main(config) -> Dict[str, float]:
     early_stop_min_delta = float(getattr(config.train, "early_stop_min_delta", 1e-4))
 
     scheduler_name = str(getattr(config.train, "scheduler_name", "none")).lower()
+    warmup_epochs = max(0, int(getattr(config.train, "warmup_epochs", 0) or 0))
+    warmup_start_factor = float(getattr(config.train, "warmup_start_factor", 0.1))
     if scheduler_name == "multistep":
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer,
@@ -611,8 +669,33 @@ def train_main(config) -> Dict[str, float]:
             threshold_mode="abs",
             min_lr=float(getattr(config.train, "plateau_min_lr", 1e-5)),
         )
+    elif scheduler_name == "cosine":
+        user_t_max = int(getattr(config.train, "cosine_t_max", 0) or 0)
+        if user_t_max > 0:
+            cosine_t_max = user_t_max
+        else:
+            cosine_t_max = max(1, int(config.train.num_epochs) - warmup_epochs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_t_max,
+            eta_min=float(getattr(config.train, "cosine_eta_min", 0.0)),
+        )
     else:
         scheduler = None
+
+    if warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=max(1e-8, warmup_start_factor),
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        print(
+            f"[train] warmup: epochs={warmup_epochs} "
+            f"start_factor={warmup_start_factor:.4g}"
+        )
+    else:
+        warmup_scheduler = None
     scaler = torch.cuda.amp.GradScaler(enabled=bool(config.train.use_amp and device.type == "cuda"))
 
     checkpoint_dir = save_training_artifacts(config.train.checkpoint_dir, config, tokenizer)
@@ -624,6 +707,10 @@ def train_main(config) -> Dict[str, float]:
     best_checkpoint_path = checkpoint_dir / "best.pt"
     last_checkpoint_path = checkpoint_dir / "last.pt"
     checkpoint_path = checkpoint_dir / f"{run_name}.pt"
+    if checkpoint_path.exists():
+        timestamp = time.strftime("%m%d%H%M")
+        checkpoint_path = checkpoint_dir / f"{run_name}_{timestamp}.pt"
+        print(f"[train] checkpoint already exists; using timestamped path: {checkpoint_path}")
     if best_metric_mode == "max":
         best_metric_value = float("-inf")
     else:
@@ -643,13 +730,17 @@ def train_main(config) -> Dict[str, float]:
     best_metrics: Dict[str, float] = {}
     latent_cost_ridges: list[dict] = []
     timestamp = time.strftime("%m%d%H%M")
-
     latent_walk_every_n = int(getattr(config.train, "latent_walk_every_n_epochs", 0) or 0)
     latent_walk_on_final = bool(getattr(config.train, "latent_walk_on_final", False))
     latent_walk_top_k = int(getattr(config.train, "latent_walk_top_k", 1) or 1)
     latent_walk_num_steps = int(getattr(config.train, "latent_walk_num_steps", 8) or 8)
     latent_walk_step_size = float(getattr(config.train, "latent_walk_step_size", 0.25) or 0.25)
-    latent_walk_use_cost_head = not bool(getattr(config.train, "cost_ridge_vec", False))
+    latent_walk_use_latent_gradient = not bool(getattr(config.train, "cost_ridge_vec", False))
+    walk_recon_predict_every_n = int(getattr(config.train, "latent_walk_predict_every_n_epochs", 0) or 0)
+    walk_recon_predict_enabled = walk_recon_predict_every_n > 0
+    walk_recon_predict_use_gp = bool(getattr(config.train, "latent_walk_predict_use_gp", False))
+    walk_recon_predict_gp_top_k = int(getattr(config.train, "latent_walk_predict_gp_top_k", 0) or 0)
+    walk_recon_predict_gp_random_n = int(getattr(config.train, "latent_walk_predict_gp_random_n", 0) or 0)
     latent_walk_record_json = _resolve_walk_record_json(config)
     latent_walk_output_dir = (
         getattr(config.train, "latent_walk_output_dir", None)
@@ -677,7 +768,7 @@ def train_main(config) -> Dict[str, float]:
             device,
             epoch,
         )
-        print(f"[train] evaluating train split with offline teacher forcing after epoch {epoch}")
+        # print(f"[train] evaluating train split with offline teacher forcing after epoch {epoch}")
         train_eval_metrics = evaluate_teacher_forcing(
             model,
             bundle.train_dataset,
@@ -685,6 +776,7 @@ def train_main(config) -> Dict[str, float]:
             tokenizer,
             device,
             batch_size=config.eval.batch_size,
+            use_compressed=bool(getattr(config.train, "use_compressed_teacher_forcing", False)),
         )
 
         summary = {
@@ -727,6 +819,55 @@ def train_main(config) -> Dict[str, float]:
         if "val_token_accuracy" in summary:
             best_val_acc = max(best_val_acc, float(summary["val_token_accuracy"]))
 
+        # Run latent walk BEFORE improvement check so walk-based best metrics
+        # (e.g. walk/best_measured_mean_cost) actually influence best.pt save.
+        walk_summary: Dict[str, float] = {}
+        recon_predict_due = (
+            walk_recon_predict_enabled
+            and (epoch % walk_recon_predict_every_n == 0)
+        )
+        walk_due = latent_walk_every_n > 0 and (epoch % latent_walk_every_n == 0)
+        # Re-encode is computed inside the walk, so the walk must run whenever
+        # re-encode is due, even off the regular walk cadence.
+        if walk_due or recon_predict_due:
+            include_recon_predict = recon_predict_due
+            include_measurement = walk_due
+            walk_recon_predictor = None
+            if include_recon_predict and walk_recon_predict_use_gp:
+                walk_recon_predictor = fit_gp_recon_predictor(
+                    model=model,
+                    dataset=bundle.train_dataset,
+                    tokenizer=tokenizer,
+                    device=device,
+                    top_k=walk_recon_predict_gp_top_k,
+                    random_n=walk_recon_predict_gp_random_n,
+                    batch_size=config.eval.batch_size,
+                    seed=int(getattr(config.data, "seed", 0)),
+                )
+            walk_summary = _run_periodic_latent_walk(
+                model=model,
+                device=device,
+                checkpoint_path=last_checkpoint_path,
+                record_json_path=latent_walk_record_json,
+                walk_output_dir=latent_walk_output_dir,
+                network_info_folder=latent_walk_network_info,
+                epoch_label=f"epoch {epoch}",
+                config=config,
+                registry=registry,
+                tokenizer=tokenizer,
+                latent_cost_ridge=latent_cost_ridge,
+                timestamp=timestamp,
+                top_k=latent_walk_top_k,
+                num_steps=latent_walk_num_steps,
+                step_size=latent_walk_step_size,
+                use_latent_gradient=latent_walk_use_latent_gradient,
+                include_recon_predict=include_recon_predict,
+                include_measurement=include_measurement,
+                recon_predictor=walk_recon_predictor,
+            )
+            if walk_summary:
+                summary.update(walk_summary)
+
         current_metric = summary.get(best_metric_name)
         improved = False
         can_early_stop = current_metric is not None
@@ -739,7 +880,9 @@ def train_main(config) -> Dict[str, float]:
         elif not best_checkpoint_path.exists():
             improved = True
 
-        if scheduler is not None:
+        if warmup_scheduler is not None and epoch <= warmup_epochs:
+            warmup_scheduler.step()
+        elif scheduler is not None:
             if scheduler_name == "plateau":
                 if current_metric is not None:
                     scheduler.step(float(current_metric))
@@ -782,24 +925,6 @@ def train_main(config) -> Dict[str, float]:
             checkpoint_kwargs["epochs_without_improve"] = epochs_without_improve
 
         save_checkpoint(last_checkpoint_path, **checkpoint_kwargs)
-
-        walk_summary: Dict[str, float] = {}
-        if latent_walk_every_n > 0 and (epoch % latent_walk_every_n == 0):
-            walk_summary = _run_periodic_latent_walk(
-                model=model,
-                device=device,
-                checkpoint_path=last_checkpoint_path,
-                record_json_path=latent_walk_record_json,
-                walk_output_dir=latent_walk_output_dir,
-                network_info_folder=latent_walk_network_info,
-                epoch_label=f"epoch {epoch}",
-                top_k=latent_walk_top_k,
-                num_steps=latent_walk_num_steps,
-                step_size=latent_walk_step_size,
-                use_cost_head=latent_walk_use_cost_head,
-            )
-            if walk_summary:
-                summary.update(walk_summary)
 
         if wandb_run is not None:
             wandb.log(
@@ -845,6 +970,18 @@ def train_main(config) -> Dict[str, float]:
         final_walk_checkpoint = (
             best_checkpoint_path if best_checkpoint_path.exists() else last_checkpoint_path
         )
+        final_walk_recon_predictor = None
+        if walk_recon_predict_enabled and walk_recon_predict_use_gp:
+            final_walk_recon_predictor = fit_gp_recon_predictor(
+                model=model,
+                dataset=bundle.train_dataset,
+                tokenizer=tokenizer,
+                device=device,
+                top_k=walk_recon_predict_gp_top_k,
+                random_n=walk_recon_predict_gp_random_n,
+                batch_size=config.eval.batch_size,
+                seed=int(getattr(config.data, "seed", 0)),
+            )
         final_walk_summary = _run_periodic_latent_walk(
             model=model,
             device=device,
@@ -853,10 +990,17 @@ def train_main(config) -> Dict[str, float]:
             walk_output_dir=latent_walk_output_dir,
             network_info_folder=latent_walk_network_info,
             epoch_label="final",
+            config=config,
+            registry=registry,
+            tokenizer=tokenizer,
+            latent_cost_ridge=(latent_cost_ridges[0] if latent_cost_ridges else None),
+            timestamp=timestamp,
             top_k=latent_walk_top_k,
             num_steps=latent_walk_num_steps,
             step_size=latent_walk_step_size,
-            use_cost_head=latent_walk_use_cost_head,
+            use_latent_gradient=latent_walk_use_latent_gradient,
+            include_recon_predict=walk_recon_predict_enabled,
+            recon_predictor=final_walk_recon_predictor,
         )
         if final_walk_summary:
             final_metrics.update(

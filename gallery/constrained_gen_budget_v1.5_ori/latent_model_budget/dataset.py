@@ -15,7 +15,7 @@ from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples, spl
 from .tokenizer import ParamTokenizer
 
 
-_CANDIDATE_MASK_CACHE_VERSION = "v14"
+_CANDIDATE_MASK_CACHE_VERSION = "v4"
 _CANDIDATE_MASK_CACHE_FLUSH_EVERY = 100
 
 
@@ -123,38 +123,50 @@ def _build_prepared_sample(
     tokenizer: ParamTokenizer,
     registry: GeneratorRegistry | None = None,
     include_candidate_masks: bool = False,
-    precomputed_candidates: Optional[Sequence[Sequence[int]]] = None,
+    oracle=None,
+    prefix_len: int = 0,
 ) -> PreparedSample:
     target_ids = tokenizer.encode_values(order, ordered_values)
-    encoder_token_ids = list(target_ids)
     var_ids = tokenizer.encode_var_names(order)
+    decoder_input_ids = [tokenizer.bos_id] + target_ids[:-1]
     candidate_masks = None
 
     if include_candidate_masks:
-        if precomputed_candidates is None:
-            raise ValueError(
-                "include_candidate_masks=True requires precomputed_candidates "
-                "(produced by _collect_record_step_candidates during bundle build)"
-            )
-        if len(precomputed_candidates) != len(order):
-            raise ValueError(
-                f"precomputed_candidates length {len(precomputed_candidates)} does not "
-                f"match order length {len(order)} for {record.sample_id}"
-            )
+        if registry is None:
+            raise ValueError("registry is required when include_candidate_masks=True")
+        if oracle is None:
+            oracle = registry.build_oracle_from_record(record)
+            prefix_len = 0
         candidate_masks = torch.zeros((len(order), len(tokenizer.id_to_token)), dtype=torch.bool)
-        for t, (name, value, cands) in enumerate(
-            zip(order, ordered_values, precomputed_candidates)
-        ):
+        for t, (name, value) in enumerate(zip(order, ordered_values)):
             gold_token = tokenizer.value_to_token(name, value)
             gold_id = tokenizer.token_to_id.get(gold_token, tokenizer.unk_id)
-            candidate_masks[t] = tokenizer.candidate_mask_from_values(name, cands)
-            if not candidate_masks[t, gold_id]:
-                # Gold value is outside constraint-allowed candidates;
-                # map target to UNK and add UNK to the mask.
-                candidate_masks[t, tokenizer.unk_id] = True
-                target_ids[t] = tokenizer.unk_id
-
-    decoder_input_ids = [tokenizer.bos_id] + target_ids[:-1]
+            try:
+                mask_key = (
+                    tuple((order[idx], int(ordered_values[idx])) for idx in range(t)),
+                    str(name),
+                )
+                cached_mask = oracle.generator._lpm_mask_cache.get(mask_key)
+                if cached_mask is None:
+                    if t < prefix_len:
+                        raise KeyError(f"missing cached mask for restored prefix: {name}")
+                    candidates = oracle.candidate_values(name)
+                    cached_mask = tokenizer.candidate_mask_from_values(name, candidates)
+                    oracle.generator._lpm_mask_cache[mask_key] = cached_mask.clone()
+                candidate_masks[t] = cached_mask
+                if not candidate_masks[t, gold_id]:
+                    raise ValueError("gold value is outside oracle candidates")
+                if t >= prefix_len:
+                    oracle.assign(name, value)
+            except Exception:  # pylint: disable=broad-except
+                candidate_masks[t].zero_()
+                candidate_masks[t, gold_id] = True
+                for rem_t, rem_name, rem_value in zip(range(t + 1, len(order)), order[t + 1:], ordered_values[t + 1:]):
+                    rem_gold_token = tokenizer.value_to_token(rem_name, rem_value)
+                    rem_gold_id = tokenizer.token_to_id.get(rem_gold_token, tokenizer.unk_id)
+                    candidate_masks[rem_t].zero_()
+                    candidate_masks[rem_t, rem_gold_id] = True
+                break
 
     sample = PreparedSample(
         sample_id=record.sample_id,
@@ -162,7 +174,7 @@ def _build_prepared_sample(
         sketch_index=record.sketch_index,
         ordered_param_names=list(order),
         ordered_param_values=list(ordered_values),
-        encoder_token_ids=encoder_token_ids,
+        encoder_token_ids=target_ids,
         encoder_var_ids=var_ids,
         decoder_input_ids=decoder_input_ids,
         decoder_var_ids=var_ids,
@@ -337,7 +349,12 @@ def _candidate_mask_cache_path_for_workload(config, workload_key: str, target_ki
     cache_dir = _candidate_mask_cache_dir(config)
     stem = _sanitize_workload_key(workload_key, target_kind)
     budget_tag = "with_budget" if budget_enabled(config) else "no_budget"
-    return cache_dir / f"{stem}_{_CANDIDATE_MASK_CACHE_VERSION}_{budget_tag}.pt"
+    compressed_tag = (
+        "_compressed"
+        if bool(getattr(getattr(config, "train", None), "use_compressed_teacher_forcing", False))
+        else ""
+    )
+    return cache_dir / f"{stem}_{_CANDIDATE_MASK_CACHE_VERSION}_{budget_tag}{compressed_tag}.pt"
 
 
 def _normalize_param_signature(signature: Sequence[str] | None) -> tuple[str, ...]:
@@ -365,100 +382,6 @@ def _extend_domain_values(
     bucket = domain_values_by_name.setdefault(str(name), set())
     for value in values:
         bucket.add(int(value))
-
-
-def _collect_record_step_candidates(
-    record: JsonSampleRecord,
-    order: Sequence[str],
-    oracle,
-    *,
-    prefix_len: int = 0,
-    prior_step_candidates: Optional[Sequence[Sequence[int]]] = None,
-    skip_candidate_names: Optional[Set[str]] = None,
-) -> tuple[List[List[int]], bool]:
-    """Walk the oracle for one record and collect propagation-aware candidate
-    sets at each AR position, starting from ``prefix_len``.
-
-    The caller is responsible for constructing the oracle and restoring it to
-    the correct prefix state (via ``_lpm_prefix_state_cache`` snapshot) before
-    invoking this helper. Positions ``[0:prefix_len]`` are filled from
-    ``prior_step_candidates``; positions ``[prefix_len:]`` are walked live.
-
-    When *skip_candidate_names* is given, positions whose name is in the set
-    skip the expensive ``candidate_values()`` call and record ``[gold]``
-    directly, but still perform ``assign()`` so downstream propagation is
-    correct.  This is used for vectorize split positions whose candidates are
-    replaced with the full domain after the walk anyway.
-
-    Returns (step_candidates, valid). ``valid`` is True iff every position's
-    ground-truth value appeared inside the oracle's candidate set. Whenever
-    the oracle fails to enumerate or the gold value is missing, the
-    corresponding position (and every subsequent one) collapses to ``[gold]``
-    so downstream mask construction stays consistent with the existing
-    gold-only fallback.
-    """
-    order = list(order)
-    step_candidates: List[List[int]] = []
-    valid = True
-    fallback = False
-
-    if prefix_len > 0:
-        if prior_step_candidates is None or len(prior_step_candidates) < prefix_len:
-            raise ValueError(
-                "prior_step_candidates must cover prefix_len positions"
-            )
-        for pos in range(prefix_len):
-            step_candidates.append([int(v) for v in prior_step_candidates[pos]])
-
-    for idx in range(prefix_len, len(order)):
-        name = order[idx]
-        gold_present = name in record.params
-        gold = int(record.params[name]) if gold_present else None
-        if fallback:
-            step_candidates.append([gold] if gold is not None else [])
-            continue
-        # Vectorize split positions: skip expensive candidate enumeration,
-        # just record [gold] and propagate the assignment.
-        if skip_candidate_names and name in skip_candidate_names:
-            step_candidates.append([gold] if gold is not None else [])
-            if gold is not None:
-                try:
-                    oracle.assign(name, gold)
-                except Exception:  # pylint: disable=broad-except
-                    valid = False
-                    fallback = True
-            continue
-        try:
-            cands = sorted({int(v) for v in oracle.candidate_values(name)})
-        except Exception:  # pylint: disable=broad-except
-            valid = False
-            fallback = True
-            step_candidates.append([gold] if gold is not None else [])
-            continue
-        if not cands:
-            valid = False
-            fallback = True
-            step_candidates.append([gold] if gold is not None else [])
-            continue
-        if gold is None or gold not in cands:
-            valid = False
-            step_candidates.append(cands)
-            # Still assign gold so downstream propagation remains consistent.
-            if gold is not None:
-                try:
-                    oracle.assign(name, gold)
-                except Exception:  # pylint: disable=broad-except
-                    fallback = True
-            else:
-                fallback = True
-            continue
-        step_candidates.append(cands)
-        try:
-            oracle.assign(name, gold)
-        except Exception:  # pylint: disable=broad-except
-            valid = False
-            fallback = True
-    return step_candidates, valid
 
 
 def _collect_generator_domain_values(
@@ -548,41 +471,22 @@ def _save_candidate_mask_cache_files(
     subset: Sequence[JsonSampleRecord],
     cached_candidate_masks: Dict[str, torch.Tensor],
     cache_paths_by_workload: Dict[tuple[str, str], Path],
-    *,
-    step_candidates_by_sample_id: Dict[str, List[List[int]]],
-    validity_by_sample_id: Dict[str, bool],
-    prepared_cache: Dict[int, tuple[List[str], List[int]]],
 ) -> None:
-    per_workload: Dict[tuple[str, str], Dict[str, object]] = {}
+    sample_masks_by_workload: Dict[tuple[str, str], Dict[str, torch.Tensor]] = {}
     for record in subset:
         workload_key = record.workload_key
         target_kind = record.target_kind
         if not workload_key or not target_kind:
             continue
-        sig = (str(workload_key), str(target_kind))
-        entry = per_workload.setdefault(
-            sig,
-            {
-                "masks": {},
-                "step_cands": {},
-                "validity": {},
-                "domain_sets": {},
-            },
+        mask = cached_candidate_masks.get(record.sample_id)
+        if mask is None:
+            continue
+        workload_sig = (str(workload_key), str(target_kind))
+        sample_masks_by_workload.setdefault(workload_sig, {})[record.sample_id] = (
+            mask.clone().to(device="cpu")
         )
-        sample_id = record.sample_id
-        mask = cached_candidate_masks.get(sample_id)
-        if mask is not None:
-            entry["masks"][sample_id] = mask.clone().to(device="cpu")
-        step_cands = step_candidates_by_sample_id.get(sample_id)
-        if step_cands is not None:
-            entry["step_cands"][sample_id] = [list(map(int, col)) for col in step_cands]
-            order, _ = prepared_cache[id(record)]
-            for name, col in zip(order, step_cands):
-                entry["domain_sets"].setdefault(str(name), set()).update(int(v) for v in col)
-        if sample_id in validity_by_sample_id:
-            entry["validity"][sample_id] = bool(validity_by_sample_id[sample_id])
 
-    for workload_sig, entry in per_workload.items():
+    for workload_sig, sample_masks in sample_masks_by_workload.items():
         cache_path = cache_paths_by_workload.get(workload_sig)
         if cache_path is None:
             cache_path = _candidate_mask_cache_path_for_workload(
@@ -594,79 +498,10 @@ def _save_candidate_mask_cache_files(
             {
                 "workload_key": workload_sig[0],
                 "target_kind": workload_sig[1],
-                "sample_masks": entry["masks"],
-                "sample_step_candidates": entry["step_cands"],
-                "sample_validity": entry["validity"],
-                "domain_values": {
-                    name: sorted(vs) for name, vs in entry["domain_sets"].items()
-                },
+                "sample_masks": sample_masks,
             },
             cache_path,
         )
-
-
-def _load_walk_cache_files(
-    config,
-    records: Sequence[JsonSampleRecord],
-    cache_paths_by_workload: Dict[tuple[str, str], Path],
-    step_candidates_by_sample_id: Dict[str, List[List[int]]],
-    validity_by_sample_id: Dict[str, bool],
-    domain_values_by_name: Dict[str, Set[int]],
-    cached_candidate_masks: Dict[str, torch.Tensor],
-) -> Set[str]:
-    """Load cached walk outputs (step candidates, validity, domain values, masks)
-    for any workload with an existing cache file. Returns the set of sample_ids
-    whose step candidates came from cache (walk can be skipped for them)."""
-    by_workload: Dict[tuple[str, str], List[JsonSampleRecord]] = {}
-    for record in records:
-        if record.workload_key and record.target_kind:
-            sig = (str(record.workload_key), str(record.target_kind))
-            by_workload.setdefault(sig, []).append(record)
-
-    cache_hit_sample_ids: Set[str] = set()
-    for workload_sig, workload_records in by_workload.items():
-        cache_path = cache_paths_by_workload.get(workload_sig)
-        if cache_path is None:
-            cache_path = _candidate_mask_cache_path_for_workload(
-                config, workload_sig[0], workload_sig[1]
-            )
-            cache_paths_by_workload[workload_sig] = cache_path
-        if not cache_path.exists():
-            continue
-        print(f"[dataset] loading walk/mask cache from {cache_path}")
-        payload = torch.load(cache_path, map_location="cpu")
-        sample_step_cands = payload.get("sample_step_candidates", {}) or {}
-        sample_validity = payload.get("sample_validity", {}) or {}
-        domain_values = payload.get("domain_values", {}) or {}
-        sample_masks = payload.get("sample_masks", {}) or {}
-
-        for name, values in domain_values.items():
-            domain_values_by_name.setdefault(str(name), set()).update(
-                int(v) for v in values
-            )
-
-        for sample_id, mask in sample_masks.items():
-            cached_candidate_masks[str(sample_id)] = mask.clone().to(
-                dtype=torch.bool, device="cpu"
-            )
-
-        loaded = 0
-        for record in workload_records:
-            sid = record.sample_id
-            if sid in sample_step_cands:
-                step_candidates_by_sample_id[sid] = [
-                    list(map(int, col)) for col in sample_step_cands[sid]
-                ]
-                if sid in sample_validity:
-                    validity_by_sample_id[sid] = bool(sample_validity[sid])
-                cache_hit_sample_ids.add(sid)
-                loaded += 1
-        print(
-            f"[dataset] walk cache hit workload={workload_sig} "
-            f"records={loaded}/{len(workload_records)} masks={len(sample_masks)}"
-        )
-
-    return cache_hit_sample_ids
 
 
 def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
@@ -685,13 +520,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     prepared_cache: Dict[int, tuple[List[str], List[int]]] = {}
     order_cache: Dict[tuple, Dict[str, object]] = {}
     domain_values_by_name: Dict[str, Set[int]] = {}
-    record_step_candidates_by_sample_id: Dict[str, List[List[int]]] = {}
-    record_validity_by_sample_id: Dict[str, bool] = {}
-    cache_paths_by_workload: Dict[tuple[str, str], Path] = {}
-    cached_candidate_masks: Dict[str, torch.Tensor] = {}
-
     print("[dataset] building ordered parameter cache")
-    record_order_keys: List[tuple] = []
     for idx, record in enumerate(records, start=1):
         order_key = (
             record.workload_key,
@@ -705,41 +534,18 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             gen = _get_generator_for_record(record, registry)
             order = get_model_param_order(gen, include_budget=include_budget)
             budget_specs = _extract_budget_specs(gen)
-            # Split steps followed by a vectorize annotation have a dynamic
-            # extent that varies per record.  When the vectorize constraint is
-            # disabled, divisor-based domain computation is meaningless for
-            # them — we collect every gold value from the dataset instead.
-            # When vectorize constraint IS enabled, these positions are treated
-            # normally (oracle-walk candidates, constraint-aware domain).
-            _vec_step_indices = gen._vectorize_split_step_indices
-            dynamic_sp_names = set()
-            _vectorize_enabled = 'vectorize' in gen._enabled
-            if not _vectorize_enabled:
-                for _name in order:
-                    if _name.startswith("sp_"):
-                        _step_idx = int(_name.split("_")[1])
-                        if _step_idx in _vec_step_indices:
-                            dynamic_sp_names.add(_name)
             cached_meta = {
                 "order": list(order),
                 "budget_specs": list(budget_specs),
-                "dynamic_sp_names": dynamic_sp_names,
             }
             order_cache[order_key] = cached_meta
-            # Union the maximal per-variable domain so tokenizer vocab covers
-            # candidate values that no record's gold walk would exercise
-            # (e.g. the factor=1 path when every record has factor>1 in a
-            # split group). Gold-path walks alone can miss div(E) entries.
-            # Dynamic-extent names are excluded — they are handled below
-            # by collecting gold values directly.
-            initial_domains = _collect_generator_domain_values(
-                gen, order, include_budget=include_budget
+            generator_domain_values = _collect_generator_domain_values(
+                gen,
+                order,
+                include_budget=include_budget,
             )
-            for name, values in initial_domains.items():
-                if name not in dynamic_sp_names:
-                    domain_values_by_name.setdefault(str(name), set()).update(
-                        int(v) for v in values
-                    )
+            for name, values in generator_domain_values.items():
+                domain_values_by_name.setdefault(name, set()).update(int(v) for v in values)
         order = list(cached_meta["order"])
         budget_specs = list(cached_meta["budget_specs"])
         _apply_cached_order_metadata(record, order, budget_specs)
@@ -748,170 +554,30 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             raise ValueError(f"{record.sample_id} is missing ordered params: {missing}")
         values = [int(record.params[name]) for name in order]
         prepared_cache[id(record)] = (order, values)
-        record_order_keys.append(order_key)
-        # For dynamic-extent split names, union the gold value from every
-        # record so the tokenizer vocab covers all observed factor values.
-        for dyn_name in cached_meta.get("dynamic_sp_names", ()):
-            if dyn_name in record.params:
-                domain_values_by_name.setdefault(str(dyn_name), set()).add(
-                    int(record.params[dyn_name])
-                )
-
-        # if idx % 2000 == 0 or idx == len(records):
-        #     print(
-        #         f"[dataset] prepared {idx}/{len(records)} record(s); "
-        #         f"unique_orders={len(order_cache)}"
-        #     )
-
-    # Try to short-circuit the propagation walk by loading cached outputs from
-    # prior runs (step candidates + validity + domain_values per workload).
-    print("[dataset] checking walk cache")
-    cache_hit_sample_ids = _load_walk_cache_files(
-        config,
-        records,
-        cache_paths_by_workload,
-        record_step_candidates_by_sample_id,
-        record_validity_by_sample_id,
-        domain_values_by_name,
-        cached_candidate_masks,
-    )
-    if cache_hit_sample_ids:
-        print(
-            f"[dataset] walk cache covers {len(cache_hit_sample_ids)}/{len(records)} record(s)"
-        )
-
-    # Per-record propagation-aware candidate walk with prefix sharing across
-    # records that share the same (order_key, gold-value prefix). Sorting by
-    # (order_key, values) maximises the common prefix between consecutive
-    # records; for each record we reuse the previous group's oracle and
-    # restore it from ``_lpm_prefix_state_cache`` to the longest common
-    # prefix, then walk only the remaining positions.
-    print("[dataset] collecting propagation candidates with prefix sharing")
-    walk_indices = [
-        i for i, record in enumerate(records)
-        if record.sample_id not in cache_hit_sample_ids
-    ]
-    sorted_indices = sorted(
-        walk_indices,
-        key=lambda i: (
-            record_order_keys[i],
-            tuple(prepared_cache[id(records[i])][1]),
-        ),
-    )
-
-    current_group_key = None
-    current_oracle = None
-    current_order: List[str] = []
-    current_values: List[int] = []
-    current_step_cands: List[List[int]] = []
-    reused_prefix_positions = 0
-    walked_positions = 0
-
-    for cnt, i in enumerate(tqdm(sorted_indices), start=1):
-        record = records[i]
-        order, values = prepared_cache[id(record)]
-        group_key = record_order_keys[i]
-
-        if current_group_key != group_key or current_oracle is None:
-            current_group_key = group_key
-            current_oracle = registry.build_oracle_from_record(record)
-            current_order = list(order)
-            current_values = []
-            current_step_cands = []
-            prefix_len = 0
-        else:
-            limit = min(len(current_order), len(current_values), len(order), len(values))
-            prefix_len = 0
-            while (
-                prefix_len < limit
-                and current_order[prefix_len] == order[prefix_len]
-                and current_values[prefix_len] == int(values[prefix_len])
-            ):
-                prefix_len += 1
-
-            prefix_key = tuple(
-                (order[pos], int(values[pos])) for pos in range(prefix_len)
-            )
-            snapshot = current_oracle.generator._lpm_prefix_state_cache.get(prefix_key)
-            if snapshot is None:
-                current_oracle = registry.build_oracle_from_record(record)
-                prefix_len = 0
-                current_step_cands = []
-            else:
-                ps = current_oracle.generator.param_sampler
-                current_oracle.assignment.clear()
-                current_oracle.assignment.update(snapshot[0])
-                current_oracle._domains = ps._copy_domains(snapshot[1])
-                current_oracle._group_remaining = ps._copy_group_remaining(snapshot[2])
-                current_oracle._budget_remaining = ps._copy_budget_remaining(snapshot[3])
-                current_oracle._sym_map = dict(snapshot[4])
-                ps._restore_sym_map(snapshot[4])
-                current_oracle.last_report = None
-
-        _skip_names = order_cache.get(group_key, {}).get("dynamic_sp_names", None)
-        step_cands, valid = _collect_record_step_candidates(
-            record,
-            order,
-            current_oracle,
-            prefix_len=prefix_len,
-            prior_step_candidates=current_step_cands if prefix_len > 0 else None,
-            skip_candidate_names=_skip_names,
-        )
-        record_step_candidates_by_sample_id[record.sample_id] = step_cands
-        record_validity_by_sample_id[record.sample_id] = valid
-        # Positions [0:prefix_len] were already unioned when a prior record in
-        # the same group walked them; union only the newly-walked suffix.
-        # Vectorize split names are excluded — their domain comes solely
-        # from gold values collected in the order-prep loop.
-        _dyn = order_cache.get(group_key, {}).get("dynamic_sp_names", set())
-        for pos in range(prefix_len, len(step_cands)):
-            if order[pos] not in _dyn:
-                domain_values_by_name.setdefault(order[pos], set()).update(
-                    int(v) for v in step_cands[pos]
-                )
-
-        current_order = list(order)
-        current_values = list(values)
-        current_step_cands = list(step_cands)
-        reused_prefix_positions += prefix_len
-        walked_positions += len(step_cands) - prefix_len
-
-        if cnt % 500 == 0 or cnt == len(sorted_indices):
+        if idx == len(records):
             print(
-                f"[dataset] propagation {cnt}/{len(sorted_indices)} "
-                f"(reused_positions={reused_prefix_positions} "
-                f"walked_positions={walked_positions})"
+                f"[dataset] prepared {idx}/{len(records)} record(s); "
+                f"unique_orders={len(order_cache)}"
             )
-
-    # For vectorize split steps, replace per-record oracle candidates with
-    # the full domain so the candidate mask is unrestricted.
-    for i, record in enumerate(records):
-        step_cands = record_step_candidates_by_sample_id.get(record.sample_id)
-        if step_cands is None:
-            continue
-        order_key = record_order_keys[i]
-        meta = order_cache.get(order_key)
-        if meta is None:
-            continue
-        dyn_names = meta.get("dynamic_sp_names", set())
-        if not dyn_names:
-            continue
-        order = meta["order"]
-        for pos, name in enumerate(order):
-            if name in dyn_names and pos < len(step_cands):
-                full_domain = sorted(domain_values_by_name.get(name, set()))
-                if full_domain:
-                    step_cands[pos] = full_domain
 
     valid_records = list(records)
     if getattr(config.data, "filter_invalid_records", False):
-        print("[dataset] filtering invalid records (gold not in oracle candidates)")
-        filtered_records = [
-            record
-            for record in records
-            if record_validity_by_sample_id.get(record.sample_id, False)
-        ]
-        invalid_count = len(records) - len(filtered_records)
+        print("[dataset] filtering invalid records")
+        filtered_records: List[JsonSampleRecord] = []
+        invalid_count = 0
+        for idx, record in enumerate(records, start=1):
+            order, values = prepared_cache[id(record)]
+            oracle = registry.build_oracle_from_record(record)
+            if not oracle.validate_assignment(order, values):
+                invalid_count += 1
+                continue
+            filtered_records.append(record)
+            if idx % 500 == 0 or idx == len(records):
+                print(
+                    f"[dataset] validated {idx}/{len(records)} record(s); "
+                    f"kept={len(filtered_records)} dropped={invalid_count}"
+                )
+
         if invalid_count:
             print(
                 f"[dataset] dropped {invalid_count} invalid records; "
@@ -956,22 +622,45 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     )
 
     precompute_candidate_masks = bool(getattr(config.train, "precompute_candidate_masks", False))
+    cached_candidate_masks: Dict[str, torch.Tensor] = {}
+    cache_paths_by_workload: Dict[tuple[str, str], Path] = {}
     precompute_records = list(train_records) + list(val_records)
     if precompute_candidate_masks:
         print("[dataset] precomputing candidate masks for train+val splits")
+        precompute_workload_keys = sorted(
+            {
+                (record.workload_key, record.target_kind)
+                for record in precompute_records
+                if record.workload_key and record.target_kind
+            }
+        )
+        for workload_key in precompute_workload_keys:
+            cache_path = _candidate_mask_cache_path_for_workload(config, workload_key[0], workload_key[1])
+            cache_paths_by_workload[workload_key] = cache_path
+            if not cache_path.exists():
+                continue
+            print(f"[dataset] loading cached candidate masks from {cache_path}")
+            payload = torch.load(cache_path, map_location="cpu")
+            sample_masks = payload.get("sample_masks", {})
+            loaded_count = 0
+            for sample_id, mask in sample_masks.items():
+                cached_candidate_masks[str(sample_id)] = mask.clone().to(dtype=torch.bool, device="cpu")
+                loaded_count += 1
+            print(
+                f"[dataset] loaded cached masks for workload_key={workload_key} "
+                f"count={loaded_count}"
+            )
 
     def build_samples(
         subset: Sequence[JsonSampleRecord],
         include_candidate_masks: bool,
         persist_cache: bool = False,
     ) -> List[PreparedSample]:
-        items: List[PreparedSample] = []
-        total = len(subset)
-        computed_cache_count = 0
-        reused_cache_count = 0
-        for idx, record in enumerate(subset, start=1):
-            order, values = prepared_cache[id(record)]
-            if not include_candidate_masks:
+        if not include_candidate_masks:
+            items: List[PreparedSample] = []
+            total = len(subset)
+            for idx, record in enumerate(subset, start=1):
+                order, values = prepared_cache[id(record)]
                 items.append(
                     _build_prepared_sample(
                         record,
@@ -984,8 +673,30 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 )
                 if idx % 1000 == 0 or idx == total:
                     print(f"[dataset] prepared samples {idx}/{total}")
-                continue
+            return items
 
+        items_by_id: Dict[int, PreparedSample] = {}
+        total = len(subset)
+        sorted_subset = sorted(
+            subset,
+            key=lambda record: (
+                record.workload_key or "",
+                record.target_kind or "",
+                -1 if record.task_index is None else int(record.task_index),
+                int(record.sketch_index),
+                tuple(record.param_signature or ()),
+                tuple(prepared_cache[id(record)][1]),
+            ),
+        )
+        current_group_key = None
+        current_oracle = None
+        current_order: List[str] = []
+        current_values: List[int] = []
+        computed_cache_count = 0
+        reused_cache_count = 0
+
+        for idx, record in enumerate(tqdm(sorted_subset), start=1):
+            order, values = prepared_cache[id(record)]
             cached_mask = cached_candidate_masks.get(record.sample_id)
             if cached_mask is not None:
                 sample = _build_prepared_sample(
@@ -997,46 +708,89 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                     include_candidate_masks=False,
                 )
                 sample.candidate_masks = cached_mask.clone()
-                items.append(sample)
+                items_by_id[id(record)] = sample
+                current_group_key = None
+                current_oracle = None
+                current_order = []
+                current_values = []
                 reused_cache_count += 1
+                if idx % 500 == 0 or idx == total:
+                    print(
+                        f"[dataset] precomputed masks {idx}/{total} "
+                        f"(reused={reused_cache_count} computed={computed_cache_count})"
+                    )
+                continue
+
+            group_key = (
+                record.workload_key,
+                record.target_kind,
+                record.task_index,
+                record.sketch_index,
+                tuple(record.param_signature or ()),
+            )
+            prefix_len = 0
+
+            if current_group_key != group_key:
+                current_group_key = group_key
+                current_oracle = registry.build_oracle_from_record(record)
+                current_order = list(order)
+                current_values = []
             else:
-                step_cands = record_step_candidates_by_sample_id.get(record.sample_id)
-                if step_cands is None:
-                    raise ValueError(
-                        f"missing precomputed step candidates for {record.sample_id}; "
-                        "bundle build did not populate record_step_candidates_by_sample_id"
-                    )
-                sample = _build_prepared_sample(
-                    record,
-                    order,
-                    values,
-                    tokenizer,
-                    registry=registry,
-                    include_candidate_masks=True,
-                    precomputed_candidates=step_cands,
+                limit = min(len(current_order), len(current_values), len(order), len(values))
+                while (
+                    prefix_len < limit
+                    and current_order[prefix_len] == order[prefix_len]
+                    and current_values[prefix_len] == int(values[prefix_len])
+                ):
+                    prefix_len += 1
+
+                prefix_key = tuple(
+                    (order[pos], int(values[pos]))
+                    for pos in range(prefix_len)
                 )
-                cached_candidate_masks[record.sample_id] = sample.candidate_masks.clone()
-                items.append(sample)
-                computed_cache_count += 1
+                snapshot = current_oracle.generator._lpm_prefix_state_cache.get(prefix_key)
+                if snapshot is None:
+                    current_oracle = registry.build_oracle_from_record(record)
+                    prefix_len = 0
+                else:
+                    current_oracle.assignment.clear()
+                    current_oracle.assignment.update(snapshot[0])
+                    current_oracle._domains = current_oracle.generator.param_sampler._copy_domains(snapshot[1])
+                    current_oracle._group_remaining = current_oracle.generator.param_sampler._copy_group_remaining(snapshot[2])
+                    current_oracle._budget_remaining = current_oracle.generator.param_sampler._copy_budget_remaining(snapshot[3])
+                    current_oracle._sym_map = dict(snapshot[4])
+                    current_oracle.generator.param_sampler._restore_sym_map(snapshot[4])
+                    current_oracle.last_report = None
 
-                if persist_cache and (idx % _CANDIDATE_MASK_CACHE_FLUSH_EVERY == 0 or idx == total):
-                    _save_candidate_mask_cache_files(
-                        config,
-                        subset,
-                        cached_candidate_masks,
-                        cache_paths_by_workload,
-                        step_candidates_by_sample_id=record_step_candidates_by_sample_id,
-                        validity_by_sample_id=record_validity_by_sample_id,
-                        prepared_cache=prepared_cache,
-                    )
+            items_by_id[id(record)] = _build_prepared_sample(
+                record,
+                order,
+                values,
+                tokenizer,
+                registry=registry,
+                include_candidate_masks=True,
+                oracle=current_oracle,
+                prefix_len=prefix_len,
+            )
+            cached_candidate_masks[record.sample_id] = items_by_id[id(record)].candidate_masks.clone()
+            current_order = list(order)
+            current_values = list(values)
+            computed_cache_count += 1
 
-            if idx % 500 == 0 or idx == total:
+            if persist_cache and (idx % _CANDIDATE_MASK_CACHE_FLUSH_EVERY == 0 or idx == total):
+                _save_candidate_mask_cache_files(
+                    config,
+                    subset,
+                    cached_candidate_masks,
+                    cache_paths_by_workload,
+                )
+            if idx == total:
                 print(
-                    f"[dataset] mask samples {idx}/{total} "
+                    f"[dataset] precomputed masks {idx}/{total} "
                     f"(reused={reused_cache_count} computed={computed_cache_count})"
                 )
 
-        return items
+        return [items_by_id[id(record)] for record in subset]
 
     if precompute_candidate_masks and cached_candidate_masks:
         missing_precompute_masks = sum(
@@ -1050,14 +804,14 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             build_samples(
                 train_records,
                 include_candidate_masks=precompute_candidate_masks,
-                persist_cache=False,
+                persist_cache=precompute_candidate_masks,
             )
         ),
         val_dataset=LatentParamDataset(
             build_samples(
                 val_records,
                 include_candidate_masks=precompute_candidate_masks,
-                persist_cache=False,
+                persist_cache=precompute_candidate_masks,
             )
         ),
         test_dataset=LatentParamDataset(build_samples(test_records, include_candidate_masks=False)),
@@ -1066,33 +820,25 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         val_records=list(val_records),
         test_records=list(test_records),
     )
-    _save_candidate_mask_cache_files(
-        config,
-        list(records),
-        cached_candidate_masks,
-        cache_paths_by_workload,
-        step_candidates_by_sample_id=record_step_candidates_by_sample_id,
-        validity_by_sample_id=record_validity_by_sample_id,
-        prepared_cache=prepared_cache,
-    )
-    for workload_sig in sorted(cache_paths_by_workload):
-        cache_path = cache_paths_by_workload[workload_sig]
-        mask_count = sum(
-            1
-            for record in precompute_records
-            if (record.workload_key, record.target_kind) == workload_sig
-            and record.sample_id in cached_candidate_masks
+    if precompute_candidate_masks:
+        _save_candidate_mask_cache_files(
+            config,
+            precompute_records,
+            cached_candidate_masks,
+            cache_paths_by_workload,
         )
-        walk_count = sum(
-            1
-            for record in records
-            if (record.workload_key, record.target_kind) == workload_sig
-            and record.sample_id in record_step_candidates_by_sample_id
-        )
-        print(
-            f"[dataset] saved walk cache to {cache_path} "
-            f"(workload_key={workload_sig}, walk={walk_count} masks={mask_count})"
-        )
+        for workload_sig in sorted(cache_paths_by_workload):
+            cache_path = cache_paths_by_workload[workload_sig]
+            count = sum(
+                1
+                for record in precompute_records
+                if (record.workload_key, record.target_kind) == workload_sig
+                and record.sample_id in cached_candidate_masks
+            )
+            print(
+                f"[dataset] saving candidate masks to {cache_path} "
+                f"(workload_key={workload_sig}, count={count})"
+            )
     print(
         f"[dataset] ready: train={len(bundle.train_dataset)} "
         f"val={len(bundle.val_dataset)} test={len(bundle.test_dataset)}"

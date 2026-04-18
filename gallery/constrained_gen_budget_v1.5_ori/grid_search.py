@@ -12,7 +12,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(HERE))
+    sys.path.insert(0, str(HERE.parent))
     from latent_model_budget.config import build_config
     from latent_model_budget.model import LatentParamVAE
     import latent_model_budget.train as train_module
@@ -24,19 +24,14 @@ else:
 
 SEARCH_SPACE = {
     "train.learning_rate": [5e-4, 7e-4],
-    "train.lambda_nce": [0.2],
-    "train.tau_nce": [0.2],
-    "train.beta_end": [0.002],
-    "train.beta_warmup_epochs": [20],
-    "train.order_nce": [False],
+    "train.lambda_nce": [0.1, 0.2],
+    "train.tau_nce": [0.2, 0.3],
+    "train.beta_end": [0.002, 0.003],
+    "train.beta_warmup_epochs": [10, 20],
+    "train.order_nce": [True, False],
     "train.nce_mu": [False],
-    "model.adaln": [True],
-    "train.lambda_cost": [0.01],
-    "train.label_smoothing": [0],
-    "train.latent_walk_top_k": [1],
-    "train.cost_ridge_vec": [True],
-    # "train.cobo_sample_weighting": [True],
-    # "train.cobo_weight_sigma": [1.0, 1.5],
+    "train.label_smoothing": [0.0, 0.1],
+    "train.use_compressed_teacher_forcing": [True, False],
 }
 
 BEST_METRIC = "val_full_sequence_exact_match"
@@ -129,8 +124,6 @@ def run_one(exp_idx: int, params: dict) -> None:
     try:
         train_main(cfg)
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         print(f"[grid] run failed: {type(e).__name__}: {e}")
 
 
@@ -140,8 +133,8 @@ def main():
     combos = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
 
     for idx, params in enumerate(combos, start=1):
-        # if idx <= 186: 
-        #     continue
+        if idx <= 186: 
+            continue
         print(f"\n===== [{idx}/{len(combos)}] {params} =====")
         run_one(idx, deepcopy(params))
 
