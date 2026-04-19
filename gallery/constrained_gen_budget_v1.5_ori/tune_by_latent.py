@@ -227,10 +227,10 @@ def log_candidate_result(result: Dict[str, Any]) -> None:
     mean_cost = measurement.get("mean_cost")
     mean_cost_text = "n/a" if mean_cost is None else f"{mean_cost:.4f}"
     print(
-        f"[latent-walk] step={step_index} alpha={alpha:.4f} "
-        f"pred={predicted_score:.6f} status=ok "
-        f"mean_cost={mean_cost_text} "
-        f"log={measurement.get('measure_record_path')}"
+        f"[latent-walk] mean_cost={mean_cost_text}\n"
+        f"step={step_index}, alpha={alpha:.4f}"
+        # f"pred={predicted_score:.6f} status=ok "
+        # f"log={measurement.get('measure_record_path')}"
     )
 
 
@@ -280,9 +280,8 @@ def log_grouped_candidate_result(grouped_record: Dict[str, Any]) -> None:
     mean_cost = measurement.get("mean_cost")
     mean_cost_text = "n/a" if mean_cost is None else f"{mean_cost:.4f}"
     print(
-        f"[latent-walk] alphas={alpha_text} pred_mean={pred_mean_text} "
-        f"mean_cost={mean_cost_text} "
-        f"log={measurement.get('measure_record_path')}"
+        f"mean_cost={mean_cost_text}, pred_mean={pred_mean_text}, {alpha_text}"
+        # f"log={measurement.get('measure_record_path')}"
     )
 
 
@@ -420,6 +419,7 @@ class WalkRecord:
     state_build_error: Optional[str]
     measurement: Any
     recon_predict_cost: Optional[float] = None
+    recon_predict_std: Optional[float] = None
 
 
 @dataclass
@@ -763,16 +763,19 @@ def predict_recon_score(
     bundle: LoadedBundle,
     ordered_names: List[str],
     params: Dict[str, int],
-) -> Optional[float]:
+) -> tuple[Optional[float], Optional[float]]:
     """Re-encode decoded params through the encoder and score the resulting z.
 
     Grounds predictions to the encoder's training manifold so cost_head/ridge
     evaluates an in-distribution latent instead of the OOD walked z.
+
+    Returns ``(mean, std)``. ``std`` is the GP posterior standard deviation
+    when ``bundle.recon_predictor`` is the GP variant; otherwise ``None``.
     """
     try:
         ordered_values = [int(params[name]) for name in ordered_names]
     except KeyError:
-        return None
+        return None, None
     tokenizer = bundle.tokenizer
     enc_ids = torch.tensor(
         [tokenizer.encode_values(ordered_names, ordered_values)],
@@ -790,8 +793,11 @@ def predict_recon_score(
     )
     z = z_recon[0].to(device=bundle.device, dtype=torch.float32).view(1, -1)
     if bundle.recon_predictor is not None:
-        return bundle.recon_predictor.predict(z[0])
-    return float(bundle.model.cost_head(z).squeeze(-1).item())
+        if hasattr(bundle.recon_predictor, "predict_with_std"):
+            mean, std = bundle.recon_predictor.predict_with_std(z[0])
+            return float(mean), float(std)
+        return float(bundle.recon_predictor.predict(z[0])), None
+    return float(bundle.model.cost_head(z).squeeze(-1).item()), None
 
 
 def compute_walk_direction(bundle: LoadedBundle, z0: torch.Tensor) -> torch.Tensor:
@@ -843,6 +849,18 @@ def build_walk_records(
         normalize_direction=normalize_direction,
     )
 
+    ref_params = {
+        str(k): int(v) for k, v in (record.params or {}).items() if isinstance(v, int)
+    }
+
+    def _is_reference_sym_map(sym_map: Dict[str, int]) -> bool:
+        if not ref_params or not sym_map:
+            return False
+        shared = set(ref_params) & set(sym_map)
+        if not shared:
+            return False
+        return all(int(sym_map[k]) == ref_params[k] for k in shared)
+
     results: List[WalkRecord] = []
     pending_measure_indices_by_key: Dict[tuple[tuple[str, int], ...], List[int]] = {}
     pending_measure_states: List[Any] = []
@@ -852,13 +870,26 @@ def build_walk_records(
         oracle = bundle.registry.build_oracle_from_record(record)
         decoded = greedy_decode_from_z(bundle, oracle, ordered_names, z)
 
+        decoded_sym_map_int = {
+            k: int(v) for k, v in decoded.sym_map.items() if isinstance(v, int)
+        }
+        sym_key = make_sym_map_key(decoded_sym_map_int)
+        is_reference_sym = _is_reference_sym_map(decoded_sym_map_int)
+
         state = None
         state_build_ok = False
         state_build_error = None
         measurement = None
         predicted_score = predict_score(bundle, z)
 
-        if not decoded.final_violations:
+        if is_reference_sym:
+            measurement = {
+                "ok": True,
+                "usable_measurement": True,
+                "mean_cost": 0.0,
+                "reference_skip": True,
+            }
+        elif not decoded.final_violations:
             try:
                 state = gen.params_to_state(decoded.params)
                 state_build_ok = True
@@ -877,9 +908,6 @@ def build_walk_records(
             "predicted_score": predicted_score,
         }
         if state_build_ok:
-            sym_key = make_sym_map_key(
-                {k: int(v) for k, v in decoded.sym_map.items() if isinstance(v, int)}
-            )
             if sym_key in pending_measure_indices_by_key:
                 pending_measure_indices_by_key[sym_key].append(len(results))
             else:
@@ -889,14 +917,16 @@ def build_walk_records(
                 pending_measure_metas.append(measure_meta)
 
         recon_predict_cost: Optional[float] = None
+        recon_predict_std: Optional[float] = None
         if include_recon_predict and not decoded.final_violations:
             try:
-                recon_predict_cost = predict_recon_score(
+                recon_predict_cost, recon_predict_std = predict_recon_score(
                     bundle, ordered_names, decoded.params
                 )
             except Exception as err:  # pylint: disable=broad-except
                 print(f"[latent-walk] recon predict failed at step={step_index}: {type(err).__name__}: {err}")
                 recon_predict_cost = None
+                recon_predict_std = None
 
         walk_record = WalkRecord(
             step_index=step_index,
@@ -910,10 +940,23 @@ def build_walk_records(
             state_build_error=state_build_error,
             measurement=measurement,
             recon_predict_cost=recon_predict_cost,
+            recon_predict_std=recon_predict_std,
         )
         results.append(walk_record)
 
-    print(f"Unique sym_map entries across walk: {len({frozenset(rec.sym_map.items()) for rec in results})}")
+    unique_sym_count = len({
+        frozenset(rec.sym_map.items())
+        for rec in results
+        if not _is_reference_sym_map(rec.sym_map)
+    })
+    ref_match_count = sum(
+        1 for rec in results if _is_reference_sym_map(rec.sym_map)
+    )
+    print(
+        f"Walk records: total={len(results)} unique_sym_map={unique_sym_count} "
+        f"ref_skipped={ref_match_count} "
+        f"(duplicates kept; measurement deduped by sym_map)"
+    )
 
     _release_measurement_environment(bundle, generator=gen, keep_bundle=keep_bundle)
 
@@ -943,8 +986,10 @@ def build_walk_records(
                 for result_index in pending_measure_indices_by_key[sym_key]:
                     results[result_index].measurement = dict(measurement)
 
+            print("[latent-walk] measurement results")
             for grouped_record in _group_walk_records_by_sym_map(results):
                 log_grouped_candidate_result(grouped_record)
+            print("=" * 80)
         finally:
             if evicted_model_device is not None:
                 bundle.model.to(evicted_model_device)

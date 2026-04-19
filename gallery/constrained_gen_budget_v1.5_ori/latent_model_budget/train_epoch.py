@@ -149,7 +149,7 @@ def train_one_epoch(
             else:
                 nce_loss = soft_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce)
             loss = (
-                recon_loss
+                float(getattr(cfg.train, "lambda_recon", 1.0)) * recon_loss
                 + beta * kl_loss
                 + float(cfg.train.lambda_cost) * cost_loss
                 + float(cfg.train.lambda_nce) * nce_loss

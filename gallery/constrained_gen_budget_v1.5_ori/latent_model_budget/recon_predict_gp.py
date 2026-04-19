@@ -9,16 +9,48 @@ the VAE's training is completely unaffected.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 
-from .dataset import collate_prepared_samples
+from .dataset import collate_prepared_samples, PreparedSample
 from .model import LatentParamVAE
 from .tokenizer import ParamTokenizer
+
+
+SymMapKey = Tuple[Tuple[str, int], ...]
+
+
+def make_sym_map_key(sym_map: Dict[str, int]) -> SymMapKey:
+    return tuple(sorted((str(k), int(v)) for k, v in sym_map.items()))
+
+
+class WalkSampleBuffer:
+    """Dedup buffer of (sym_map -> PreparedSample) collected from latent walks.
+
+    Each entry corresponds to a measured walk candidate whose cost is the
+    measured ``mean_cost`` (already in negative-log scale, matching dataset
+    costs). Used to augment the GP training set on subsequent fits.
+    """
+
+    def __init__(self) -> None:
+        self._samples: Dict[SymMapKey, PreparedSample] = {}
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def __contains__(self, key: SymMapKey) -> bool:
+        return key in self._samples
+
+    def add(self, key: SymMapKey, sample: PreparedSample) -> None:
+        # latest walk wins for the same sym_map (cost may have refined)
+        self._samples[key] = sample
+
+    def samples(self) -> List[PreparedSample]:
+        return list(self._samples.values())
 
 
 @dataclass
@@ -33,6 +65,12 @@ class GPReconPredictor:
     def predict(self, z: torch.Tensor) -> float:
         z_np = z.detach().to(dtype=torch.float32).cpu().numpy().reshape(1, -1)
         return float(self.gp.predict(z_np)[0])
+
+    def predict_with_std(self, z: torch.Tensor) -> Tuple[float, float]:
+        """Posterior mean and standard deviation at z."""
+        z_np = z.detach().to(dtype=torch.float32).cpu().numpy().reshape(1, -1)
+        mean, std = self.gp.predict(z_np, return_std=True)
+        return float(mean[0]), float(std[0])
 
 
 def _select_indices(
@@ -70,14 +108,14 @@ def _select_indices(
 
 
 @torch.no_grad()
-def _collect_mu_and_cost(
+def _encode_samples(
     model: LatentParamVAE,
-    dataset,
+    samples: Sequence[PreparedSample],
     tokenizer: ParamTokenizer,
     device: torch.device,
     batch_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    samples = list(dataset.samples)
+    samples = list(samples)
     stride = max(int(batch_size), 1)
     mu_chunks: List[np.ndarray] = []
     cost_chunks: List[np.ndarray] = []
@@ -103,6 +141,17 @@ def _collect_mu_and_cost(
     return np.concatenate(mu_chunks, axis=0), np.concatenate(cost_chunks, axis=0)
 
 
+@torch.no_grad()
+def _collect_mu_and_cost(
+    model: LatentParamVAE,
+    dataset,
+    tokenizer: ParamTokenizer,
+    device: torch.device,
+    batch_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    return _encode_samples(model, list(dataset.samples), tokenizer, device, batch_size)
+
+
 def fit_gp_recon_predictor(
     *,
     model: LatentParamVAE,
@@ -113,34 +162,55 @@ def fit_gp_recon_predictor(
     random_n: int,
     batch_size: int = 128,
     seed: int = 0,
+    walk_buffer: Optional[WalkSampleBuffer] = None,
 ) -> Optional[GPReconPredictor]:
     """Fit a GP on (deterministic z, cost) for the selected training subset.
 
     The resulting predictor is intended to be passed to the latent walk and
     used in place of ``cost_head`` for the recon-predict step. The VAE itself
     stays in eval mode and its parameters are not touched.
+
+    When ``walk_buffer`` is supplied, its samples (one per unique sym_map seen
+    across prior walks, with measured mean_cost) are encoded with the current
+    encoder and concatenated to the training subset.
     """
     was_training = model.training
     model.eval()
     try:
         mu, costs = _collect_mu_and_cost(model, dataset, tokenizer, device, batch_size)
+        indices, selection = _select_indices(
+            costs, top_k=top_k, random_n=random_n, seed=seed
+        )
+        if mu.shape[0] == 0 or indices.shape[0] == 0:
+            x_train = np.empty((0, mu.shape[1] if mu.ndim == 2 else 0), dtype=np.float32)
+            y_train = np.empty((0,), dtype=np.float32)
+        else:
+            x_train = mu[indices]
+            y_train = costs[indices]
+
+        walk_added = 0
+        if walk_buffer is not None and len(walk_buffer) > 0:
+            wb_mu, wb_costs = _encode_samples(
+                model, walk_buffer.samples(), tokenizer, device, batch_size
+            )
+            if wb_mu.shape[0] > 0:
+                if x_train.shape[0] == 0:
+                    x_train = wb_mu
+                    y_train = wb_costs
+                else:
+                    x_train = np.concatenate([x_train, wb_mu], axis=0)
+                    y_train = np.concatenate([y_train, wb_costs], axis=0)
+                walk_added = int(wb_mu.shape[0])
     finally:
         if was_training:
             model.train()
 
-    if mu.shape[0] == 0:
-        print("[gp-recon] no valid (mu, cost) samples available; skipping GP fit")
+    if x_train.shape[0] == 0:
+        print("[gp-recon] no samples available (train+walk); skipping GP fit")
         return None
 
-    indices, selection = _select_indices(
-        costs, top_k=top_k, random_n=random_n, seed=seed
-    )
-    if indices.shape[0] == 0:
-        print("[gp-recon] selection produced 0 samples; skipping GP fit")
-        return None
-
-    x_train = mu[indices]
-    y_train = costs[indices]
+    if walk_added > 0:
+        selection = f"{selection}+walk{walk_added}"
 
     kernel = (
         ConstantKernel(1.0, (1e-3, 1e3))
@@ -154,12 +224,15 @@ def fit_gp_recon_predictor(
         random_state=int(seed),
     )
     gp.fit(x_train, y_train)
-    pred = gp.predict(x_train)
+    pred, pred_std = gp.predict(x_train, return_std=True)
     mse = float(np.mean((pred - y_train) ** 2))
+    train_std_mean = float(np.mean(pred_std))
+    train_std_max = float(np.max(pred_std))
     print(
         f"[gp-recon] GP fitted: selection={selection} "
         f"n={int(x_train.shape[0])} dim={int(x_train.shape[1])} "
-        f"train_mse={mse:.6f}"
+        f"train_mse={mse:.6f} train_std_mean={train_std_mean:.6f} "
+        f"train_std_max={train_std_max:.6f}"
     )
     return GPReconPredictor(
         gp=gp,

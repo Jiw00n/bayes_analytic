@@ -23,19 +23,31 @@ else:
 
 
 SEARCH_SPACE = {
-    "train.learning_rate": [5e-4, 7e-4],
-    "train.lambda_nce": [0.1, 0.2],
-    "train.tau_nce": [0.2, 0.3],
-    "train.beta_end": [0.002, 0.003],
-    "train.beta_warmup_epochs": [10, 20],
-    "train.order_nce": [True, False],
+    "train.beta_end": [0.005],
+    "train.beta_warmup_epochs": [10],
+    "train.order_nce": [True],
     "train.nce_mu": [False],
-    "train.label_smoothing": [0.0, 0.1],
-    "train.use_compressed_teacher_forcing": [True, False],
+    "model.adaln": [True],
+
+    "model.num_encoder_layers": [3],
+    "model.num_decoder_layers": [3],
+    "model.d_model": [128],
+    "model.dim_feedforward": [256],
+    "model.latent_dim": [32],
+    "model.cost_hidden_dim": [64],
+    "model.nhead": [4],
+    "model.latent_token_count": [4],
+
+    "train.num_epochs": [100],
+    "train.learning_rate": [3e-4],
+    "train.lambda_nce": [0.2, 0.1],
+    "train.tau_nce": [0.2, 0.3],
+    "train.lambda_recon": [1.0],
+    "train.label_smoothing": [0],
 }
 
-BEST_METRIC = "val_full_sequence_exact_match"
-BEST_MODE = "max"
+# BEST_METRIC = "val_full_sequence_exact_match"
+# BEST_MODE = "max"
 
 
 _SHARED_DATASET_ARTIFACTS: dict[str, dict] = {}
@@ -113,10 +125,10 @@ def set_nested_attr(obj, dotted_key: str, value):
 def run_one(exp_idx: int, params: dict) -> None:
     cfg = build_config()
 
-    cfg.train.num_epochs = 100
-    cfg.train.early_stop_min_delta = 1e-4
-    cfg.train.best_metric_name = BEST_METRIC
-    cfg.train.best_metric_mode = BEST_MODE
+    # cfg.train.num_epochs = 100
+    # cfg.train.early_stop_min_delta = 1e-4
+    # cfg.train.best_metric_name = BEST_METRIC
+    # cfg.train.best_metric_mode = BEST_MODE
 
     for k, v in params.items():
         set_nested_attr(cfg, k, v)
@@ -133,8 +145,8 @@ def main():
     combos = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
 
     for idx, params in enumerate(combos, start=1):
-        if idx <= 186: 
-            continue
+        # if idx <= 1: 
+        #     continue
         print(f"\n===== [{idx}/{len(combos)}] {params} =====")
         run_one(idx, deepcopy(params))
 

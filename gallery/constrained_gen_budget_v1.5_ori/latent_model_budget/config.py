@@ -8,10 +8,11 @@ from typing import List, Optional
 
 DEFAULT_JSON_PATH = [
     # "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor/584_([cb7a0e9e733d26ffc00e7f6c9cc0f879,[1,128,128,32],[1,1,32,16],[1,1,1,16],[1,128,128,16]],cuda).json",
-    "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor/1490_([3eda1939e30b947e921f5e1814346365,[1,56,56,128],[6,6,32,128],[1,56,56,32]],cuda).json"
+    # "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor/1490_([3eda1939e30b947e921f5e1814346365,[1,56,56,128],[6,6,32,128],[1,56,56,32]],cuda).json",
+    "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_family_ansor/415_([e7c984cba151d5c7c1e081f0b1910087,[1,112,112,32],[3,3,32,1],[1,1,1,32],[1,112,112,32]],cuda).json"
 ]
 DEFAULT_NETWORK_INFO_FOLDER = "/root/work/tvm-ansor/gallery/dataset/network_info_all"
-DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget_v1.5_ori/checkpoints_all/1490"
+DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget_v1.5_ori/checkpoints_all/415"
 
 
 @dataclass
@@ -47,6 +48,7 @@ class TrainConfig:
     beta_start: float = 1e-4
     beta_end: float = 0.003
     beta_warmup_epochs: int = 20
+    lambda_recon: float = 1.0
     lambda_cost: float = 0.01
     lambda_nce: float = 0.2
     tau_nce: float = 0.3
@@ -65,7 +67,6 @@ class TrainConfig:
     latent_walk_predict_gp_top_k: int = 800
     latent_walk_predict_gp_random_n: int = 200
     label_smoothing: float = 0.0
-    use_compressed_teacher_forcing: bool = True
 
 
     batch_size: int = 128
@@ -109,6 +110,7 @@ class TrainConfig:
     resume_from: Optional[str] = None
     device: str = "cuda"
     debug_invalid_step: bool = False
+    use_compressed_teacher_forcing: bool = False
 
 @dataclass
 class EvalConfig:

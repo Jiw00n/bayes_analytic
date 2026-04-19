@@ -13,8 +13,18 @@ try:
 except Exception:  # pragma: no cover
     wandb = None
 
+import dataclasses
+import math
+
 from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples
-from .dataset import DatasetBundle, build_dataset_bundle
+from .dataset import (
+    DatasetBundle,
+    _build_prepared_sample,
+    _get_generator_for_record,
+    budget_enabled,
+    build_dataset_bundle,
+    get_model_param_order,
+)
 from .inference import greedy_decode_sample, pretty_print_reconstruction
 from .model import LatentParamVAE
 from .runtime_utils import (
@@ -26,7 +36,11 @@ from .runtime_utils import (
     save_training_artifacts,
     seed_everything,
 )
-from .recon_predict_gp import fit_gp_recon_predictor
+from .recon_predict_gp import (
+    WalkSampleBuffer,
+    fit_gp_recon_predictor,
+    make_sym_map_key,
+)
 from .tokenizer import ParamTokenizer
 from .train_epoch import train_one_epoch
 from .train_eval import (
@@ -121,13 +135,19 @@ def _summarize_walk_records(
         summary["walk/best_predicted_cost"] = float(max(pred_costs))
         summary["walk/mean_predicted_cost"] = float(sum(pred_costs) / len(pred_costs))
 
-    recon_costs = [
-        float(r.recon_predict_cost) for r in records
-        if getattr(r, "recon_predict_cost", None) is not None
+    recon_records = [
+        r for r in records if getattr(r, "recon_predict_cost", None) is not None
     ]
-    if recon_costs:
+    if recon_records:
+        recon_costs = [float(r.recon_predict_cost) for r in recon_records]
         summary["walk/best_recon_predict_cost"] = float(max(recon_costs))
         summary["walk/mean_recon_predict_cost"] = float(sum(recon_costs) / len(recon_costs))
+        best_recon_record = max(
+            recon_records, key=lambda r: float(r.recon_predict_cost)
+        )
+        best_std = getattr(best_recon_record, "recon_predict_std", None)
+        if best_std is not None:
+            summary["walk/best_recon_predict_std"] = float(best_std)
 
     measured_novel: list[tuple[float, float]] = []
     true_cost_at_alpha0: Optional[float] = None
@@ -173,6 +193,7 @@ def _merge_walk_summaries(summaries: list[Dict[str, float]]) -> Dict[str, float]
     recon_weighted_sum = 0.0
     recon_weight = 0.0
     best_recon: Optional[float] = None
+    best_recon_std: Optional[float] = None
 
     for summary in summaries:
         if not summary:
@@ -209,6 +230,12 @@ def _merge_walk_summaries(summaries: list[Dict[str, float]]) -> Dict[str, float]
             best_recon is None or best_recon_summary > best_recon
         ):
             best_recon = float(best_recon_summary)
+            best_recon_std_summary = summary.get("walk/best_recon_predict_std")
+            best_recon_std = (
+                float(best_recon_std_summary)
+                if best_recon_std_summary is not None
+                else None
+            )
 
     merged["walk/num_records"] = float(num_records)
     merged["walk/num_steps"] = total_steps
@@ -227,7 +254,85 @@ def _merge_walk_summaries(summaries: list[Dict[str, float]]) -> Dict[str, float]
         merged["walk/mean_recon_predict_cost"] = recon_weighted_sum / recon_weight
     if best_recon is not None:
         merged["walk/best_recon_predict_cost"] = best_recon
+    if best_recon_std is not None:
+        merged["walk/best_recon_predict_std"] = best_recon_std
     return merged
+
+
+def _ingest_walk_records_into_buffer(
+    walk_buffer: WalkSampleBuffer,
+    *,
+    walk_records,
+    ref_record: JsonSampleRecord,
+    registry: GeneratorRegistry,
+    tokenizer: ParamTokenizer,
+    config,
+) -> None:
+    """Add measured walk records into the GP-augmentation buffer.
+
+    Each walk record contributes one entry keyed by its sym_map; entries are
+    PreparedSamples encoded with the same param order the dataset uses, with
+    `cost` set to the measured negative-log mean cost.
+    """
+    include_budget = budget_enabled(config)
+    try:
+        gen = _get_generator_for_record(ref_record, registry)
+        order = get_model_param_order(gen, include_budget=include_budget)
+    except Exception as err:  # pragma: no cover
+        print(f"[walk-buffer] cannot resolve param order: {type(err).__name__}: {err}")
+        return
+
+    added = 0
+    skipped_dup = 0
+    for record in walk_records:
+        if not getattr(record, "state_build_ok", False):
+            continue
+        meas = getattr(record, "measurement", None) or {}
+        if not (meas.get("ok") and meas.get("usable_measurement")):
+            continue
+        mean_cost = meas.get("mean_cost")
+        if mean_cost is None or not math.isfinite(float(mean_cost)):
+            continue
+
+        sym_key = make_sym_map_key(
+            {str(k): int(v) for k, v in record.sym_map.items() if isinstance(v, int)}
+        )
+        if sym_key in walk_buffer:
+            skipped_dup += 1
+            continue
+
+        try:
+            ordered_values = [int(record.params[name]) for name in order]
+        except KeyError:
+            continue
+
+        sample_id = f"{ref_record.sample_id}_walk_{abs(hash(sym_key)) & 0xFFFFFFFF:08x}"
+        synthesized = dataclasses.replace(
+            ref_record,
+            sample_id=sample_id,
+            params=dict(record.params),
+            cost=float(mean_cost),
+        )
+        try:
+            prepared = _build_prepared_sample(
+                synthesized,
+                order,
+                ordered_values,
+                tokenizer,
+                registry=registry,
+                include_candidate_masks=False,
+            )
+        except Exception as err:  # pragma: no cover
+            print(f"[walk-buffer] prepare failed: {type(err).__name__}: {err}")
+            continue
+        walk_buffer.add(sym_key, prepared)
+        added += 1
+
+    if added or skipped_dup:
+        print(
+            f"[walk-buffer] added={added} dup_skipped={skipped_dup} "
+            f"buffer_size={len(walk_buffer)}"
+        )
 
 
 def _run_periodic_latent_walk(
@@ -251,6 +356,7 @@ def _run_periodic_latent_walk(
     include_recon_predict: bool = False,
     include_measurement: bool = True,
     recon_predictor=None,
+    walk_buffer: Optional[WalkSampleBuffer] = None,
 ) -> Dict[str, float]:
     here = Path(__file__).resolve().parent.parent
     if str(here) not in sys.path:
@@ -321,6 +427,15 @@ def _run_periodic_latent_walk(
             per_rank_summaries.append(
                 _summarize_walk_records(walk_records, reference_params=reference_params)
             )
+            if walk_buffer is not None and walk_records:
+                _ingest_walk_records_into_buffer(
+                    walk_buffer,
+                    walk_records=walk_records,
+                    ref_record=ref_record,
+                    registry=registry,
+                    tokenizer=tokenizer,
+                    config=config,
+                )
     finally:
         if was_training:
             model.train()
@@ -389,14 +504,15 @@ def _build_wandb_project_name(config, bundle: DatasetBundle) -> str:
 
 def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
     name = (
-        f"lr{config.train.learning_rate}"
+        f"ep{config.train.num_epochs}"
+        f"_lr{config.train.learning_rate}"
         f"_nce{config.train.lambda_nce}"
-        f"_tau{config.train.tau_nce}"
+        f"_t{config.train.tau_nce}"
         f"_kl{config.train.beta_end}"
-        f"_warm{config.train.beta_warmup_epochs}"
+        f"_bw{config.train.beta_warmup_epochs}"
     )
     if config.train.lambda_cost != 0.01:
-        name += f"_cost{config.train.lambda_cost}"
+        name += f"_lc{config.train.lambda_cost}"
     name += f"_cdim{config.model.cost_hidden_dim}"
     if bool(config.train.order_nce):
         name += "_order"
@@ -431,10 +547,10 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
     for ridge_payload in latent_cost_ridges:
         alpha = float(ridge_payload["alpha"])
         alpha_suffix = _alpha_metric_suffix(alpha)
-        print(
-            f"[train] latent cost ridge ready: samples={ridge_payload['num_samples']} "
-            f"alpha={alpha:.2e} train_mse={ridge_payload['train_mse']:.6f}"
-        )
+        # print(
+        #     f"[train] latent cost ridge ready: samples={ridge_payload['num_samples']} "
+        #     f"alpha={alpha:.2e} train_mse={ridge_payload['train_mse']:.6f}"
+        # )
         if alpha == float(ridge_alphas[0]):
             ridge_metrics["train_ridge_mse"] = float(ridge_payload["train_mse"])
         ridge_metrics[f"train_ridge_alpha_{alpha_suffix}_mse"] = float(ridge_payload["train_mse"])
@@ -478,14 +594,14 @@ def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, devic
             f"val_cost_head_actual_top1_pred_rank : {int(cost_metrics['cost_head_actual_top1_pred_rank'])}\n"
             f"val_cost_head_pred_top1_actual_cost : {cost_metrics['cost_head_pred_top1_actual_cost']:.6f}\n"
             f"val_cost_head_pred_top10_mean_actual_cost : {cost_metrics['cost_head_pred_top10_mean_actual_cost']:.6f}\n"
-            f"val_cost_head_pred_top20_mean_actual_cost : {cost_metrics['cost_head_pred_top20_mean_actual_cost']:.6f}\n"
+            # f"val_cost_head_pred_top20_mean_actual_cost : {cost_metrics['cost_head_pred_top20_mean_actual_cost']:.6f}\n"
         )
     if "cost_vec_actual_top1_pred_rank" in cost_metrics:
         print(
             f"val_cost_vec_actual_top1_pred_rank : {int(cost_metrics['cost_vec_actual_top1_pred_rank'])}\n"
             f"val_cost_vec_pred_top1_actual_cost : {cost_metrics['cost_vec_pred_top1_actual_cost']:.6f}\n"
             f"val_cost_vec_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_pred_top10_mean_actual_cost']:.6f}\n"
-            f"val_cost_vec_pred_top20_mean_actual_cost : {cost_metrics['cost_vec_pred_top20_mean_actual_cost']:.6f}\n"
+            # f"val_cost_vec_pred_top20_mean_actual_cost : {cost_metrics['cost_vec_pred_top20_mean_actual_cost']:.6f}\n"
         )
     for key, value in sorted(cost_metrics.items()):
         if key.startswith("cost_vec_alpha_") and key.endswith("_actual_top1_pred_rank"):
@@ -598,11 +714,7 @@ def train_main(config) -> Dict[str, float]:
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("[train] model architecture:")
-    print(model)
-    print(
-        f"[train] model parameters: total={total_params:,} trainable={trainable_params:,}"
-    )
+    print(f"[train] model/total_params: {total_params:,}")
 
     wandb_run = None
     wandb_project = getattr(config.wandb, "project", None)
@@ -716,6 +828,7 @@ def train_main(config) -> Dict[str, float]:
     else:
         best_metric_value = float("inf")
     epochs_without_improve = 0
+    best_metric_epoch: Optional[int] = None
     last_summary: Dict[str, float] = {}
 
     if config.train.resume_from:
@@ -726,9 +839,13 @@ def train_main(config) -> Dict[str, float]:
         best_val_acc = float(payload.get("best_val_acc", best_val_acc))
         best_metric_value = float(payload.get("best_metric_value", best_metric_value))
         epochs_without_improve = int(payload.get("epochs_without_improve", epochs_without_improve))
+        best_metric_epoch = payload.get("best_metric_epoch", None)
+        if best_metric_epoch is not None:
+            best_metric_epoch = int(best_metric_epoch)
 
     best_metrics: Dict[str, float] = {}
     latent_cost_ridges: list[dict] = []
+    walk_sample_buffer = WalkSampleBuffer()
     timestamp = time.strftime("%m%d%H%M")
     latent_walk_every_n = int(getattr(config.train, "latent_walk_every_n_epochs", 0) or 0)
     latent_walk_on_final = bool(getattr(config.train, "latent_walk_on_final", False))
@@ -813,7 +930,6 @@ def train_main(config) -> Dict[str, float]:
             )
         )
 
-        last_summary = dict(summary)
         if "val_full_sequence_exact_match" in summary:
             best_exact_match = max(best_exact_match, float(summary["val_full_sequence_exact_match"]))
         if "val_token_accuracy" in summary:
@@ -822,11 +938,13 @@ def train_main(config) -> Dict[str, float]:
         # Run latent walk BEFORE improvement check so walk-based best metrics
         # (e.g. walk/best_measured_mean_cost) actually influence best.pt save.
         walk_summary: Dict[str, float] = {}
-        recon_predict_due = (
-            walk_recon_predict_enabled
-            and (epoch % walk_recon_predict_every_n == 0)
+        is_final_epoch = epoch == int(config.train.num_epochs)
+        recon_predict_due = walk_recon_predict_enabled and (
+            (epoch % walk_recon_predict_every_n == 0) or is_final_epoch
         )
-        walk_due = latent_walk_every_n > 0 and (epoch % latent_walk_every_n == 0)
+        walk_due = latent_walk_every_n > 0 and (
+            (epoch % latent_walk_every_n == 0) or is_final_epoch
+        )
         # Re-encode is computed inside the walk, so the walk must run whenever
         # re-encode is due, even off the regular walk cadence.
         if walk_due or recon_predict_due:
@@ -843,6 +961,7 @@ def train_main(config) -> Dict[str, float]:
                     random_n=walk_recon_predict_gp_random_n,
                     batch_size=config.eval.batch_size,
                     seed=int(getattr(config.data, "seed", 0)),
+                    walk_buffer=walk_sample_buffer,
                 )
             walk_summary = _run_periodic_latent_walk(
                 model=model,
@@ -864,9 +983,13 @@ def train_main(config) -> Dict[str, float]:
                 include_recon_predict=include_recon_predict,
                 include_measurement=include_measurement,
                 recon_predictor=walk_recon_predictor,
+                walk_buffer=walk_sample_buffer if include_measurement else None,
             )
             if walk_summary:
                 summary.update(walk_summary)
+
+        # Snapshot AFTER walk so the latest walk metrics survive into final.
+        last_summary = dict(summary)
 
         current_metric = summary.get(best_metric_name)
         improved = False
@@ -900,6 +1023,7 @@ def train_main(config) -> Dict[str, float]:
             best_val_acc=best_val_acc,
             best_metric_name=best_metric_name,
             best_metric_value=best_metric_value,
+            best_metric_epoch=best_metric_epoch,
             epochs_without_improve=epochs_without_improve,
             config=config,
             tokenizer=tokenizer,
@@ -912,12 +1036,17 @@ def train_main(config) -> Dict[str, float]:
             if current_metric is not None:
                 best_metric_value = float(current_metric)
             epochs_without_improve = 0
+            best_metric_epoch = int(epoch)
             best_metrics = dict(summary)
             checkpoint_kwargs["best_metric_value"] = best_metric_value
             checkpoint_kwargs["epochs_without_improve"] = epochs_without_improve
+            checkpoint_kwargs["best_metric_epoch"] = best_metric_epoch
             save_checkpoint(best_checkpoint_path, **checkpoint_kwargs)
             save_checkpoint(checkpoint_path, **checkpoint_kwargs)
-            print(f"[train] best updated: {best_metric_name}={best_metric_value:.6f}")
+            print(
+                f"[train] best updated: {best_metric_name}={best_metric_value:.6f} "
+                f"@ epoch {best_metric_epoch}"
+            )
         else:
             if can_early_stop:
                 epochs_without_improve += 1
@@ -951,7 +1080,18 @@ def train_main(config) -> Dict[str, float]:
         model.to(device)
         print(f"[train] reloaded best checkpoint from {best_checkpoint_path}")
 
+    # Start from best_metrics (snapshot at the best epoch) but overlay the
+    # latest epoch's walk-related metrics so the very last walk (e.g. epoch
+    # num_epochs) is reflected in the final report instead of being shadowed
+    # by the walk recorded during the best epoch.
     final_metrics = dict(best_metrics if best_metrics else last_summary)
+    if best_metrics and last_summary:
+        for key, value in last_summary.items():
+            if key.startswith("walk/") or "walk/" in key:
+                final_metrics[key] = value
+    if best_metric_epoch is not None:
+        final_metrics["walk/best_epoch"] = float(best_metric_epoch)
+    final_metrics["walk/best_cost"] = float(best_metric_value)
     final_metrics.update(
         _evaluate_final_checkpoint(
             model,
@@ -981,6 +1121,7 @@ def train_main(config) -> Dict[str, float]:
                 random_n=walk_recon_predict_gp_random_n,
                 batch_size=config.eval.batch_size,
                 seed=int(getattr(config.data, "seed", 0)),
+                walk_buffer=walk_sample_buffer,
             )
         final_walk_summary = _run_periodic_latent_walk(
             model=model,
@@ -1001,6 +1142,7 @@ def train_main(config) -> Dict[str, float]:
             use_latent_gradient=latent_walk_use_latent_gradient,
             include_recon_predict=walk_recon_predict_enabled,
             recon_predictor=final_walk_recon_predictor,
+            walk_buffer=walk_sample_buffer,
         )
         if final_walk_summary:
             final_metrics.update(
