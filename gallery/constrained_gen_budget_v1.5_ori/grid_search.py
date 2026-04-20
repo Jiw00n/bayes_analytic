@@ -23,27 +23,35 @@ else:
 
 
 SEARCH_SPACE = {
-    "train.beta_end": [0.005],
+    "train.beta_end": [0.003],
     "train.beta_warmup_epochs": [10],
     "train.order_nce": [True],
     "train.nce_mu": [False],
     "model.adaln": [True],
 
-    "model.num_encoder_layers": [3],
-    "model.num_decoder_layers": [3],
-    "model.d_model": [128],
-    "model.dim_feedforward": [256],
-    "model.latent_dim": [32],
-    "model.cost_hidden_dim": [64],
-    "model.nhead": [4],
-    "model.latent_token_count": [4],
+    # "model.num_encoder_layers": [3],
+    # "model.num_decoder_layers": [3],
+    # "model.d_model": [128],
+    # "model.dim_feedforward": [256, 384],
+    # "model.latent_dim": [24, 32],
+    # "model.cost_hidden_dim": [64],
+    # "model.nhead": [2, 4],
+    # "model.latent_token_count": [4],
 
     "train.num_epochs": [100],
-    "train.learning_rate": [3e-4],
-    "train.lambda_nce": [0.2, 0.1],
+    "train.learning_rate": [5e-4],
+    "train.lambda_nce": [0.2],
     "train.tau_nce": [0.2, 0.3],
-    "train.lambda_recon": [1.0],
-    "train.label_smoothing": [0],
+
+    # "train.cobo_sample_weighting": [True],
+    # "train.cobo_apply_to": [["cost", "nce"]],
+    # "train.weight_quantile": [0.85],         # cobo, weighted_cost_Vec
+    # "train.weight_sigma": [0.5],        # cobo, weighted_cost_Vec
+
+    "train.lambda_cost": [0.01],
+
+    # "train.label_smoothing": [0],
+    # "train.lambda_recon": [1.0],
 }
 
 # BEST_METRIC = "val_full_sequence_exact_match"

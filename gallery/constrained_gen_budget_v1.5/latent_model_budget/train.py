@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import sys
 from pathlib import Path
 import time
@@ -595,6 +596,8 @@ def train_main(config) -> Dict[str, float]:
     early_stop_min_delta = float(getattr(config.train, "early_stop_min_delta", 1e-4))
 
     scheduler_name = str(getattr(config.train, "scheduler_name", "none")).lower()
+    warmup_epochs = max(0, int(getattr(config.train, "warmup_epochs", 0) or 0))
+    warmup_start_factor = float(getattr(config.train, "warmup_start_factor", 0.1))
     if scheduler_name == "multistep":
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer,
@@ -611,8 +614,33 @@ def train_main(config) -> Dict[str, float]:
             threshold_mode="abs",
             min_lr=float(getattr(config.train, "plateau_min_lr", 1e-5)),
         )
+    elif scheduler_name == "cosine":
+        user_t_max = int(getattr(config.train, "cosine_t_max", 0) or 0)
+        if user_t_max > 0:
+            cosine_t_max = user_t_max
+        else:
+            cosine_t_max = max(1, int(config.train.num_epochs) - warmup_epochs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_t_max,
+            eta_min=float(getattr(config.train, "cosine_eta_min", 0.0)),
+        )
     else:
         scheduler = None
+
+    if warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=max(1e-8, warmup_start_factor),
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        print(
+            f"[train] warmup: epochs={warmup_epochs} "
+            f"start_factor={warmup_start_factor:.4g}"
+        )
+    else:
+        warmup_scheduler = None
     scaler = torch.cuda.amp.GradScaler(enabled=bool(config.train.use_amp and device.type == "cuda"))
 
     checkpoint_dir = save_training_artifacts(config.train.checkpoint_dir, config, tokenizer)
@@ -708,6 +736,17 @@ def train_main(config) -> Dict[str, float]:
             device,
         )
         summary.update(ridge_metrics)
+
+        train_cost_metrics = evaluate_cost_ranking(
+            model,
+            bundle.train_dataset,
+            tokenizer,
+            device,
+            batch_size=config.eval.batch_size,
+            latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
+        )
+        summary.update({f"train_{k}": float(v) for k, v in train_cost_metrics.items()})
+
         summary.update(
             _evaluate_validation_epoch(
                 model,
@@ -720,6 +759,22 @@ def train_main(config) -> Dict[str, float]:
                 latent_cost_ridges,
             )
         )
+
+        def _fmt(value) -> str:
+            return f"{float(value):+.4f}" if value is not None and math.isfinite(float(value)) else "nan"
+
+        for source in ("cost_head", "cost_vec"):
+            tr_all = summary.get(f"train_{source}_spearman")
+            tr_top = summary.get(f"train_{source}_spearman_top5pct")
+            va_all = summary.get(f"val_{source}_spearman")
+            va_top = summary.get(f"val_{source}_spearman_top5pct")
+            if tr_all is None and va_all is None:
+                continue
+            print(
+                f"[epoch {epoch}] {source} spearman "
+                f"train={_fmt(tr_all)} (top5%={_fmt(tr_top)}) "
+                f"val={_fmt(va_all)} (top5%={_fmt(va_top)})"
+            )
 
         last_summary = dict(summary)
         if "val_full_sequence_exact_match" in summary:
@@ -739,7 +794,9 @@ def train_main(config) -> Dict[str, float]:
         elif not best_checkpoint_path.exists():
             improved = True
 
-        if scheduler is not None:
+        if warmup_scheduler is not None and epoch <= warmup_epochs:
+            warmup_scheduler.step()
+        elif scheduler is not None:
             if scheduler_name == "plateau":
                 if current_metric is not None:
                     scheduler.step(float(current_metric))

@@ -234,7 +234,11 @@ def log_candidate_result(result: Dict[str, Any]) -> None:
     )
 
 
-def log_grouped_candidate_result(grouped_record: Dict[str, Any]) -> None:
+def log_grouped_candidate_result(
+    grouped_record: Dict[str, Any],
+    *,
+    reencode_label: str = "re_pred",
+) -> None:
     record = grouped_record["record"]
     alphas = grouped_record["alphas"]
     pred_costs = grouped_record["pred_costs"]
@@ -279,8 +283,11 @@ def log_grouped_candidate_result(grouped_record: Dict[str, Any]) -> None:
 
     mean_cost = measurement.get("mean_cost")
     mean_cost_text = "n/a" if mean_cost is None else f"{mean_cost:.4f}"
+    reencode_pred = record.reencode_cost_pred
+    reencode_text = "n/a" if reencode_pred is None else f"{reencode_pred:.6f}"
     print(
-        f"mean_cost={mean_cost_text}, pred_mean={pred_mean_text}, {alpha_text}"
+        f"mean_cost={mean_cost_text}, pred_mean={pred_mean_text}, "
+        f"{reencode_label}={reencode_text}, {alpha_text}"
         # f"log={measurement.get('measure_record_path')}"
     )
 
@@ -404,6 +411,8 @@ class LoadedBundle:
     cost_source: str
     device: torch.device
     recon_predictor: Optional[Any] = None  # GPReconPredictor; swaps in for cost_head in predict_recon_score
+    reencode_predictor: Optional[Any] = None  # ReEncodePredictor; used by predict_reencode_score
+    reencode_predictor_name: str = "cost_head"
 
 
 @dataclass
@@ -420,6 +429,7 @@ class WalkRecord:
     measurement: Any
     recon_predict_cost: Optional[float] = None
     recon_predict_std: Optional[float] = None
+    reencode_cost_pred: Optional[float] = None
 
 
 @dataclass
@@ -516,6 +526,8 @@ def make_bundle(
     use_latent_gradient: bool = False,
     timestamp: Optional[str] = None,
     recon_predictor: Optional[Any] = None,
+    reencode_predictor: Optional[Any] = None,
+    reencode_predictor_name: str = "cost_head",
 ) -> LoadedBundle:
     """Construct a LoadedBundle from already-loaded in-memory objects.
 
@@ -550,6 +562,8 @@ def make_bundle(
         cost_source=cost_source,
         device=device,
         recon_predictor=recon_predictor,
+        reencode_predictor=reencode_predictor,
+        reencode_predictor_name=reencode_predictor_name,
     )
 
 
@@ -758,6 +772,81 @@ def predict_score(bundle: LoadedBundle, z: torch.Tensor) -> float:
     return float((z @ bundle.cost_weight + bundle.cost_bias).item())
 
 
+@dataclass
+class CostHeadReEncodePredictor:
+    """Uses LatentParamVAE.cost_head(z) directly."""
+
+    model: LatentParamVAE
+
+    def predict(self, z: torch.Tensor) -> float:
+        z = z.to(dtype=torch.float32).view(1, -1)
+        return float(self.model.cost_head(z).squeeze(-1).item())
+
+
+@dataclass
+class RidgeReEncodePredictor:
+    """Linear predictor: z @ weight + bias."""
+
+    weight: torch.Tensor
+    bias: float
+    name: str = "cost_vec"
+
+    def predict(self, z: torch.Tensor) -> float:
+        z = z.to(device=self.weight.device, dtype=torch.float32).view(-1)
+        return float((z @ self.weight + self.bias).item())
+
+
+@torch.no_grad()
+def _encode_params_to_z(
+    bundle: LoadedBundle,
+    ordered_names: List[str],
+    params: Dict[str, int],
+) -> Optional[torch.Tensor]:
+    try:
+        ordered_values = [int(params[name]) for name in ordered_names]
+    except KeyError:
+        return None
+    tokenizer = bundle.tokenizer
+    enc_ids = torch.tensor(
+        [tokenizer.encode_values(ordered_names, ordered_values)],
+        dtype=torch.long,
+        device=bundle.device,
+    )
+    enc_var_ids = torch.tensor(
+        [tokenizer.encode_var_names(ordered_names)],
+        dtype=torch.long,
+        device=bundle.device,
+    )
+    enc_pad = enc_ids.eq(tokenizer.pad_id)
+    _, _, z_recon, _ = bundle.model.encode(
+        enc_ids, enc_var_ids, enc_pad, deterministic=True
+    )
+    return z_recon[0].to(device=bundle.device, dtype=torch.float32)
+
+
+@torch.no_grad()
+def predict_reencode_score(
+    bundle: LoadedBundle,
+    ordered_names: List[str],
+    params: Dict[str, int],
+) -> Optional[float]:
+    """Re-encode decoded params and score via the configured re-encode predictor.
+
+    Falls back to cost_head when ``bundle.reencode_predictor`` is None.
+    """
+    z = _encode_params_to_z(bundle, ordered_names, params)
+    if z is None:
+        return None
+    predictor = bundle.reencode_predictor
+    if predictor is None:
+        return float(bundle.model.cost_head(z.view(1, -1)).squeeze(-1).item())
+    return float(predictor.predict(z))
+
+
+# Backwards-compat alias — older code paths called this name explicitly.
+predict_cost_head_from_reencode = predict_reencode_score
+
+
 @torch.no_grad()
 def predict_recon_score(
     bundle: LoadedBundle,
@@ -827,6 +916,7 @@ def build_walk_records(
     include_recon_predict: bool = False,
     include_measurement: bool = True,
     keep_bundle: bool = False,
+    measurement_cache: Optional[Dict[tuple, Any]] = None,
 ) -> tuple[List[WalkRecord], StartZContext]:
     start_ctx = resolve_start_z(
         bundle,
@@ -908,7 +998,12 @@ def build_walk_records(
             "predicted_score": predicted_score,
         }
         if state_build_ok:
-            if sym_key in pending_measure_indices_by_key:
+            cached_measurement = (
+                measurement_cache.get(sym_key) if measurement_cache is not None else None
+            )
+            if cached_measurement is not None:
+                measurement = dict(cached_measurement)
+            elif sym_key in pending_measure_indices_by_key:
                 pending_measure_indices_by_key[sym_key].append(len(results))
             else:
                 pending_measure_indices_by_key[sym_key] = [len(results)]
@@ -928,6 +1023,19 @@ def build_walk_records(
                 recon_predict_cost = None
                 recon_predict_std = None
 
+        reencode_cost_pred: Optional[float] = None
+        if not decoded.final_violations:
+            try:
+                reencode_cost_pred = predict_reencode_score(
+                    bundle, ordered_names, decoded.params
+                )
+            except Exception as err:  # pylint: disable=broad-except
+                print(
+                    f"[latent-walk] reencode cost_head failed at step={step_index}: "
+                    f"{type(err).__name__}: {err}"
+                )
+                reencode_cost_pred = None
+
         walk_record = WalkRecord(
             step_index=step_index,
             alpha=alpha,
@@ -941,6 +1049,7 @@ def build_walk_records(
             measurement=measurement,
             recon_predict_cost=recon_predict_cost,
             recon_predict_std=recon_predict_std,
+            reencode_cost_pred=reencode_cost_pred,
         )
         results.append(walk_record)
 
@@ -953,9 +1062,9 @@ def build_walk_records(
         1 for rec in results if _is_reference_sym_map(rec.sym_map)
     )
     print(
-        f"Walk records: total={len(results)} unique_sym_map={unique_sym_count} "
+        f"Walk records: unique sym_map={unique_sym_count} "
+        f"total={len(results)} "
         f"ref_skipped={ref_match_count} "
-        f"(duplicates kept; measurement deduped by sym_map)"
     )
 
     _release_measurement_environment(bundle, generator=gen, keep_bundle=keep_bundle)
@@ -985,10 +1094,33 @@ def build_walk_records(
             for sym_key, measurement in zip(pending_measure_keys, measured_results):
                 for result_index in pending_measure_indices_by_key[sym_key]:
                     results[result_index].measurement = dict(measurement)
+                if measurement_cache is not None:
+                    prior = measurement_cache.get(sym_key)
+                    if prior is None:
+                        measurement_cache[sym_key] = dict(measurement)
+                    else:
+                        prior_ok = bool(prior.get("ok") and prior.get("usable_measurement"))
+                        curr_ok = bool(measurement.get("ok") and measurement.get("usable_measurement"))
+                        prior_mc = prior.get("mean_cost") if prior_ok else None
+                        curr_mc = measurement.get("mean_cost") if curr_ok else None
+                        if curr_mc is not None and (prior_mc is None or curr_mc > prior_mc):
+                            measurement_cache[sym_key] = dict(measurement)
 
             print("[latent-walk] measurement results")
-            for grouped_record in _group_walk_records_by_sym_map(results):
-                log_grouped_candidate_result(grouped_record)
+            grouped = _group_walk_records_by_sym_map(results)
+            grouped.sort(
+                key=lambda g: (
+                    g["record"].reencode_cost_pred
+                    if g["record"].reencode_cost_pred is not None
+                    else float("-inf")
+                ),
+                reverse=True,
+            )
+            reencode_label = f"re_pred[{bundle.reencode_predictor_name}]"
+            for grouped_record in grouped:
+                log_grouped_candidate_result(
+                    grouped_record, reencode_label=reencode_label
+                )
             print("=" * 80)
         finally:
             if evicted_model_device is not None:
@@ -1125,6 +1257,7 @@ def run_latent_walk(
     include_measurement: bool = True,
     bundle: Optional[LoadedBundle] = None,
     keep_bundle: bool = False,
+    measurement_cache: Optional[Dict[tuple, Any]] = None,
 ) -> List[WalkRecord]:
     walk_output_path, _ = _resolve_output_layout(
         checkpoint_path=checkpoint_path,
@@ -1158,6 +1291,7 @@ def run_latent_walk(
         include_recon_predict=include_recon_predict,
         include_measurement=include_measurement,
         keep_bundle=keep_bundle,
+        measurement_cache=measurement_cache,
     )
     if walk_output_path is not None:
         save_walk_records(records, walk_output_path)

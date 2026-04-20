@@ -44,24 +44,28 @@ class ModelConfig:
 class TrainConfig:
     batch_size: int = 128
     num_epochs: int = 100
-    learning_rate: float = 7e-4
-    scheduler_name: str = "plateau"   # "none" | "multistep" | "plateau"
+    learning_rate: float = 5e-4
+    scheduler_name: str = "cosine"   # "none" | "multistep" | "plateau" | "cosine"
     scheduler_milestones: List[int] = field(default_factory=lambda: [20])
     scheduler_gamma: float = 1.0 / 3.0
     plateau_factor: float = 0.5
     plateau_patience: int = 5
     plateau_threshold: float = 1e-4
     plateau_min_lr: float = 1e-5
+    cosine_t_max: int = 0
+    cosine_eta_min: float = 1e-5
+    warmup_epochs: int = 5
+    warmup_start_factor: float = 0.1
     early_stop_patience: int = 15
     early_stop_min_delta: float = 1e-4
     weight_decay: float = 1e-4
     grad_clip_norm: float = 1.0
     beta_start: float = 1e-4
     beta_end: float = 0.003
-    beta_warmup_epochs: int = 20
+    beta_warmup_epochs: int = 10
     lambda_cost: float = 0.01
     lambda_nce: float = 0.2
-    tau_nce: float = 0.3
+    tau_nce: float = 0.2
     cost_ridge_vec: bool = True
     ridge_alpha: float | List[float] = 0.1
     use_amp: bool = False
@@ -75,26 +79,26 @@ class TrainConfig:
     device: str = "cuda"
     debug_invalid_step: bool = False
     precompute_candidate_masks: bool = True
-    order_nce: bool = False
+    order_nce: bool = True
     nce_mu: bool = False
     lambda_latent_use: float = 0.0
     latent_use_margin: float = 0.0
     latent_wrong_top1_margin: float = 0.0
-    best_metric_name: str = "val_full_sequence_exact_match"
+    best_metric_name: str = "walk/best_measured_mean_cost"
     best_metric_mode: str = "max"   # "max" or "min"
     latent_walk_every_n_epochs: int = 10
     latent_walk_on_final: bool = False
     latent_walk_record_json: Optional[str] = None
     latent_walk_output_dir: Optional[str] = None
-    latent_walk_top_k: int = 3
+    latent_walk_top_k: int = 1
     latent_walk_num_steps: int = 30
     latent_walk_step_size: float = 0.25
     # CoBO-style sample weighting: higher cost → higher loss weight
-    cobo_sample_weighting: bool = False
-    cobo_weight_quantile: float = 0.95   # y_q: CDF threshold percentile
-    cobo_weight_sigma: float = 0.5       # σ as fraction of cost std (transition smoothness)
-    label_smoothing: float = 0.1         # label smoothing epsilon (0 = disabled)
-    early_param_weight_max: float = 2.5  # max loss weight for earliest positions (<=1 disables)
+    cobo_sample_weighting: bool = True
+    cobo_weight_quantile: float = 0.85   # y_q: CDF threshold percentile
+    cobo_weight_sigma: float = 0.25       # σ as fraction of cost std (transition smoothness)
+    label_smoothing: float = 0.0         # label smoothing epsilon (0 = disabled)
+    early_param_weight_max: float = 1.0  # max loss weight for earliest positions (<=1 disables)
     early_param_weight_power: float = 1.0  # decay curve exponent for early-position weighting
 
 
@@ -108,7 +112,7 @@ class EvalConfig:
 @dataclass
 class WandbConfig:
     # project: Optional[str] = "V1.5_grid_search"
-    project: Optional[str] = "V1.5_early_param"
+    project: Optional[str] = "V1.5_cobo"
 
 
 @dataclass

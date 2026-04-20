@@ -216,6 +216,9 @@ class LatentParamVAE(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.cost_hidden_dim, 1),
         )
+        # self.std = nn.Parameter(torch.tensor(1.0))
+        # self.mean = nn.Parameter(torch.tensor(0.0))
+        # self.cost_head = self.cost_predict
         # self.cost_head = nn.Parameter(torch.randn(cfg.latent_dim))
 
         self.lm_head = nn.Linear(d_model, vocab_size)
@@ -236,6 +239,11 @@ class LatentParamVAE(nn.Module):
             torch.full((seq_len, seq_len), float("-inf"), device=device),
             diagonal=1,
         )
+
+    # def cost_predict(self, z: torch.Tensor) -> torch.Tensor:
+    #     cost_pred = self.cost_head_net(z).squeeze(-1)
+    #     cost_pred = cost_pred * self.std + self.mean
+    #     return cost_pred
 
     def encode(
         self,

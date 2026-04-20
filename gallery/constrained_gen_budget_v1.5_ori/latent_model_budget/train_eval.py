@@ -14,7 +14,102 @@ from .adapter import GeneratorRegistry
 from .dataset import collate_prepared_samples
 from .inference import greedy_decode_batch
 from .model import LatentParamVAE
+from .recon_predict_gp import fit_gp_recon_predictor
+from .recon_predict_lgbm import fit_lgbm_ranker_recon_predictor
 from .tokenizer import ParamTokenizer
+
+
+VALID_REENCODE_PREDICTOR_NAMES = (
+    "cost_head",
+    "cost_vec",
+    "cost_vec_weighted",
+    "gp",
+    "lightgbm_ranker",
+)
+
+
+def _build_reencode_predictor(
+    *,
+    name: str,
+    model,
+    bundle,
+    tokenizer,
+    device,
+    latent_cost_ridges,
+    config,
+):
+    """Construct a re-encode predictor matching the configured name.
+
+    Training set for gp / lightgbm_ranker is the top-K + random-N training
+    subset only — walk-buffer samples are NOT included here (intentionally
+    different from the recon-predict GP which does include them).
+
+    - cost_head: returns None (tune_by_latent falls back to model.cost_head).
+    - cost_vec / cost_vec_weighted: wraps the corresponding ridge payload.
+    - gp: fits a fresh GP on the training subset.
+    - lightgbm_ranker: fits an LGBMRanker on the same selection as GP.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _here = _Path(__file__).resolve().parent.parent
+    if str(_here) not in _sys.path:
+        _sys.path.insert(0, str(_here))
+    from tune_by_latent import RidgeReEncodePredictor  # lazy import to avoid cycles
+
+    name = (name or "cost_head").lower()
+    if name not in VALID_REENCODE_PREDICTOR_NAMES:
+        print(
+            f"[reencode] unknown re_encode_predictor={name!r}; "
+            f"falling back to cost_head"
+        )
+        name = "cost_head"
+
+    if name == "cost_head":
+        return None
+    if name in ("cost_vec", "cost_vec_weighted"):
+        want_weighted = name == "cost_vec_weighted"
+        payload = next(
+            (
+                p for p in (latent_cost_ridges or [])
+                if bool(p.get("weighted", False)) == want_weighted
+            ),
+            None,
+        )
+        if payload is None or "weight" not in payload:
+            print(
+                f"[reencode] {name} ridge not fitted yet; "
+                f"falling back to cost_head"
+            )
+            return None
+        weight = payload["weight"].detach().to(dtype=torch.float32, device=device)
+        bias = float(payload.get("bias", 0.0))
+        return RidgeReEncodePredictor(weight=weight, bias=bias, name=name)
+    if name == "gp":
+        return fit_gp_recon_predictor(
+            model=model,
+            dataset=bundle.train_dataset,
+            tokenizer=tokenizer,
+            device=device,
+            top_k=int(getattr(config.train, "latent_walk_predict_gp_top_k", 800)),
+            random_n=int(getattr(config.train, "latent_walk_predict_gp_random_n", 200)),
+            batch_size=config.eval.batch_size,
+            seed=int(getattr(config.data, "seed", 0)),
+            walk_buffer=None,
+        )
+    if name == "lightgbm_ranker":
+        return fit_lgbm_ranker_recon_predictor(
+            model=model,
+            dataset=bundle.train_dataset,
+            tokenizer=tokenizer,
+            device=device,
+            top_k=int(getattr(config.train, "latent_walk_predict_gp_top_k", 800)),
+            random_n=int(getattr(config.train, "latent_walk_predict_gp_random_n", 200)),
+            batch_size=config.eval.batch_size,
+            seed=int(getattr(config.data, "seed", 0)),
+            walk_buffer=None,
+        )
+    return None
 
 
 def _build_singleton_position_mask(
@@ -254,17 +349,43 @@ def _alpha_metric_suffix(alpha: float) -> str:
     return text.replace("-", "m").replace("+", "").replace(".", "p")
 
 
+def _spearman_from_pairs(scored_items: Sequence[tuple[float, float, str]]) -> float:
+    if len(scored_items) < 2:
+        return float("nan")
+    try:
+        from scipy.stats import spearmanr
+    except Exception:  # pragma: no cover
+        return float("nan")
+    preds = [item[0] for item in scored_items]
+    actuals = [item[1] for item in scored_items]
+    result = spearmanr(preds, actuals)
+    rho = getattr(result, "correlation", None)
+    if rho is None:
+        rho = result[0]
+    rho = float(rho)
+    return rho if math.isfinite(rho) else float("nan")
+
+
 def _build_named_latent_cost_ridges(latent_cost_ridges: Sequence[dict] | None) -> Dict[str, dict]:
     if not latent_cost_ridges:
         return {}
 
-    named: Dict[str, dict] = {"cost_vec": latent_cost_ridges[0]}
-    if len(latent_cost_ridges) == 1:
-        return named
+    unweighted = [p for p in latent_cost_ridges if not bool(p.get("weighted", False))]
+    weighted = [p for p in latent_cost_ridges if bool(p.get("weighted", False))]
 
-    for payload in latent_cost_ridges:
-        alpha = float(payload["alpha"])
-        named[f"cost_vec_alpha_{_alpha_metric_suffix(alpha)}"] = payload
+    named: Dict[str, dict] = {}
+    if unweighted:
+        named["cost_vec"] = unweighted[0]
+        if len(unweighted) > 1:
+            for payload in unweighted:
+                alpha = float(payload["alpha"])
+                named[f"cost_vec_alpha_{_alpha_metric_suffix(alpha)}"] = payload
+    if weighted:
+        named["cost_vec_weighted"] = weighted[0]
+        if len(weighted) > 1:
+            for payload in weighted:
+                alpha = float(payload["alpha"])
+                named[f"cost_vec_weighted_alpha_{_alpha_metric_suffix(alpha)}"] = payload
     return named
 
 
@@ -463,6 +584,13 @@ def evaluate_cost_ranking(
             pred_topk_mean_actual_cost = sum(item[1] for item in pred_sorted[:topk]) / topk
             metrics[f"{source_name}_pred_top{k}_mean_actual_cost"] = float(pred_topk_mean_actual_cost)
 
+        metrics[f"{source_name}_spearman"] = _spearman_from_pairs(scored_items)
+        top5_n = max(2, int(math.ceil(len(actual_sorted) * 0.05)))
+        top5_n = min(top5_n, len(actual_sorted))
+        metrics[f"{source_name}_spearman_top5pct"] = _spearman_from_pairs(
+            actual_sorted[:top5_n]
+        )
+
     return metrics
 
 
@@ -474,6 +602,8 @@ def fit_latent_cost_ridge(
     device: torch.device,
     alpha: float,
     batch_size: int = 128,
+    sample_weight_quantile: float | None = None,
+    sample_weight_sigma: float | None = None,
 ) -> dict | None:
     model.eval()
 
@@ -511,15 +641,33 @@ def fit_latent_cost_ridge(
     reg[-1, -1] = 0.0
     reg = reg * float(alpha)
 
-    lhs = design.T @ design + reg
-    rhs = design.T @ y
+    weighted = sample_weight_quantile is not None and sample_weight_sigma is not None
+    if weighted:
+        from .train_losses import compute_cobo_sample_weights
+
+        y32 = y.to(dtype=torch.float32)
+        mask_all = torch.ones_like(y32, dtype=torch.bool)
+        w = compute_cobo_sample_weights(
+            y32,
+            mask_all,
+            quantile=float(sample_weight_quantile),
+            sigma=float(sample_weight_sigma),
+        ).to(dtype=torch.float64)
+        sqrt_w = torch.sqrt(w.clamp_min(1e-8))
+        design_w = sqrt_w.unsqueeze(1) * design
+        y_w = sqrt_w * y
+        lhs = design_w.T @ design_w + reg
+        rhs = design_w.T @ y_w
+    else:
+        lhs = design.T @ design + reg
+        rhs = design.T @ y
     try:
         coeff = torch.linalg.solve(lhs, rhs)
     except RuntimeError:
         coeff = torch.linalg.pinv(lhs) @ rhs
 
     pred = (design @ coeff).to(dtype=torch.float64)
-    return {
+    payload = {
         "weight": coeff[:-1].to(dtype=torch.float32).contiguous(),
         "bias": float(coeff[-1].item()),
         "alpha": float(alpha),
@@ -528,7 +676,12 @@ def fit_latent_cost_ridge(
         "feature_name": "deterministic_z",
         "target_name": "neg_log_cost",
         "train_mse": float(torch.mean((pred - y) ** 2).item()),
+        "weighted": bool(weighted),
     }
+    if weighted:
+        payload["weight_quantile"] = float(sample_weight_quantile)
+        payload["weight_sigma"] = float(sample_weight_sigma)
+    return payload
 
 
 @torch.no_grad()
@@ -539,6 +692,8 @@ def fit_latent_cost_ridges(
     device: torch.device,
     alphas: Sequence[float],
     batch_size: int = 128,
+    sample_weight_quantile: float | None = None,
+    sample_weight_sigma: float | None = None,
 ) -> List[dict]:
     fitted: List[dict] = []
     for alpha in alphas:
@@ -549,6 +704,8 @@ def fit_latent_cost_ridges(
             device,
             alpha=float(alpha),
             batch_size=batch_size,
+            sample_weight_quantile=sample_weight_quantile,
+            sample_weight_sigma=sample_weight_sigma,
         )
         if payload is not None:
             fitted.append(payload)

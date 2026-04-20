@@ -52,6 +52,9 @@ class WalkSampleBuffer:
     def samples(self) -> List[PreparedSample]:
         return list(self._samples.values())
 
+    def items(self):
+        return self._samples.items()
+
 
 @dataclass
 class GPReconPredictor:

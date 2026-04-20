@@ -23,24 +23,23 @@ else:
 
 
 SEARCH_SPACE = {
-    "train.learning_rate": [5e-4, 7e-4],
+    "train.learning_rate": [5e-4],
     "train.lambda_nce": [0.2],
     "train.tau_nce": [0.2],
-    "train.beta_end": [0.002],
-    "train.beta_warmup_epochs": [20],
-    "train.order_nce": [False],
+    "train.beta_end": [0.003],
+    "train.beta_warmup_epochs": [10],
+    "train.order_nce": [True],
     "train.nce_mu": [False],
     "model.adaln": [True],
     "train.lambda_cost": [0.01],
     "train.label_smoothing": [0],
     "train.latent_walk_top_k": [1],
     "train.cost_ridge_vec": [True],
-    # "train.cobo_sample_weighting": [True],
-    # "train.cobo_weight_sigma": [1.0, 1.5],
+    "train.cobo_sample_weighting": [True],
+    "train.cobo_weight_quantile": [0.85],
+    "train.cobo_weight_sigma": [1.0],
 }
 
-BEST_METRIC = "val_full_sequence_exact_match"
-BEST_MODE = "max"
 
 
 _SHARED_DATASET_ARTIFACTS: dict[str, dict] = {}
@@ -120,8 +119,6 @@ def run_one(exp_idx: int, params: dict) -> None:
 
     cfg.train.num_epochs = 100
     cfg.train.early_stop_min_delta = 1e-4
-    cfg.train.best_metric_name = BEST_METRIC
-    cfg.train.best_metric_mode = BEST_MODE
 
     for k, v in params.items():
         set_nested_attr(cfg, k, v)

@@ -186,6 +186,23 @@ def _alpha_metric_suffix(alpha: float) -> str:
     return text.replace("-", "m").replace("+", "").replace(".", "p")
 
 
+def _spearman_from_pairs(scored_items: Sequence[tuple[float, float, str]]) -> float:
+    if len(scored_items) < 2:
+        return float("nan")
+    try:
+        from scipy.stats import spearmanr
+    except Exception:  # pragma: no cover
+        return float("nan")
+    preds = [item[0] for item in scored_items]
+    actuals = [item[1] for item in scored_items]
+    result = spearmanr(preds, actuals)
+    rho = getattr(result, "correlation", None)
+    if rho is None:
+        rho = result[0]
+    rho = float(rho)
+    return rho if math.isfinite(rho) else float("nan")
+
+
 def _build_named_latent_cost_ridges(latent_cost_ridges: Sequence[dict] | None) -> Dict[str, dict]:
     if not latent_cost_ridges:
         return {}
@@ -381,6 +398,13 @@ def evaluate_cost_ranking(
         metrics[f"{source_name}_actual_top1_pred_rank"] = float(actual_top1_pred_rank)
         metrics[f"{source_name}_pred_top1_actual_cost"] = float(pred_top1_actual_cost)
         metrics[f"{source_name}_pred_top10_mean_actual_cost"] = float(pred_topk_mean_actual_cost)
+
+        metrics[f"{source_name}_spearman"] = _spearman_from_pairs(scored_items)
+        top5_n = max(2, int(math.ceil(len(actual_sorted) * 0.05)))
+        top5_n = min(top5_n, len(actual_sorted))
+        metrics[f"{source_name}_spearman_top5pct"] = _spearman_from_pairs(
+            actual_sorted[:top5_n]
+        )
 
     return metrics
 

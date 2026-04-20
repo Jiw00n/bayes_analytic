@@ -24,6 +24,7 @@ from .train_eval import (
 )
 from .train_losses import (
     beta_by_epoch,
+    compute_cobo_sample_weights,
     kl_divergence,
     latent_use_margin_loss,
     masked_cross_entropy,
@@ -115,16 +116,35 @@ def train_one_epoch(
                 decoder_var_ids,
                 pad_token_id=tokenizer.pad_id,
             )
+            # CoBO-style sample weighting
+            cobo_sw = None
+            cobo_apply = set()
+            if getattr(cfg.train, "cobo_sample_weighting", False):
+                cobo_sw = compute_cobo_sample_weights(
+                    batch["costs"],
+                    batch["cost_mask"],
+                    quantile=float(getattr(cfg.train, "weight_quantile", 0.95)),
+                    sigma=float(getattr(cfg.train, "weight_sigma", 0.1)),
+                )
+                cobo_apply = {
+                    str(x).lower()
+                    for x in getattr(cfg.train, "cobo_apply_to", ["kld", "cost", "nce"])
+                }
+            recon_sw = cobo_sw if "recon" in cobo_apply else None
+            kld_sw = cobo_sw if "kld" in cobo_apply else None
+            cost_sw = cobo_sw if "cost" in cobo_apply else None
+            nce_sw = cobo_sw if "nce" in cobo_apply else None
             recon_loss = masked_cross_entropy(
                 out.logits,
                 target_ids,
                 cand_masks_eff,
                 tokenizer.pad_id,
                 position_weights=position_weights,
+                sample_weights=recon_sw,
                 label_smoothing=float(getattr(cfg.train, "label_smoothing", 0.0)),
             )
-            kl_loss = kl_divergence(out.mu, out.logvar)
-            cost_loss = weighted_cost_loss(out.cost_pred, batch["costs"], batch["cost_mask"])
+            kl_loss = kl_divergence(out.mu, out.logvar, sample_weights=kld_sw)
+            cost_loss = weighted_cost_loss(out.cost_pred, batch["costs"], batch["cost_mask"], sample_weights=cost_sw)
             latent_use_loss, latent_use_rank_loss, latent_use_top1_drop_loss = latent_use_margin_loss(
                 model,
                 out.logits,
@@ -145,9 +165,17 @@ def train_one_epoch(
             else:
                 nce_z = out.z
             if cfg.train.order_nce:
-                nce_loss = ordered_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce)
+                nce_loss = ordered_infonce_loss(
+                    nce_z,
+                    batch["costs"],
+                    batch["cost_mask"],
+                    cfg.train.tau_nce,
+                    sample_weights=nce_sw,
+                    pos_weight_by_percentile=bool(getattr(cfg.train, "order_nce_pos_weight_by_percentile", False)),
+                    pos_weight_sigma=float(getattr(cfg.train, "order_nce_pos_weight_sigma", 0.2)),
+                )
             else:
-                nce_loss = soft_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce)
+                nce_loss = soft_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce, sample_weights=nce_sw)
             loss = (
                 float(getattr(cfg.train, "lambda_recon", 1.0)) * recon_loss
                 + beta * kl_loss

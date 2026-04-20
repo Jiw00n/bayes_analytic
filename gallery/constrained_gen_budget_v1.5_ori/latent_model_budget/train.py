@@ -46,6 +46,7 @@ from .train_epoch import train_one_epoch
 from .train_eval import (
     _alpha_metric_suffix,
     _build_named_latent_cost_ridges,
+    _build_reencode_predictor,
     _resolve_ridge_alphas,
     evaluate_autoregressive,
     evaluate_cost_ranking,
@@ -356,7 +357,11 @@ def _run_periodic_latent_walk(
     include_recon_predict: bool = False,
     include_measurement: bool = True,
     recon_predictor=None,
+    reencode_predictor=None,
+    reencode_predictor_name: str = "cost_head",
     walk_buffer: Optional[WalkSampleBuffer] = None,
+    walk_key_prefix: str = "",
+    measurement_cache: Optional[dict] = None,
 ) -> Dict[str, float]:
     here = Path(__file__).resolve().parent.parent
     if str(here) not in sys.path:
@@ -373,8 +378,7 @@ def _run_periodic_latent_walk(
         return {}
 
     print(
-        f"[train] latent walk ({epoch_label}) reusing in-memory model "
-        f"(output stem={Path(checkpoint_path).stem}) top_k={len(ref_records)}"
+        f"[train] latent walk ({epoch_label}) reusing in-memory model"
     )
 
     # Reuse in-memory model + cached registry to skip checkpoint round-trip
@@ -392,6 +396,8 @@ def _run_periodic_latent_walk(
         use_latent_gradient=bool(use_latent_gradient),
         timestamp=timestamp,
         recon_predictor=recon_predictor,
+        reencode_predictor=reencode_predictor,
+        reencode_predictor_name=reencode_predictor_name,
     )
 
     per_rank_summaries: list[Dict[str, float]] = []
@@ -420,6 +426,7 @@ def _run_periodic_latent_walk(
                     include_measurement=bool(include_measurement),
                     bundle=bundle,
                     keep_bundle=True,
+                    measurement_cache=measurement_cache,
                 ) or []
             except Exception as err:  # pragma: no cover
                 print(f"[train] latent walk rank={rank} failed: {type(err).__name__}: {err}")
@@ -452,6 +459,12 @@ def _run_periodic_latent_walk(
                 new_key = prefix + "walk/" + key
             combined[new_key] = value
     combined.update(_merge_walk_summaries(per_rank_summaries))
+    if walk_key_prefix:
+        target = f"{walk_key_prefix}walk/"
+        combined = {
+            key.replace("walk/", target, 1) if "walk/" in key else key: value
+            for key, value in combined.items()
+        }
     return combined
 
 
@@ -503,29 +516,112 @@ def _build_wandb_project_name(config, bundle: DatasetBundle) -> str:
 
 
 def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
+    name = ""
+
+    if config.model.num_encoder_layers != 3:
+        name += f"_enc{config.model.num_encoder_layers}"
+    if config.model.num_decoder_layers != 3:
+        name += f"_dec{config.model.num_decoder_layers}"
+    if config.model.nhead != 4:
+        name += f"_head{config.model.nhead}"
+    
+    if config.model.latent_dim != 64:
+        name += f"_zdim{config.model.latent_dim}"
+    if config.model.dim_feedforward != 192:
+        name += f"_fdim{config.model.dim_feedforward}"
+    if config.model.cost_hidden_dim != 128:
+        name += f"_cdim{config.model.cost_hidden_dim}"
+    if config.model.latent_token_count != 4:
+        name += f"_ztok{config.model.latent_token_count}"
+
+    if config.train.num_epochs != 100:
+        name += f"_ep{config.train.num_epochs}"
     name = (
-        f"ep{config.train.num_epochs}"
         f"_lr{config.train.learning_rate}"
         f"_nce{config.train.lambda_nce}"
         f"_t{config.train.tau_nce}"
         f"_kl{config.train.beta_end}"
         f"_bw{config.train.beta_warmup_epochs}"
     )
+
+    if config.train.lambda_recon != 1.0:
+        name += f"_lamr{config.train.lambda_recon}"
     if config.train.lambda_cost != 0.01:
-        name += f"_lc{config.train.lambda_cost}"
-    name += f"_cdim{config.model.cost_hidden_dim}"
+        name += f"_lamc{config.train.lambda_cost}"
     if bool(config.train.order_nce):
         name += "_order"
     if bool(getattr(config.train, "nce_mu", False)):
         name += "_nce_mu"
     if bool(config.model.adaln):
         name += "_adaln"
+    if bool(getattr(config.train, "cobo_sample_weighting", False)):
+        cobo_tag = getattr(config.train, "cobo_apply_to", [])
+        name += (
+            f"_cobo{float(config.train.weight_quantile):.1f}"
+            f"_{float(config.train.weight_sigma):.1f}"
+            f"_{cobo_tag}"
+        )
+    if bool(getattr(config.train, "cost_ridge_weighted", False)):
+        name += "_wridge"
+        if not bool(getattr(config.train, "cobo_sample_weighting", False)):
+            name += (
+                f"{float(config.train.weight_quantile):.1f}"
+                f"_{float(config.train.weight_sigma):.1f}"
+            )
+    if bool(getattr(config.train, "latent_walk_use_cost_head", False)):
+        name += "_ch"
     if bool(getattr(config.train, "use_compressed_teacher_forcing", False)):
         name += "_comp"
     ls = float(getattr(config.train, "label_smoothing", 0.0))
     if ls > 0.0:
         name += f"_ls{ls}"
-    return f"{name}"
+    if bool(getattr(config.train, "order_nce_pos_weight_by_percentile", False)):
+        name += f"_pos{float(config.train.order_nce_pos_weight_sigma):.1f}"
+    return name
+
+
+def _seed_measurement_cache_from_buffer(
+    walk_buffer: Optional[WalkSampleBuffer],
+) -> dict:
+    """Pre-populate the measurement cache with prior measurements so that
+    sym_maps already measured in earlier epochs skip re-measurement."""
+    cache: dict = {}
+    if walk_buffer is None:
+        return cache
+    for sym_key, sample in walk_buffer.items():
+        cost = getattr(sample, "cost", None)
+        if cost is None or not math.isfinite(float(cost)):
+            continue
+        cache[sym_key] = {
+            "ok": True,
+            "usable_measurement": True,
+            "mean_cost": float(cost),
+            "from_walk_buffer": True,
+        }
+    return cache
+
+
+def _iter_walk_ridges(latent_cost_ridges, config):
+    """Yield (ridge_payload, walk_key_prefix, use_cost_head_gradient) for each
+    walk to run. Order: cost_head (if enabled) → cost_vec → cost_vec_weighted."""
+    use_cost_head = bool(getattr(config.train, "latent_walk_use_cost_head", False))
+    if use_cost_head:
+        yield None, "cost_head_", True
+
+    if not latent_cost_ridges:
+        return
+    unweighted = next(
+        (p for p in latent_cost_ridges if not bool(p.get("weighted", False))),
+        None,
+    )
+    weighted = next(
+        (p for p in latent_cost_ridges if bool(p.get("weighted", False))),
+        None,
+    )
+    if unweighted is not None:
+        yield unweighted, "", False
+    if weighted is not None:
+        yield weighted, "w_ridge_", False
 
 
 def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
@@ -533,7 +629,6 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
         return [], None, {}
 
     ridge_alphas = _resolve_ridge_alphas(config)
-    # print(f"[train] fitting latent cost ridge on train split for alphas={ridge_alphas}")
     latent_cost_ridges = fit_latent_cost_ridges(
         model,
         bundle.train_dataset,
@@ -542,19 +637,36 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
         alphas=ridge_alphas,
         batch_size=config.eval.batch_size,
     )
-    latent_cost_ridge = latent_cost_ridges[0] if latent_cost_ridges else None
     ridge_metrics = {}
     for ridge_payload in latent_cost_ridges:
         alpha = float(ridge_payload["alpha"])
         alpha_suffix = _alpha_metric_suffix(alpha)
-        # print(
-        #     f"[train] latent cost ridge ready: samples={ridge_payload['num_samples']} "
-        #     f"alpha={alpha:.2e} train_mse={ridge_payload['train_mse']:.6f}"
-        # )
         if alpha == float(ridge_alphas[0]):
             ridge_metrics["train_ridge_mse"] = float(ridge_payload["train_mse"])
         ridge_metrics[f"train_ridge_alpha_{alpha_suffix}_mse"] = float(ridge_payload["train_mse"])
-    return latent_cost_ridges, latent_cost_ridge, ridge_metrics
+
+    if bool(getattr(config.train, "cost_ridge_weighted", False)):
+        weighted_ridges = fit_latent_cost_ridges(
+            model,
+            bundle.train_dataset,
+            tokenizer,
+            device,
+            alphas=ridge_alphas,
+            batch_size=config.eval.batch_size,
+            sample_weight_quantile=float(getattr(config.train, "weight_quantile", 0.85)),
+            sample_weight_sigma=float(getattr(config.train, "weight_sigma", 0.25)),
+        )
+        for ridge_payload in weighted_ridges:
+            alpha = float(ridge_payload["alpha"])
+            alpha_suffix = _alpha_metric_suffix(alpha)
+            if alpha == float(ridge_alphas[0]):
+                ridge_metrics["train_ridge_weighted_mse"] = float(ridge_payload["train_mse"])
+            ridge_metrics[f"train_ridge_weighted_alpha_{alpha_suffix}_mse"] = float(
+                ridge_payload["train_mse"]
+            )
+        latent_cost_ridges = list(latent_cost_ridges) + list(weighted_ridges)
+
+    return latent_cost_ridges, ridge_metrics
 
 
 def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, device, epoch, latent_cost_ridges):
@@ -602,6 +714,12 @@ def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, devic
             f"val_cost_vec_pred_top1_actual_cost : {cost_metrics['cost_vec_pred_top1_actual_cost']:.6f}\n"
             f"val_cost_vec_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_pred_top10_mean_actual_cost']:.6f}\n"
             # f"val_cost_vec_pred_top20_mean_actual_cost : {cost_metrics['cost_vec_pred_top20_mean_actual_cost']:.6f}\n"
+        )
+    if "cost_vec_weighted_actual_top1_pred_rank" in cost_metrics:
+        print(
+            f"val_cost_vec_weighted_actual_top1_pred_rank : {int(cost_metrics['cost_vec_weighted_actual_top1_pred_rank'])}\n"
+            f"val_cost_vec_weighted_pred_top1_actual_cost : {cost_metrics['cost_vec_weighted_pred_top1_actual_cost']:.6f}\n"
+            f"val_cost_vec_weighted_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_weighted_pred_top10_mean_actual_cost']:.6f}\n"
         )
     for key, value in sorted(cost_metrics.items()):
         if key.startswith("cost_vec_alpha_") and key.endswith("_actual_top1_pred_rank"):
@@ -909,7 +1027,7 @@ def train_main(config) -> Dict[str, float]:
             f"exact={summary['full_sequence_exact_match']:.4f}"
         )
 
-        latent_cost_ridges, latent_cost_ridge, ridge_metrics = _fit_epoch_ridges(
+        latent_cost_ridges, ridge_metrics = _fit_epoch_ridges(
             model,
             bundle,
             tokenizer,
@@ -917,6 +1035,17 @@ def train_main(config) -> Dict[str, float]:
             device,
         )
         summary.update(ridge_metrics)
+
+        train_cost_metrics = evaluate_cost_ranking(
+            model,
+            bundle.train_dataset,
+            tokenizer,
+            device,
+            batch_size=config.eval.batch_size,
+            latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
+        )
+        summary.update({f"train_{k}": float(v) for k, v in train_cost_metrics.items()})
+
         summary.update(
             _evaluate_validation_epoch(
                 model,
@@ -929,6 +1058,22 @@ def train_main(config) -> Dict[str, float]:
                 latent_cost_ridges,
             )
         )
+
+        def _fmt(value) -> str:
+            return f"{float(value):+.4f}" if value is not None and math.isfinite(float(value)) else "nan"
+
+        for source in ("cost_head", "cost_vec", "cost_vec_weighted"):
+            tr_all = summary.get(f"train_{source}_spearman")
+            tr_top = summary.get(f"train_{source}_spearman_top5pct")
+            va_all = summary.get(f"val_{source}_spearman")
+            va_top = summary.get(f"val_{source}_spearman_top5pct")
+            if tr_all is None and va_all is None:
+                continue
+            print(
+                f"[epoch {epoch}] {source.replace('cost_', '')} spearman "
+                f"train={_fmt(tr_all)} (top5%={_fmt(tr_top)}) "
+                f"val={_fmt(va_all)} (top5%={_fmt(va_top)})"
+            )
 
         if "val_full_sequence_exact_match" in summary:
             best_exact_match = max(best_exact_match, float(summary["val_full_sequence_exact_match"]))
@@ -963,28 +1108,53 @@ def train_main(config) -> Dict[str, float]:
                     seed=int(getattr(config.data, "seed", 0)),
                     walk_buffer=walk_sample_buffer,
                 )
-            walk_summary = _run_periodic_latent_walk(
-                model=model,
-                device=device,
-                checkpoint_path=last_checkpoint_path,
-                record_json_path=latent_walk_record_json,
-                walk_output_dir=latent_walk_output_dir,
-                network_info_folder=latent_walk_network_info,
-                epoch_label=f"epoch {epoch}",
-                config=config,
-                registry=registry,
-                tokenizer=tokenizer,
-                latent_cost_ridge=latent_cost_ridge,
-                timestamp=timestamp,
-                top_k=latent_walk_top_k,
-                num_steps=latent_walk_num_steps,
-                step_size=latent_walk_step_size,
-                use_latent_gradient=latent_walk_use_latent_gradient,
-                include_recon_predict=include_recon_predict,
-                include_measurement=include_measurement,
-                recon_predictor=walk_recon_predictor,
-                walk_buffer=walk_sample_buffer if include_measurement else None,
+            walk_summary = {}
+            ridge_walks = list(_iter_walk_ridges(latent_cost_ridges, config)) or [(None, "", False)]
+            shared_measurement_cache: dict = _seed_measurement_cache_from_buffer(
+                walk_sample_buffer
             )
+            reencode_predictor_name = str(
+                getattr(config.train, "re_encode_predictor", "cost_head")
+            )
+            reencode_predictor = _build_reencode_predictor(
+                name=reencode_predictor_name,
+                model=model,
+                bundle=bundle,
+                tokenizer=tokenizer,
+                device=device,
+                latent_cost_ridges=latent_cost_ridges,
+                config=config,
+            )
+            for walk_ridge, walk_prefix, force_cost_head in ridge_walks:
+                label = f"epoch {epoch}" + (f" [{walk_prefix.rstrip('_')}]" if walk_prefix else "")
+                sub_summary = _run_periodic_latent_walk(
+                    model=model,
+                    device=device,
+                    checkpoint_path=last_checkpoint_path,
+                    record_json_path=latent_walk_record_json,
+                    walk_output_dir=latent_walk_output_dir,
+                    network_info_folder=latent_walk_network_info,
+                    epoch_label=label,
+                    config=config,
+                    registry=registry,
+                    tokenizer=tokenizer,
+                    latent_cost_ridge=walk_ridge,
+                    timestamp=timestamp,
+                    top_k=latent_walk_top_k,
+                    num_steps=latent_walk_num_steps,
+                    step_size=latent_walk_step_size,
+                    use_latent_gradient=force_cost_head or latent_walk_use_latent_gradient,
+                    include_recon_predict=include_recon_predict,
+                    include_measurement=include_measurement,
+                    recon_predictor=walk_recon_predictor,
+                    reencode_predictor=reencode_predictor,
+                    reencode_predictor_name=reencode_predictor_name,
+                    walk_buffer=walk_sample_buffer if include_measurement else None,
+                    walk_key_prefix=walk_prefix,
+                    measurement_cache=shared_measurement_cache,
+                )
+                if sub_summary:
+                    walk_summary.update(sub_summary)
             if walk_summary:
                 summary.update(walk_summary)
 
@@ -1027,7 +1197,10 @@ def train_main(config) -> Dict[str, float]:
             epochs_without_improve=epochs_without_improve,
             config=config,
             tokenizer=tokenizer,
-            latent_cost_ridge=latent_cost_ridge,
+            latent_cost_ridge=next(
+                (p for p in latent_cost_ridges if not bool(p.get("weighted", False))),
+                latent_cost_ridges[0] if latent_cost_ridges else None,
+            ),
             latent_cost_ridges=latent_cost_ridges,
             timestamp=timestamp,
         )
@@ -1123,27 +1296,52 @@ def train_main(config) -> Dict[str, float]:
                 seed=int(getattr(config.data, "seed", 0)),
                 walk_buffer=walk_sample_buffer,
             )
-        final_walk_summary = _run_periodic_latent_walk(
-            model=model,
-            device=device,
-            checkpoint_path=final_walk_checkpoint,
-            record_json_path=latent_walk_record_json,
-            walk_output_dir=latent_walk_output_dir,
-            network_info_folder=latent_walk_network_info,
-            epoch_label="final",
-            config=config,
-            registry=registry,
-            tokenizer=tokenizer,
-            latent_cost_ridge=(latent_cost_ridges[0] if latent_cost_ridges else None),
-            timestamp=timestamp,
-            top_k=latent_walk_top_k,
-            num_steps=latent_walk_num_steps,
-            step_size=latent_walk_step_size,
-            use_latent_gradient=latent_walk_use_latent_gradient,
-            include_recon_predict=walk_recon_predict_enabled,
-            recon_predictor=final_walk_recon_predictor,
-            walk_buffer=walk_sample_buffer,
+        final_walk_summary: Dict[str, float] = {}
+        final_ridge_walks = list(_iter_walk_ridges(latent_cost_ridges, config)) or [(None, "", False)]
+        final_measurement_cache: dict = _seed_measurement_cache_from_buffer(
+            walk_sample_buffer
         )
+        final_reencode_predictor_name = str(
+            getattr(config.train, "re_encode_predictor", "cost_head")
+        )
+        final_reencode_predictor = _build_reencode_predictor(
+            name=final_reencode_predictor_name,
+            model=model,
+            bundle=bundle,
+            tokenizer=tokenizer,
+            device=device,
+            latent_cost_ridges=latent_cost_ridges,
+            config=config,
+        )
+        for walk_ridge, walk_prefix, force_cost_head in final_ridge_walks:
+            label = "final" + (f" [{walk_prefix.rstrip('_')}]" if walk_prefix else "")
+            sub_summary = _run_periodic_latent_walk(
+                model=model,
+                device=device,
+                checkpoint_path=final_walk_checkpoint,
+                record_json_path=latent_walk_record_json,
+                walk_output_dir=latent_walk_output_dir,
+                network_info_folder=latent_walk_network_info,
+                epoch_label=label,
+                config=config,
+                registry=registry,
+                tokenizer=tokenizer,
+                latent_cost_ridge=walk_ridge,
+                timestamp=timestamp,
+                top_k=latent_walk_top_k,
+                num_steps=latent_walk_num_steps,
+                step_size=latent_walk_step_size,
+                use_latent_gradient=force_cost_head or latent_walk_use_latent_gradient,
+                include_recon_predict=walk_recon_predict_enabled,
+                recon_predictor=final_walk_recon_predictor,
+                reencode_predictor=final_reencode_predictor,
+                reencode_predictor_name=final_reencode_predictor_name,
+                walk_buffer=walk_sample_buffer,
+                walk_key_prefix=walk_prefix,
+                measurement_cache=final_measurement_cache,
+            )
+            if sub_summary:
+                final_walk_summary.update(sub_summary)
         if final_walk_summary:
             final_metrics.update(
                 {f"final_{k}": v for k, v in final_walk_summary.items()}
