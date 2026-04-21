@@ -32,12 +32,27 @@ SEARCH_SPACE = {
     "train.nce_mu": [False],
     "model.adaln": [True],
     "train.lambda_cost": [0.01],
+
+    "train.latent_walk_use_cost_head": [False],
+
+    
     "train.label_smoothing": [0],
     "train.latent_walk_top_k": [1],
     "train.cost_ridge_vec": [True],
-    "train.cobo_sample_weighting": [True],
-    "train.cobo_weight_quantile": [0.85],
-    "train.cobo_weight_sigma": [1.0],
+    # "train.cobo_sample_weighting": [False],
+    # "train.cobo_weight_quantile": [0.85],
+    # "train.cobo_weight_sigma": [1.0],
+    "sampling.strategy": ["greedy"],
+    # "sampling.temperature": [0.8],
+    # "sampling.top_k": [4],
+    # "sampling.top_p": [1.0],
+    # "sampling.seed": [42],
+
+
+    "train.lambda_annealing_epochs": [[10, 20]],
+    "train.lambda_recon_anneal": [[0.8, 0.3]],
+    "train.lambda_nce_anneal": [[0.2, 0.4]],
+    "train.lambda_cost_anneal": [[0.01, 0.015]],
 }
 
 

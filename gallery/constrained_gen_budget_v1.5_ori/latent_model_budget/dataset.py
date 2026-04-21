@@ -345,6 +345,75 @@ def _sanitize_workload_key(workload_key: str, target_kind: str) -> str:
     return safe_name
 
 
+_HW_PARAM_CACHE_TAGS: Dict[str, str] = {
+    "max_vector_bytes": "vecBytes",
+    "max_shared_memory_per_block": "shMem",
+    "max_threads_per_block": "thrBlk",
+    "max_thread_x": "thrX",
+    "max_thread_y": "thrY",
+    "max_thread_z": "thrZ",
+    "max_vthread_extent": "vThread",
+    "max_innermost_split_factor": "innerSplit",
+    "warp_size": "warp",
+}
+
+_DISABLE_CONSTRAINT_CACHE_TAGS: Dict[str, str] = {
+    "vectorize": "noVec",
+    "shared_memory": "noShMem",
+    "max_threads": "noThr",
+    "max_vthread": "noVThr",
+    "innermost_split": "noInner",
+    "split_structure": "noSplit",
+    "min_thread_extent": "noMinThr",
+}
+
+
+def _extract_generator_settings(config) -> tuple[Dict[str, object], List[str]]:
+    gen_cfg = getattr(config, "generator", None)
+    if gen_cfg is None:
+        return {}, []
+    hw_param = getattr(gen_cfg, "hw_param", None) or {}
+    disable_constraint = getattr(gen_cfg, "disable_constraint", None) or []
+    if isinstance(hw_param, dict):
+        hw_param = dict(hw_param)
+    else:
+        hw_param = {}
+    disable_constraint = [str(k) for k in disable_constraint]
+    return hw_param, disable_constraint
+
+
+def _generator_cache_suffix(config) -> str:
+    """Suffix encoding hw_param/disable_constraint diffs from ScheduleGenerator defaults."""
+    hw_param, disable_constraint = _extract_generator_settings(config)
+    if not hw_param and not disable_constraint:
+        return ""
+
+    from modules.schedule_generator import ScheduleGenerator
+
+    parts: List[str] = []
+    defaults = ScheduleGenerator.DEFAULT_HW_PARAM
+    for key in _HW_PARAM_CACHE_TAGS:
+        if key not in hw_param:
+            continue
+        value = hw_param[key]
+        if key in defaults and value == defaults[key]:
+            continue
+        parts.append(f"{_HW_PARAM_CACHE_TAGS[key]}{value}")
+
+    default_enabled = set(ScheduleGenerator.DEFAULT_ENABLED_CONSTRAINT_KINDS)
+    for kind in disable_constraint:
+        if kind not in default_enabled:
+            continue
+        tag = _DISABLE_CONSTRAINT_CACHE_TAGS.get(kind)
+        if tag is None:
+            continue
+        parts.append(tag)
+
+    if not parts:
+        return ""
+    return "_" + "_".join(parts)
+
+
 def _candidate_mask_cache_path_for_workload(config, workload_key: str, target_kind: str) -> Path:
     cache_dir = _candidate_mask_cache_dir(config)
     stem = _sanitize_workload_key(workload_key, target_kind)
@@ -354,7 +423,11 @@ def _candidate_mask_cache_path_for_workload(config, workload_key: str, target_ki
         if bool(getattr(getattr(config, "train", None), "use_compressed_teacher_forcing", False))
         else ""
     )
-    return cache_dir / f"{stem}_{_CANDIDATE_MASK_CACHE_VERSION}_{budget_tag}{compressed_tag}.pt"
+    generator_tag = _generator_cache_suffix(config)
+    return cache_dir / (
+        f"{stem}_{_CANDIDATE_MASK_CACHE_VERSION}_{budget_tag}"
+        f"{compressed_tag}{generator_tag}.pt"
+    )
 
 
 def _normalize_param_signature(signature: Sequence[str] | None) -> tuple[str, ...]:

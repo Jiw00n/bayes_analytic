@@ -6,7 +6,7 @@ import math
 import sys
 from pathlib import Path
 import time
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover
 
 from .adapter import GeneratorRegistry
 from .dataset import DatasetBundle, build_dataset_bundle
-from .inference import greedy_decode_sample, pretty_print_reconstruction
+from .inference import SamplingOptions, greedy_decode_sample, pretty_print_reconstruction
 from .model import LatentParamVAE
 from .runtime_utils import (
     configure_runtime,
@@ -210,6 +210,18 @@ def _merge_walk_summaries(summaries: list) -> Dict[str, float]:
     return merged
 
 
+def _iter_walks(config):
+    """Yield (use_cost_head, walk_key_prefix) for each walk to run.
+
+    Order: cost_head walk first (when enabled), then ridge walk (when
+    ``cost_ridge_vec`` is set). Both can be active simultaneously.
+    """
+    if bool(getattr(config.train, "latent_walk_use_cost_head", False)):
+        yield True, "cost_head_"
+    if bool(getattr(config.train, "cost_ridge_vec", False)):
+        yield False, ""
+
+
 def _run_periodic_latent_walk(
     *,
     model,
@@ -223,6 +235,9 @@ def _run_periodic_latent_walk(
     num_steps: int = 8,
     step_size: float = 0.25,
     use_cost_head: bool = False,
+    walk_key_prefix: str = "",
+    measurement_cache: Optional[Dict[tuple, Any]] = None,
+    sampling_options: Optional[SamplingOptions] = None,
 ) -> Dict[str, float]:
     """Run the tune.sh-equivalent latent walk against ``checkpoint_path``.
 
@@ -282,6 +297,8 @@ def _run_periodic_latent_walk(
                     use_cost_head=bool(use_cost_head),
                     deterministic_start=True,
                     preselected_record=ref_record,
+                    measurement_cache=measurement_cache,
+                    sampling_options=sampling_options,
                 ) or []
             except Exception as err:  # pragma: no cover
                 print(f"[train] latent walk rank={rank} failed: {type(err).__name__}: {err}")
@@ -308,6 +325,12 @@ def _run_periodic_latent_walk(
                 new_key = prefix + "walk/" + key
             combined[new_key] = value
     combined.update(_merge_walk_summaries(per_rank_summaries))
+    if walk_key_prefix:
+        target = f"{walk_key_prefix}walk/"
+        combined = {
+            key.replace("walk/", target, 1) if "walk/" in key else key: value
+            for key, value in combined.items()
+        }
     return combined
 
 
@@ -401,10 +424,10 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
     for ridge_payload in latent_cost_ridges:
         alpha = float(ridge_payload["alpha"])
         alpha_suffix = _alpha_metric_suffix(alpha)
-        print(
-            f"[train] latent cost ridge ready: samples={ridge_payload['num_samples']} "
-            f"alpha={alpha:.2e} train_mse={ridge_payload['train_mse']:.6f}"
-        )
+        # print(
+        #     f"[train] latent cost ridge ready: samples={ridge_payload['num_samples']} "
+        #     f"alpha={alpha:.2e} train_mse={ridge_payload['train_mse']:.6f}"
+        # )
         if alpha == float(ridge_alphas[0]):
             ridge_metrics["train_ridge_mse"] = float(ridge_payload["train_mse"])
         ridge_metrics[f"train_ridge_alpha_{alpha_suffix}_mse"] = float(ridge_payload["train_mse"])
@@ -677,13 +700,26 @@ def train_main(config) -> Dict[str, float]:
     latent_walk_top_k = int(getattr(config.train, "latent_walk_top_k", 1) or 1)
     latent_walk_num_steps = int(getattr(config.train, "latent_walk_num_steps", 8) or 8)
     latent_walk_step_size = float(getattr(config.train, "latent_walk_step_size", 0.25) or 0.25)
-    latent_walk_use_cost_head = not bool(getattr(config.train, "cost_ridge_vec", False))
+    latent_walks = list(_iter_walks(config))
+    if not latent_walks:
+        latent_walks = [(False, "")]
     latent_walk_record_json = _resolve_walk_record_json(config)
     latent_walk_output_dir = (
         getattr(config.train, "latent_walk_output_dir", None)
         or str(checkpoint_dir)
     )
     latent_walk_network_info = getattr(config.data, "network_info_folder", None)
+    latent_walk_measurement_cache: Dict[tuple, Any] = {}
+    latent_walk_sampling_options = SamplingOptions.from_config(
+        getattr(config, "sampling", None)
+    )
+    if latent_walk_sampling_options.strategy != "greedy":
+        print(
+            f"[train] latent walk decoding: strategy={latent_walk_sampling_options.strategy} "
+            f"temperature={latent_walk_sampling_options.temperature} "
+            f"top_k={latent_walk_sampling_options.top_k} "
+            f"top_p={latent_walk_sampling_options.top_p}"
+        )
     if (latent_walk_every_n > 0 or latent_walk_on_final) and not latent_walk_record_json:
         print(
             "[train] latent walk requested but no record JSON resolvable from "
@@ -842,19 +878,26 @@ def train_main(config) -> Dict[str, float]:
 
         walk_summary: Dict[str, float] = {}
         if latent_walk_every_n > 0 and (epoch % latent_walk_every_n == 0):
-            walk_summary = _run_periodic_latent_walk(
-                model=model,
-                device=device,
-                checkpoint_path=last_checkpoint_path,
-                record_json_path=latent_walk_record_json,
-                walk_output_dir=latent_walk_output_dir,
-                network_info_folder=latent_walk_network_info,
-                epoch_label=f"epoch {epoch}",
-                top_k=latent_walk_top_k,
-                num_steps=latent_walk_num_steps,
-                step_size=latent_walk_step_size,
-                use_cost_head=latent_walk_use_cost_head,
-            )
+            for walk_use_cost_head, walk_prefix in latent_walks:
+                label = f"epoch {epoch}" + (f" [{walk_prefix.rstrip('_')}]" if walk_prefix else "")
+                sub_summary = _run_periodic_latent_walk(
+                    model=model,
+                    device=device,
+                    checkpoint_path=last_checkpoint_path,
+                    record_json_path=latent_walk_record_json,
+                    walk_output_dir=latent_walk_output_dir,
+                    network_info_folder=latent_walk_network_info,
+                    epoch_label=label,
+                    top_k=latent_walk_top_k,
+                    num_steps=latent_walk_num_steps,
+                    step_size=latent_walk_step_size,
+                    use_cost_head=walk_use_cost_head,
+                    walk_key_prefix=walk_prefix,
+                    measurement_cache=latent_walk_measurement_cache,
+                    sampling_options=latent_walk_sampling_options,
+                )
+                if sub_summary:
+                    walk_summary.update(sub_summary)
             if walk_summary:
                 summary.update(walk_summary)
 
@@ -902,19 +945,27 @@ def train_main(config) -> Dict[str, float]:
         final_walk_checkpoint = (
             best_checkpoint_path if best_checkpoint_path.exists() else last_checkpoint_path
         )
-        final_walk_summary = _run_periodic_latent_walk(
-            model=model,
-            device=device,
-            checkpoint_path=final_walk_checkpoint,
-            record_json_path=latent_walk_record_json,
-            walk_output_dir=latent_walk_output_dir,
-            network_info_folder=latent_walk_network_info,
-            epoch_label="final",
-            top_k=latent_walk_top_k,
-            num_steps=latent_walk_num_steps,
-            step_size=latent_walk_step_size,
-            use_cost_head=latent_walk_use_cost_head,
-        )
+        final_walk_summary: Dict[str, float] = {}
+        for walk_use_cost_head, walk_prefix in latent_walks:
+            label = "final" + (f" [{walk_prefix.rstrip('_')}]" if walk_prefix else "")
+            sub_summary = _run_periodic_latent_walk(
+                model=model,
+                device=device,
+                checkpoint_path=final_walk_checkpoint,
+                record_json_path=latent_walk_record_json,
+                walk_output_dir=latent_walk_output_dir,
+                network_info_folder=latent_walk_network_info,
+                epoch_label=label,
+                top_k=latent_walk_top_k,
+                num_steps=latent_walk_num_steps,
+                step_size=latent_walk_step_size,
+                use_cost_head=walk_use_cost_head,
+                walk_key_prefix=walk_prefix,
+                measurement_cache=latent_walk_measurement_cache,
+                sampling_options=latent_walk_sampling_options,
+            )
+            if sub_summary:
+                final_walk_summary.update(sub_summary)
         if final_walk_summary:
             final_metrics.update(
                 {f"final_{k}": v for k, v in final_walk_summary.items()}

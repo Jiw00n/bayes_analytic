@@ -4,20 +4,19 @@ import copy
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+from glob import glob
 
-DEFAULT_JSON_PATH = [
-    # "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor/584_([cb7a0e9e733d26ffc00e7f6c9cc0f879,[1,128,128,32],[1,1,32,16],[1,1,1,16],[1,128,128,16]],cuda).json",
-    "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor/1490_([3eda1939e30b947e921f5e1814346365,[1,56,56,128],[6,6,32,128],[1,56,56,32]],cuda).json",
-    # "/root/work/tvm-ansor/gallery/constrained_gen/data/measured_family_ansor/415_([e7c984cba151d5c7c1e081f0b1910087,[1,112,112,32],[3,3,32,1],[1,1,1,32],[1,112,112,32]],cuda).json"
-]
+
+DEFAULT_JSON_PATHS = glob("/root/work/tvm-ansor/gallery/constrained_gen/data/measured_*/*.json")
 DEFAULT_NETWORK_INFO_FOLDER = "/root/work/tvm-ansor/gallery/dataset/network_info_all"
-DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget_v1.5_ori/checkpoints_all/1490"
+DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget_v1.5_ori/checkpoints_all/"
 
 
 @dataclass
 class DataConfig:
-    json_paths: List[str] = field(default_factory=lambda: list(DEFAULT_JSON_PATH))
+    task_index: Optional[int] = 415
+    json_paths: List[str] = field(default_factory=list)
     network_info_folder: str = DEFAULT_NETWORK_INFO_FOLDER
     train_ratio: float = 0.9
     val_ratio: float = 0.1
@@ -25,6 +24,13 @@ class DataConfig:
     seed: int = 42
     filter_invalid_records: bool = False
     budget: bool = False
+
+    def __post_init__(self):
+        if not self.json_paths and self.task_index is not None:
+            prefix = f"{int(self.task_index)}_"
+            self.json_paths = [
+                p for p in DEFAULT_JSON_PATHS if Path(p).name.startswith(prefix)
+            ]
 
 
 @dataclass
@@ -137,8 +143,46 @@ class EvalConfig:
 
 
 @dataclass
+class SamplingConfig:
+    """Decoding strategy used by `greedy_decode_*` and the latent walk.
+
+    ``strategy`` selects the decoding mode. Any other value is treated as
+    sampling with the listed truncation parameters.
+
+    - ``strategy="greedy"``: argmax (ignores every other field).
+    - ``strategy="sampling"``: multinomial over masked candidates after
+      applying temperature, then optional top-k, then optional top-p.
+    - ``top_k=0`` disables top-k; ``top_p=1.0`` disables top-p; the two can
+      be combined (top-k first, then top-p).
+    """
+
+    strategy: str = "greedy"  # "greedy" | "sampling"
+    temperature: float = 0.8
+    top_k: int = 2
+    top_p: float = 1.0
+    seed: Optional[int] = 42
+
+
+@dataclass
 class WandbConfig:
     project: Optional[str] = "v1.5_ori_sampling"
+
+
+@dataclass
+class GeneratorConfig:
+    """ScheduleGenerator overrides.
+
+    ``hw_param`` patches entries in ``ScheduleGenerator.DEFAULT_HW_PARAM`` and
+    ``disable_constraint`` removes kinds from
+    ``ScheduleGenerator.DEFAULT_ENABLED_CONSTRAINT_KINDS``. Only values that
+    differ from the defaults affect the precompute mask cache name.
+    """
+
+    # hw_param: Dict[str, Any] = field(default_factory=dict)
+    hw_param: Dict[str, Any] = field(default_factory=lambda: {"max_vthread_extent": 15})
+
+    disable_constraint: List[str] = field(default_factory=list)
+    # disable_constraint: List[str] = field(default_factory=lambda: ["vectorize"])
 
 
 @dataclass
@@ -147,7 +191,15 @@ class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    sampling: SamplingConfig = field(default_factory=SamplingConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    generator: GeneratorConfig = field(default_factory=GeneratorConfig)
+
+    def __post_init__(self):
+        if self.data.task_index is not None:
+            base = Path(self.train.checkpoint_dir)
+            if base.name != str(self.data.task_index):
+                self.train.checkpoint_dir = str(base / str(self.data.task_index))
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -164,7 +216,9 @@ class ExperimentConfig:
             model=ModelConfig(**payload.get("model", {})),
             train=TrainConfig(**payload.get("train", {})),
             eval=EvalConfig(**payload.get("eval", {})),
+            sampling=SamplingConfig(**payload.get("sampling", {})),
             wandb=WandbConfig(**payload.get("wandb", {})),
+            generator=GeneratorConfig(**payload.get("generator", {})),
         )
 
 

@@ -390,14 +390,40 @@ class GeneratorRegistry:
     - TVM custom runtime / global func 누락
     """
 
-    def __init__(self, network_info_folder: str):
+    def __init__(
+        self,
+        network_info_folder: str,
+        *,
+        hw_param: Optional[Dict[str, object]] = None,
+        disable_constraint: Optional[List[str]] = None,
+    ):
         self.network_info_folder = network_info_folder
+        self.hw_param = dict(hw_param) if hw_param else None
+        self.disable_constraint = list(disable_constraint) if disable_constraint else None
+        self._enabled_constraints = self._resolve_enabled_constraints(self.disable_constraint)
         self._tasks = None
         self._tasks_by_index: Dict[int, object] = {}
         self._tasks_by_signature: Dict[Tuple[str, str], object] = {}
         self._sketch_cache: Dict[Tuple[str, str], list] = {}
         self._generator_cache: Dict[Tuple[str, str, int], object] = {}
         self._sketch_index_by_param_signature: Dict[Tuple[str, str, Tuple[str, ...]], int] = {}
+
+    @staticmethod
+    def _resolve_enabled_constraints(
+        disable_constraint: Optional[List[str]],
+    ) -> Optional[List[str]]:
+        if not disable_constraint:
+            return None
+        from modules.schedule_generator import ScheduleGenerator
+
+        defaults = list(ScheduleGenerator.DEFAULT_ENABLED_CONSTRAINT_KINDS)
+        unknown = set(disable_constraint) - set(ScheduleGenerator.ALL_CONSTRAINT_KINDS)
+        if unknown:
+            raise ValueError(
+                f"Unknown constraint kinds in disable_constraint: {sorted(unknown)}"
+            )
+        disabled = set(disable_constraint)
+        return [kind for kind in defaults if kind not in disabled]
 
     def _load_tasks(self):
         if self._tasks is not None:
@@ -505,7 +531,12 @@ class GeneratorRegistry:
                 f"available={len(sketches)}"
             ) from err
 
-        gen = ScheduleGenerator.from_task_state(task, state)
+        gen = ScheduleGenerator.from_task_state(
+            task,
+            state,
+            hw_param=self.hw_param,
+            enabled_constraints=self._enabled_constraints,
+        )
         self._generator_cache[cache_key] = gen
         return gen
 
@@ -533,6 +564,8 @@ class GeneratorRegistry:
             gen = ScheduleGenerator.from_task_state(
                 task,
                 base_inp.state,
+                hw_param=self.hw_param,
+                enabled_constraints=self._enabled_constraints,
                 base_input=base_inp,
                 base_result=base_res,
             )

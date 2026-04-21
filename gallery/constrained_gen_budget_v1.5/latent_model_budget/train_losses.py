@@ -15,6 +15,86 @@ def beta_by_epoch(cfg, epoch: int) -> float:
     return float(cfg.beta_start + (cfg.beta_end - cfg.beta_start) * progress)
 
 
+def _linear_anneal(
+    epoch: int,
+    *,
+    start_epoch: int,
+    end_epoch: int,
+    start_value: float,
+    end_value: float,
+) -> float:
+    """Linearly interpolate between ``start_value`` and ``end_value`` over
+    ``[start_epoch, end_epoch]``. Before/after the window the endpoint values
+    are held constant. ``end_epoch <= start_epoch`` becomes a step change.
+    """
+    if epoch <= start_epoch:
+        return float(start_value)
+    if epoch >= end_epoch or end_epoch <= start_epoch:
+        return float(end_value)
+    progress = (epoch - start_epoch) / (end_epoch - start_epoch)
+    return float(start_value + (end_value - start_value) * progress)
+
+
+def _resolve_lambda(
+    cfg,
+    epoch: int,
+    *,
+    anneal_attr: str,
+    flat_fallback: float,
+) -> float:
+    """Resolve a loss coefficient at the given epoch.
+
+    ``anneal_attr`` should name a field holding a ``(start, end)`` sequence
+    or ``None``. When it is ``None`` or the shared epoch window is ``(0, 0)``,
+    ``flat_fallback`` is returned. Otherwise linearly interpolate between the
+    tuple's two values.
+    """
+    anneal = getattr(cfg, anneal_attr, None)
+    if anneal is None:
+        return flat_fallback
+    epoch_window = getattr(cfg, "lambda_annealing_epochs", None)
+    if epoch_window is None:
+        return flat_fallback
+    start_epoch = int(epoch_window[0])
+    end_epoch = int(epoch_window[1])
+    start_value = float(anneal[0])
+    end_value = float(anneal[1])
+    return _linear_anneal(
+        epoch,
+        start_epoch=start_epoch,
+        end_epoch=end_epoch,
+        start_value=start_value,
+        end_value=end_value,
+    )
+
+
+def lambda_recon_by_epoch(cfg, epoch: int) -> float:
+    return _resolve_lambda(
+        cfg,
+        epoch,
+        anneal_attr="lambda_recon_anneal",
+        flat_fallback=1.0,
+    )
+
+
+def lambda_nce_by_epoch(cfg, epoch: int) -> float:
+    return _resolve_lambda(
+        cfg,
+        epoch,
+        anneal_attr="lambda_nce_anneal",
+        flat_fallback=float(getattr(cfg, "lambda_nce", 0.0)),
+    )
+
+
+def lambda_cost_by_epoch(cfg, epoch: int) -> float:
+    return _resolve_lambda(
+        cfg,
+        epoch,
+        anneal_attr="lambda_cost_anneal",
+        flat_fallback=float(getattr(cfg, "lambda_cost", 0.0)),
+    )
+
+
 def compute_cobo_sample_weights(
     costs: torch.Tensor,
     cost_mask: torch.Tensor,

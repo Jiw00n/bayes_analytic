@@ -25,6 +25,9 @@ from .train_losses import (
     beta_by_epoch,
     compute_cobo_sample_weights,
     kl_divergence,
+    lambda_cost_by_epoch,
+    lambda_nce_by_epoch,
+    lambda_recon_by_epoch,
     latent_use_margin_loss,
     masked_cross_entropy,
     ordered_infonce_loss,
@@ -61,6 +64,9 @@ def train_one_epoch(
 
     iterator = tqdm(loader, desc=f"train epoch {epoch}") if tqdm is not None else loader
     beta = beta_by_epoch(cfg.train, epoch)
+    lambda_recon = lambda_recon_by_epoch(cfg.train, epoch)
+    lambda_nce = lambda_nce_by_epoch(cfg.train, epoch)
+    lambda_cost = lambda_cost_by_epoch(cfg.train, epoch)
 
     for batch in iterator:
         batch = _batch_to_device(batch, device)
@@ -140,10 +146,10 @@ def train_one_epoch(
             else:
                 nce_loss = soft_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce, sample_weights=cobo_sw)
             loss = (
-                recon_loss
+                lambda_recon * recon_loss
                 + beta * kl_loss
-                + float(cfg.train.lambda_cost) * cost_loss
-                + float(cfg.train.lambda_nce) * nce_loss
+                + lambda_cost * cost_loss
+                + lambda_nce * nce_loss
                 + float(getattr(cfg.train, "lambda_latent_use", 0.0)) * latent_use_loss
             )
             batch_token_correct, batch_token_total, batch_exact_count, batch_sample_total = (
@@ -191,6 +197,9 @@ def train_one_epoch(
         "latent_use_rank_loss": total_latent_use_rank / denom,
         "latent_use_top1_drop_loss": total_latent_use_top1_drop / denom,
         "beta": beta,
+        "lambda_recon": lambda_recon,
+        "lambda_nce": lambda_nce,
+        "lambda_cost": lambda_cost,
         "early_param_weight_max": float(getattr(cfg.train, "early_param_weight_max", 1.0)),
         "early_param_weight_power": float(getattr(cfg.train, "early_param_weight_power", 1.0)),
         "lambda_latent_use": float(getattr(cfg.train, "lambda_latent_use", 0.0)),

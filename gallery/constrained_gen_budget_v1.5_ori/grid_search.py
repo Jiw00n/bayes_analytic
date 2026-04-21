@@ -23,25 +23,29 @@ else:
 
 
 SEARCH_SPACE = {
+    "data.task_index": [1490],
+
     "train.beta_end": [0.003],
     "train.beta_warmup_epochs": [10],
     "train.order_nce": [True],
     "train.nce_mu": [False],
     "model.adaln": [True],
 
-    # "model.num_encoder_layers": [3],
-    # "model.num_decoder_layers": [3],
-    # "model.d_model": [128],
-    # "model.dim_feedforward": [256, 384],
-    # "model.latent_dim": [24, 32],
-    # "model.cost_hidden_dim": [64],
-    # "model.nhead": [2, 4],
-    # "model.latent_token_count": [4],
+    "model.num_encoder_layers": [3],
+    "model.num_decoder_layers": [3],
+    "model.d_model": [128],
+    "model.dim_feedforward": [256, 384],
+    "model.latent_dim": [24, 32],
+    "model.cost_hidden_dim": [64],
+    "model.nhead": [2, 4],
+    "model.latent_token_count": [4],
 
+    "train.latent_walk_every_n_epochs": [5],
     "train.num_epochs": [100],
-    "train.learning_rate": [5e-4],
+    "train.learning_rate": [1e-4, 3e-4],
     "train.lambda_nce": [0.2],
-    "train.tau_nce": [0.2, 0.3],
+    "train.tau_nce": [0.2],
+    "train.latent_walk_top_k": [3],
 
     # "train.cobo_sample_weighting": [True],
     # "train.cobo_apply_to": [["cost", "nce"]],
@@ -49,6 +53,12 @@ SEARCH_SPACE = {
     # "train.weight_sigma": [0.5],        # cobo, weighted_cost_Vec
 
     "train.lambda_cost": [0.01],
+
+    "sampling.strategy": ["sampling"],
+    "sampling.temperature": [0.8, 1.1],
+    "sampling.top_k": [2, 4],
+    "sampling.top_p": [1.0],
+    "sampling.seed": [42, 43],
 
     # "train.label_smoothing": [0],
     # "train.lambda_recon": [1.0],
@@ -65,6 +75,7 @@ def _dataset_cache_payload(cfg) -> dict:
     cfg_payload = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
     return {
         "data": cfg_payload.get("data", {}),
+        "generator": cfg_payload.get("generator", {}),
         "precompute_candidate_masks": bool(getattr(cfg.train, "precompute_candidate_masks", False)),
     }
 
@@ -90,7 +101,12 @@ def _build_shared_dataset_artifacts(cfg) -> dict:
 
     cache_tag = _dataset_cache_tag(cfg)
     print(f"[grid] building shared dataset artifacts (cache_key={cache_tag})")
-    registry = train_module.GeneratorRegistry(cfg.data.network_info_folder)
+    gen_cfg = getattr(cfg, "generator", None)
+    registry = train_module.GeneratorRegistry(
+        cfg.data.network_info_folder,
+        hw_param=getattr(gen_cfg, "hw_param", None),
+        disable_constraint=getattr(gen_cfg, "disable_constraint", None),
+    )
     bundle = train_module.build_dataset_bundle(cfg, registry)
     tokenizer = bundle.tokenizer
     cached = {

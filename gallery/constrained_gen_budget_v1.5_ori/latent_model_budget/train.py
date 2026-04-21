@@ -25,7 +25,7 @@ from .dataset import (
     build_dataset_bundle,
     get_model_param_order,
 )
-from .inference import greedy_decode_sample, pretty_print_reconstruction
+from .inference import SamplingOptions, greedy_decode_sample, pretty_print_reconstruction
 from .model import LatentParamVAE
 from .runtime_utils import (
     configure_runtime,
@@ -362,6 +362,7 @@ def _run_periodic_latent_walk(
     walk_buffer: Optional[WalkSampleBuffer] = None,
     walk_key_prefix: str = "",
     measurement_cache: Optional[dict] = None,
+    sampling_options: Optional[SamplingOptions] = None,
 ) -> Dict[str, float]:
     here = Path(__file__).resolve().parent.parent
     if str(here) not in sys.path:
@@ -427,6 +428,7 @@ def _run_periodic_latent_walk(
                     bundle=bundle,
                     keep_bundle=True,
                     measurement_cache=measurement_cache,
+                    sampling_options=sampling_options,
                 ) or []
             except Exception as err:  # pragma: no cover
                 print(f"[train] latent walk rank={rank} failed: {type(err).__name__}: {err}")
@@ -470,7 +472,12 @@ def _run_periodic_latent_walk(
 
 def build_everything(config):
     print(f"[build] loading registry from {config.data.network_info_folder}")
-    registry = GeneratorRegistry(config.data.network_info_folder)
+    gen_cfg = getattr(config, "generator", None)
+    registry = GeneratorRegistry(
+        config.data.network_info_folder,
+        hw_param=getattr(gen_cfg, "hw_param", None),
+        disable_constraint=getattr(gen_cfg, "disable_constraint", None),
+    )
     print("[build] building dataset bundle")
     bundle = build_dataset_bundle(config, registry)
     tokenizer = bundle.tokenizer
@@ -539,7 +546,7 @@ def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
     name = (
         f"_lr{config.train.learning_rate}"
         f"_nce{config.train.lambda_nce}"
-        f"_t{config.train.tau_nce}"
+        f"_tau{config.train.tau_nce}"
         f"_kl{config.train.beta_end}"
         f"_bw{config.train.beta_warmup_epochs}"
     )
@@ -568,8 +575,6 @@ def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
                 f"{float(config.train.weight_quantile):.1f}"
                 f"_{float(config.train.weight_sigma):.1f}"
             )
-    if bool(getattr(config.train, "latent_walk_use_cost_head", False)):
-        name += "_ch"
     if bool(getattr(config.train, "use_compressed_teacher_forcing", False)):
         name += "_comp"
     ls = float(getattr(config.train, "label_smoothing", 0.0))
@@ -577,6 +582,15 @@ def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
         name += f"_ls{ls}"
     if bool(getattr(config.train, "order_nce_pos_weight_by_percentile", False)):
         name += f"_pos{float(config.train.order_nce_pos_weight_sigma):.1f}"
+    if getattr(config.sampling, "strategy", "greedy") != "greedy":
+        name += f"_{config.sampling.strategy}"
+        if config.sampling.strategy == "sampling":
+            name += (
+                f"_t{config.sampling.temperature}"
+                f"_k{config.sampling.top_k}"
+                f"_p{config.sampling.top_p}"
+                f"_seed{config.sampling.seed}"
+            )
     return name
 
 
@@ -982,6 +996,16 @@ def train_main(config) -> Dict[str, float]:
         or str(checkpoint_dir)
     )
     latent_walk_network_info = getattr(config.data, "network_info_folder", None)
+    latent_walk_sampling_options = SamplingOptions.from_config(
+        getattr(config, "sampling", None)
+    )
+    if latent_walk_sampling_options.strategy != "greedy":
+        print(
+            f"[train] latent walk decoding: strategy={latent_walk_sampling_options.strategy} "
+            f"temperature={latent_walk_sampling_options.temperature} "
+            f"top_k={latent_walk_sampling_options.top_k} "
+            f"top_p={latent_walk_sampling_options.top_p}"
+        )
     if (latent_walk_every_n > 0 or latent_walk_on_final) and not latent_walk_record_json:
         print(
             "[train] latent walk requested but no record JSON resolvable from "
@@ -1152,6 +1176,7 @@ def train_main(config) -> Dict[str, float]:
                     walk_buffer=walk_sample_buffer if include_measurement else None,
                     walk_key_prefix=walk_prefix,
                     measurement_cache=shared_measurement_cache,
+                    sampling_options=latent_walk_sampling_options,
                 )
                 if sub_summary:
                     walk_summary.update(sub_summary)
@@ -1339,6 +1364,7 @@ def train_main(config) -> Dict[str, float]:
                 walk_buffer=walk_sample_buffer,
                 walk_key_prefix=walk_prefix,
                 measurement_cache=final_measurement_cache,
+                sampling_options=latent_walk_sampling_options,
             )
             if sub_summary:
                 final_walk_summary.update(sub_summary)

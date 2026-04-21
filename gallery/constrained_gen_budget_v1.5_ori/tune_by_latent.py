@@ -25,6 +25,7 @@ if __package__ in (None, ""):
         load_json_samples,
     )
     from latent_model_budget.dataset import budget_enabled, get_model_param_order
+    from latent_model_budget.inference import SamplingOptions, _sample_token_from_logits
     from latent_model_budget.model import LatentParamVAE
     from latent_model_budget.tokenizer import ParamTokenizer
     from modules.task_paths import clean_name, get_measure_record_filename
@@ -45,6 +46,7 @@ else:
         load_json_samples,
     )
     from .latent_model_budget.dataset import budget_enabled, get_model_param_order
+    from .latent_model_budget.inference import SamplingOptions, _sample_token_from_logits
     from .latent_model_budget.model import LatentParamVAE
     from .latent_model_budget.tokenizer import ParamTokenizer
     from .modules.task_paths import clean_name, get_measure_record_filename
@@ -502,7 +504,12 @@ def load_bundle(
     if network_info_folder is None:
         network_info_folder = payload["config"]["data"]["network_info_folder"]
 
-    registry = GeneratorRegistry(network_info_folder)
+    generator_cfg = payload.get("config", {}).get("generator", {}) or {}
+    registry = GeneratorRegistry(
+        network_info_folder,
+        hw_param=generator_cfg.get("hw_param") or None,
+        disable_constraint=generator_cfg.get("disable_constraint") or None,
+    )
     return LoadedBundle(
         checkpoint_payload=payload,
         model=model,
@@ -680,7 +687,11 @@ def greedy_decode_from_z(
     oracle: LegalPrefixOracle,
     ordered_names: List[str],
     z: torch.Tensor,
+    *,
+    sampling_options: Optional[SamplingOptions] = None,
+    rng: Optional[torch.Generator] = None,
 ) -> DecodeRecord:
+    options = sampling_options or SamplingOptions()
     model = bundle.model
     tokenizer = bundle.tokenizer
     device = bundle.device
@@ -717,8 +728,8 @@ def greedy_decode_from_z(
             z,
             decoder_pad_mask=step_input.eq(tokenizer.pad_id),
         )
-        step_logits = logits[0, -1].masked_fill(~token_mask, float("-inf"))
-        pred_token_id = int(torch.argmax(step_logits).item())
+        step_logits = logits[0, -1]
+        pred_token_id = _sample_token_from_logits(step_logits, token_mask, options, rng)
         pred_value = _resolve_decoded_value(tokenizer, var_name, pred_token_id, candidate_values)
 
         oracle.assign(var_name, pred_value)
@@ -917,7 +928,13 @@ def build_walk_records(
     include_measurement: bool = True,
     keep_bundle: bool = False,
     measurement_cache: Optional[Dict[tuple, Any]] = None,
+    sampling_options: Optional[SamplingOptions] = None,
 ) -> tuple[List[WalkRecord], StartZContext]:
+    options = sampling_options or SamplingOptions()
+    decode_rng: Optional[torch.Generator] = None
+    if options.strategy != "greedy" and options.seed is not None:
+        decode_rng = torch.Generator(device=bundle.device)
+        decode_rng.manual_seed(int(options.seed))
     start_ctx = resolve_start_z(
         bundle,
         record,
@@ -958,7 +975,14 @@ def build_walk_records(
     pending_measure_keys: List[tuple[tuple[str, int], ...]] = []
     for step_index, alpha, z in shifted_zs:
         oracle = bundle.registry.build_oracle_from_record(record)
-        decoded = greedy_decode_from_z(bundle, oracle, ordered_names, z)
+        decoded = greedy_decode_from_z(
+            bundle,
+            oracle,
+            ordered_names,
+            z,
+            sampling_options=options,
+            rng=decode_rng,
+        )
 
         decoded_sym_map_int = {
             k: int(v) for k, v in decoded.sym_map.items() if isinstance(v, int)
@@ -1258,6 +1282,7 @@ def run_latent_walk(
     bundle: Optional[LoadedBundle] = None,
     keep_bundle: bool = False,
     measurement_cache: Optional[Dict[tuple, Any]] = None,
+    sampling_options: Optional[SamplingOptions] = None,
 ) -> List[WalkRecord]:
     walk_output_path, _ = _resolve_output_layout(
         checkpoint_path=checkpoint_path,
@@ -1292,6 +1317,7 @@ def run_latent_walk(
         include_measurement=include_measurement,
         keep_bundle=keep_bundle,
         measurement_cache=measurement_cache,
+        sampling_options=sampling_options,
     )
     if walk_output_path is not None:
         save_walk_records(records, walk_output_path)
@@ -1347,12 +1373,45 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use deterministic=True when encoding the starting latent z from --record-json",
     )
+    p.add_argument(
+        "--decode-strategy",
+        type=str,
+        default="greedy",
+        choices=["greedy", "sampling"],
+        help="Token decoding strategy used when walking the latent space",
+    )
+    p.add_argument("--decode-temperature", type=float, default=1.0)
+    p.add_argument(
+        "--decode-top-k",
+        type=int,
+        default=0,
+        help="0 disables top-k truncation",
+    )
+    p.add_argument(
+        "--decode-top-p",
+        type=float,
+        default=1.0,
+        help="1.0 disables top-p truncation",
+    )
+    p.add_argument(
+        "--decode-seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for sampling decoding",
+    )
     return p
 
 
 
 def main() -> List[WalkRecord]:
     args = _build_argparser().parse_args()
+    sampling_options = SamplingOptions(
+        strategy=args.decode_strategy,
+        temperature=float(args.decode_temperature),
+        top_k=int(args.decode_top_k),
+        top_p=float(args.decode_top_p),
+        seed=args.decode_seed,
+    )
     return run_latent_walk(
         checkpoint_path=args.checkpoint,
         record_json_path=args.record_json,
@@ -1367,6 +1426,7 @@ def main() -> List[WalkRecord]:
         output=args.output,
         latent_gradient=args.latent_gradient,
         deterministic_start=bool(args.deterministic),
+        sampling_options=sampling_options,
     )
 
 

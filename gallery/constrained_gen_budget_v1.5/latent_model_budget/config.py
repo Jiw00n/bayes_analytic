@@ -65,6 +65,10 @@ class TrainConfig:
     beta_warmup_epochs: int = 10
     lambda_cost: float = 0.01
     lambda_nce: float = 0.2
+    lambda_annealing_epochs: Optional[List[int]] = field(default_factory=lambda: [10, 20])
+    lambda_recon_anneal: Optional[List[float]] = field(default_factory=lambda: [1.0, 0.3])
+    lambda_nce_anneal: Optional[List[float]] = field(default_factory=lambda: [0.2, 0.4])
+    lambda_cost_anneal: Optional[List[float]] = field(default_factory=lambda: [0.01, 0.015])
     tau_nce: float = 0.2
     cost_ridge_vec: bool = True
     ridge_alpha: float | List[float] = 0.1
@@ -91,10 +95,11 @@ class TrainConfig:
     latent_walk_record_json: Optional[str] = None
     latent_walk_output_dir: Optional[str] = None
     latent_walk_top_k: int = 1
-    latent_walk_num_steps: int = 30
+    latent_walk_num_steps: int = 20
     latent_walk_step_size: float = 0.25
+    latent_walk_use_cost_head: bool = False
     # CoBO-style sample weighting: higher cost → higher loss weight
-    cobo_sample_weighting: bool = True
+    cobo_sample_weighting: bool = False
     cobo_weight_quantile: float = 0.85   # y_q: CDF threshold percentile
     cobo_weight_sigma: float = 0.25       # σ as fraction of cost std (transition smoothness)
     label_smoothing: float = 0.0         # label smoothing epsilon (0 = disabled)
@@ -110,9 +115,30 @@ class EvalConfig:
 
 
 @dataclass
+class SamplingConfig:
+    """Decoding strategy used by `greedy_decode_*` and the latent walk.
+
+    ``strategy`` selects the decoding mode. Any other value is treated as
+    sampling with the listed truncation parameters.
+
+    - ``strategy="greedy"``: argmax (ignores every other field).
+    - ``strategy="sampling"``: multinomial over masked candidates after
+      applying temperature, then optional top-k, then optional top-p.
+    - ``top_k=0`` disables top-k; ``top_p=1.0`` disables top-p; the two can
+      be combined (top-k first, then top-p).
+    """
+
+    strategy: str = "greedy"  # "greedy" | "sampling"
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 1.0
+    seed: Optional[int] = None
+
+
+@dataclass
 class WandbConfig:
     # project: Optional[str] = "V1.5_grid_search"
-    project: Optional[str] = "V1.5_cobo"
+    project: Optional[str] = "V1.5_sampling_anneal"
 
 
 @dataclass
@@ -121,6 +147,7 @@ class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    sampling: SamplingConfig = field(default_factory=SamplingConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
 
     def to_dict(self) -> dict:
@@ -138,6 +165,7 @@ class ExperimentConfig:
             model=ModelConfig(**payload.get("model", {})),
             train=TrainConfig(**payload.get("train", {})),
             eval=EvalConfig(**payload.get("eval", {})),
+            sampling=SamplingConfig(**payload.get("sampling", {})),
             wandb=WandbConfig(**payload.get("wandb", {})),
         )
 

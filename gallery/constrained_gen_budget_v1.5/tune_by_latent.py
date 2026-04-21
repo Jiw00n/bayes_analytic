@@ -25,6 +25,7 @@ if __package__ in (None, ""):
         load_json_samples,
     )
     from latent_model_budget.dataset import budget_enabled, get_model_param_order
+    from latent_model_budget.inference import SamplingOptions, _sample_token_from_logits
     from latent_model_budget.model import LatentParamVAE
     from latent_model_budget.tokenizer import ParamTokenizer
     from modules.task_paths import clean_name, get_measure_record_filename
@@ -45,6 +46,7 @@ else:
         load_json_samples,
     )
     from .latent_model_budget.dataset import budget_enabled, get_model_param_order
+    from .latent_model_budget.inference import SamplingOptions, _sample_token_from_logits
     from .latent_model_budget.model import LatentParamVAE
     from .latent_model_budget.tokenizer import ParamTokenizer
     from .modules.task_paths import clean_name, get_measure_record_filename
@@ -646,7 +648,11 @@ def greedy_decode_from_z(
     oracle: LegalPrefixOracle,
     ordered_names: List[str],
     z: torch.Tensor,
+    *,
+    sampling_options: Optional[SamplingOptions] = None,
+    rng: Optional[torch.Generator] = None,
 ) -> DecodeRecord:
+    options = sampling_options or SamplingOptions()
     model = bundle.model
     tokenizer = bundle.tokenizer
     device = bundle.device
@@ -683,8 +689,8 @@ def greedy_decode_from_z(
             z,
             decoder_pad_mask=step_input.eq(tokenizer.pad_id),
         )
-        step_logits = logits[0, -1].masked_fill(~token_mask, float("-inf"))
-        pred_token_id = int(torch.argmax(step_logits).item())
+        step_logits = logits[0, -1]
+        pred_token_id = _sample_token_from_logits(step_logits, token_mask, options, rng)
         pred_value = _resolve_decoded_value(tokenizer, var_name, pred_token_id, candidate_values)
 
         oracle.assign(var_name, pred_value)
@@ -709,7 +715,11 @@ def greedy_decode_many_from_z(
     record: JsonSampleRecord,
     ordered_names: Sequence[str],
     z_batch: torch.Tensor,
+    *,
+    sampling_options: Optional[SamplingOptions] = None,
+    rng: Optional[torch.Generator] = None,
 ) -> List[DecodeRecord]:
+    options = sampling_options or SamplingOptions()
     model = bundle.model
     tokenizer = bundle.tokenizer
     device = bundle.device
@@ -803,8 +813,16 @@ def greedy_decode_many_from_z(
                     f"candidates={candidate_lists[local_idx]}"
                 )
 
-        masked_logits = step_logits.masked_fill(~step_masks, float("-inf"))
-        pred_token_ids = torch.argmax(masked_logits, dim=-1).tolist()
+        pred_token_ids: List[int] = []
+        for local_idx in range(step_logits.shape[0]):
+            pred_token_ids.append(
+                _sample_token_from_logits(
+                    step_logits[local_idx],
+                    step_masks[local_idx],
+                    options,
+                    rng,
+                )
+            )
         for local_idx, sample_idx in enumerate(variable_indices):
             candidate_values = candidate_lists[local_idx]
             pred_token_id = int(pred_token_ids[local_idx])
@@ -915,7 +933,14 @@ def build_walk_records(
     seed: Optional[int] = None,
     output: Optional[str | Path] = None,
     deterministic_start: bool = False,
+    measurement_cache: Optional[Dict[tuple, Any]] = None,
+    sampling_options: Optional[SamplingOptions] = None,
 ) -> tuple[List[WalkRecord], StartZContext]:
+    options = sampling_options or SamplingOptions()
+    decode_rng: Optional[torch.Generator] = None
+    if options.strategy != "greedy" and options.seed is not None:
+        decode_rng = torch.Generator(device=bundle.device)
+        decode_rng.manual_seed(int(options.seed))
     start_ctx = resolve_start_z(
         bundle,
         record,
@@ -939,7 +964,14 @@ def build_walk_records(
     decoded_batch: List[DecodeRecord] = []
     if shifted_zs:
         z_batch = torch.stack([z for _, _, z in shifted_zs], dim=0)
-        decoded_batch = greedy_decode_many_from_z(bundle, record, ordered_names, z_batch)
+        decoded_batch = greedy_decode_many_from_z(
+            bundle,
+            record,
+            ordered_names,
+            z_batch,
+            sampling_options=options,
+            rng=decode_rng,
+        )
 
     results: List[WalkRecord] = []
     pending_measure_indices_by_key: Dict[tuple[tuple[str, int], ...], List[int]] = {}
@@ -976,7 +1008,12 @@ def build_walk_records(
             sym_key = make_sym_map_key(
                 {k: int(v) for k, v in decoded.sym_map.items() if isinstance(v, int)}
             )
-            if sym_key in pending_measure_indices_by_key:
+            cached_measurement = (
+                measurement_cache.get(sym_key) if measurement_cache is not None else None
+            )
+            if cached_measurement is not None:
+                measurement = dict(cached_measurement)
+            elif sym_key in pending_measure_indices_by_key:
                 pending_measure_indices_by_key[sym_key].append(len(results))
             else:
                 pending_measure_indices_by_key[sym_key] = [len(results)]
@@ -1012,6 +1049,17 @@ def build_walk_records(
     for sym_key, measurement in zip(pending_measure_keys, measured_results):
         for result_index in pending_measure_indices_by_key[sym_key]:
             results[result_index].measurement = dict(measurement)
+        if measurement_cache is not None:
+            prior = measurement_cache.get(sym_key)
+            if prior is None:
+                measurement_cache[sym_key] = dict(measurement)
+            else:
+                prior_ok = bool(prior.get("ok") and prior.get("usable_measurement"))
+                curr_ok = bool(measurement.get("ok") and measurement.get("usable_measurement"))
+                prior_mc = prior.get("mean_cost") if prior_ok else None
+                curr_mc = measurement.get("mean_cost") if curr_ok else None
+                if curr_mc is not None and (prior_mc is None or curr_mc > prior_mc):
+                    measurement_cache[sym_key] = dict(measurement)
 
     for grouped_record in _group_walk_records_by_sym_map(results):
         log_grouped_candidate_result(grouped_record)
@@ -1144,6 +1192,8 @@ def run_latent_walk(
     latent_gradient: bool = False,
     deterministic_start: bool = False,
     preselected_record: Optional[JsonSampleRecord] = None,
+    measurement_cache: Optional[Dict[tuple, Any]] = None,
+    sampling_options: Optional[SamplingOptions] = None,
 ) -> List[WalkRecord]:
     walk_output_path, _ = _resolve_output_layout(
         checkpoint_path=checkpoint_path,
@@ -1174,6 +1224,8 @@ def run_latent_walk(
         seed=seed,
         output=output,
         deterministic_start=deterministic_start,
+        measurement_cache=measurement_cache,
+        sampling_options=sampling_options,
     )
     if walk_output_path is not None:
         save_walk_records(records, walk_output_path)
@@ -1234,12 +1286,45 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use deterministic=True when encoding the starting latent z from --record-json",
     )
+    p.add_argument(
+        "--decode-strategy",
+        type=str,
+        default="greedy",
+        choices=["greedy", "sampling"],
+        help="Token decoding strategy used when walking the latent space",
+    )
+    p.add_argument("--decode-temperature", type=float, default=1.0)
+    p.add_argument(
+        "--decode-top-k",
+        type=int,
+        default=0,
+        help="0 disables top-k truncation",
+    )
+    p.add_argument(
+        "--decode-top-p",
+        type=float,
+        default=1.0,
+        help="1.0 disables top-p truncation",
+    )
+    p.add_argument(
+        "--decode-seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for sampling decoding",
+    )
     return p
 
 
 
 def main() -> List[WalkRecord]:
     args = _build_argparser().parse_args()
+    sampling_options = SamplingOptions(
+        strategy=args.decode_strategy,
+        temperature=float(args.decode_temperature),
+        top_k=int(args.decode_top_k),
+        top_p=float(args.decode_top_p),
+        seed=args.decode_seed,
+    )
     return run_latent_walk(
         checkpoint_path=args.checkpoint,
         record_json_path=args.record_json,
@@ -1255,6 +1340,7 @@ def main() -> List[WalkRecord]:
         use_cost_head=bool(args.cost_head),
         latent_gradient=args.latent_gradient,
         deterministic_start=bool(args.deterministic),
+        sampling_options=sampling_options,
     )
 
 
