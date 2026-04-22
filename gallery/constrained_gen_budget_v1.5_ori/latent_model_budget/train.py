@@ -20,6 +20,7 @@ from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples
 from .dataset import (
     DatasetBundle,
     _build_prepared_sample,
+    _generator_cache_suffix,
     _get_generator_for_record,
     budget_enabled,
     build_dataset_bundle,
@@ -516,25 +517,41 @@ def _resolve_run_task_index(bundle: DatasetBundle) -> str:
     return "na"
 
 
-def _build_wandb_project_name(config, bundle: DatasetBundle) -> str:
-    task_index = _resolve_run_task_index(bundle)
+def _resolve_task_index_from_config(config) -> str:
+    import re
+
+    ti = getattr(config.data, "task_index", None)
+    if ti is not None:
+        return str(int(ti))
+    for p in getattr(config.data, "json_paths", []) or []:
+        m = re.match(r"^(\d+)", Path(p).stem)
+        if m:
+            return m.group(1)
+    return "na"
+
+
+def _build_wandb_project_name(config, bundle: DatasetBundle | None = None) -> str:
+    if bundle is not None:
+        task_index = _resolve_run_task_index(bundle)
+    else:
+        task_index = _resolve_task_index_from_config(config)
     project_suffix = getattr(config.wandb, "project", None) or "single_v1"
     return f"Task{task_index}_{project_suffix}"
 
 
-def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
+def _build_wandb_run_name(config, bundle: DatasetBundle | None = None) -> str:
     name = ""
 
-    if config.model.num_encoder_layers != 3:
+    if config.model.num_encoder_layers != 4:
         name += f"_enc{config.model.num_encoder_layers}"
-    if config.model.num_decoder_layers != 3:
+    if config.model.num_decoder_layers != 4:
         name += f"_dec{config.model.num_decoder_layers}"
     if config.model.nhead != 4:
         name += f"_head{config.model.nhead}"
     
     if config.model.latent_dim != 64:
         name += f"_zdim{config.model.latent_dim}"
-    if config.model.dim_feedforward != 192:
+    if config.model.dim_feedforward != 384:
         name += f"_fdim{config.model.dim_feedforward}"
     if config.model.cost_hidden_dim != 128:
         name += f"_cdim{config.model.cost_hidden_dim}"
@@ -543,7 +560,7 @@ def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
 
     if config.train.num_epochs != 100:
         name += f"_ep{config.train.num_epochs}"
-    name = (
+    name += (
         f"_lr{config.train.learning_rate}"
         f"_nce{config.train.lambda_nce}"
         f"_tau{config.train.tau_nce}"
@@ -589,8 +606,10 @@ def _build_wandb_run_name(config, bundle: DatasetBundle) -> str:
                 f"_t{config.sampling.temperature}"
                 f"_k{config.sampling.top_k}"
                 f"_p{config.sampling.top_p}"
-                f"_seed{config.sampling.seed}"
+                f"_samseed{config.sampling.seed}"
             )
+    name += f"_seed{config.data.seed}"
+    name += _generator_cache_suffix(config)
     return name
 
 
@@ -840,6 +859,21 @@ def train_main(config) -> Dict[str, float]:
         f"tf32={bool(getattr(config.train, 'allow_tf32', True))}"
     )
 
+    wandb_run = None
+    wandb_project = getattr(config.wandb, "project", None)
+    run_name = _build_wandb_run_name(config)
+    if wandb_project:
+        if wandb is None:
+            print("[train] wandb project is set but wandb is not installed; skipping wandb logging")
+        else:
+            project_name = _build_wandb_project_name(config)
+            print(f"[train] initializing wandb: project={project_name} run={run_name}")
+            wandb_run = wandb.init(
+                project=project_name,
+                name=run_name,
+                config=config.to_dict(),
+            )
+
     registry, bundle, tokenizer, model = build_everything(config)
     model.to(device)
     print(f"[train] model moved to {device}")
@@ -848,23 +882,10 @@ def train_main(config) -> Dict[str, float]:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] model/total_params: {total_params:,}")
 
-    wandb_run = None
-    wandb_project = getattr(config.wandb, "project", None)
-    run_name = _build_wandb_run_name(config, bundle)
-    if wandb_project:
-        if wandb is None:
-            print("[train] wandb project is set but wandb is not installed; skipping wandb logging")
-        else:
-            project_name = _build_wandb_project_name(config, bundle)
-            print(f"[train] initializing wandb: project={project_name} run={run_name}")
-            wandb_run = wandb.init(
-                project=project_name,
-                name=run_name,
-                config=config.to_dict(),
-            )
-            wandb_run.summary["model/architecture"] = str(model)
-            wandb_run.summary["model/total_params"] = total_params
-            wandb_run.summary["model/trainable_params"] = trainable_params
+    if wandb_run is not None:
+        wandb_run.summary["model/architecture"] = str(model)
+        wandb_run.summary["model/total_params"] = total_params
+        wandb_run.summary["model/trainable_params"] = trainable_params
 
 
     train_loader = prepare_loader(
@@ -945,15 +966,23 @@ def train_main(config) -> Dict[str, float]:
     checkpoint_dir = save_training_artifacts(config.train.checkpoint_dir, config, tokenizer)
     print(f"[train] checkpoint dir: {checkpoint_dir}")
 
+    pt_project_name = getattr(config.wandb, "project", None)
+    if pt_project_name:
+        pt_dir = checkpoint_dir / str(pt_project_name)
+        pt_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        pt_dir = checkpoint_dir
+    print(f"[train] checkpoint pt dir: {pt_dir}")
+
     start_epoch = 1
     best_exact_match = float("-inf")
     best_val_acc = float("-inf")
-    best_checkpoint_path = checkpoint_dir / "best.pt"
-    last_checkpoint_path = checkpoint_dir / "last.pt"
-    checkpoint_path = checkpoint_dir / f"{run_name}.pt"
+    best_checkpoint_path = pt_dir / "best.pt"
+    last_checkpoint_path = pt_dir / "last.pt"
+    checkpoint_path = pt_dir / f"{_resolve_run_task_index(bundle)}_{run_name}.pt"
     if checkpoint_path.exists():
         timestamp = time.strftime("%m%d%H%M")
-        checkpoint_path = checkpoint_dir / f"{run_name}_{timestamp}.pt"
+        checkpoint_path = pt_dir / f"{_resolve_run_task_index(bundle)}_{run_name}_{timestamp}.pt"
         print(f"[train] checkpoint already exists; using timestamped path: {checkpoint_path}")
     if best_metric_mode == "max":
         best_metric_value = float("-inf")

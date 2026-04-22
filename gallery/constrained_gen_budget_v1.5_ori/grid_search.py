@@ -13,17 +13,23 @@ if str(HERE) not in sys.path:
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(HERE.parent))
-    from latent_model_budget.config import build_config
+    from latent_model_budget.config import build_config, resolve_task_paths
     from latent_model_budget.model import LatentParamVAE
     import latent_model_budget.train as train_module
 else:
-    from .latent_model_budget.config import build_config
+    from .latent_model_budget.config import build_config, resolve_task_paths
     from .latent_model_budget.model import LatentParamVAE
     from .latent_model_budget import train as train_module
 
 
 SEARCH_SPACE = {
-    "data.task_index": [1490],
+    "wandb.project": ["v1.5_ori_sample"],
+    # "wandb.project": [None],
+
+    # "data.seed": [42],
+    "data.task_index": [302],
+    "generator.hw_param": [{}, {"max_vthread_extent": 15}],
+    "data.seed": [0,1,42],
 
     "train.beta_end": [0.003],
     "train.beta_warmup_epochs": [10],
@@ -31,19 +37,21 @@ SEARCH_SPACE = {
     "train.nce_mu": [False],
     "model.adaln": [True],
 
-    "model.num_encoder_layers": [3],
-    "model.num_decoder_layers": [3],
-    "model.d_model": [128],
-    "model.dim_feedforward": [256, 384],
-    "model.latent_dim": [24, 32],
-    "model.cost_hidden_dim": [64],
-    "model.nhead": [2, 4],
-    "model.latent_token_count": [4],
+    # "model.num_encoder_layers": [3],
+    # "model.num_decoder_layers": [3],
+    # "model.d_model": [128],
+    # "model.dim_feedforward": [256, 384],
+    # "model.latent_dim": [24, 32],
+    # "model.cost_hidden_dim": [64],
+    # "model.nhead": [2, 4],
+    # "model.latent_token_count": [4],
 
-    "train.latent_walk_every_n_epochs": [5],
+    "train.latent_walk_every_n_epochs": [10],
+    "train.latent_walk_use_cost_head": [False],
+
     "train.num_epochs": [100],
-    "train.learning_rate": [1e-4, 3e-4],
-    "train.lambda_nce": [0.2],
+    "train.learning_rate": [5e-4],
+    "train.lambda_nce": [0.1, 0.2, 0.3],
     "train.tau_nce": [0.2],
     "train.latent_walk_top_k": [3],
 
@@ -57,8 +65,8 @@ SEARCH_SPACE = {
     "sampling.strategy": ["sampling"],
     "sampling.temperature": [0.8, 1.1],
     "sampling.top_k": [2, 4],
-    "sampling.top_p": [1.0],
-    "sampling.seed": [42, 43],
+    # "sampling.top_p": [1.0],
+    "sampling.seed": [42],
 
     # "train.label_smoothing": [0],
     # "train.lambda_recon": [1.0],
@@ -156,6 +164,7 @@ def run_one(exp_idx: int, params: dict) -> None:
 
     for k, v in params.items():
         set_nested_attr(cfg, k, v)
+    resolve_task_paths(cfg)
 
     try:
         train_main(cfg)

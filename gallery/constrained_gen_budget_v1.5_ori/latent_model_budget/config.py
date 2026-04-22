@@ -10,7 +10,7 @@ from glob import glob
 
 DEFAULT_JSON_PATHS = glob("/root/work/tvm-ansor/gallery/constrained_gen/data/measured_*/*.json")
 DEFAULT_NETWORK_INFO_FOLDER = "/root/work/tvm-ansor/gallery/dataset/network_info_all"
-DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget_v1.5_ori/checkpoints_all/"
+DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget_v1.5_ori/checkpoints_all"
 
 
 @dataclass
@@ -50,25 +50,26 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    learning_rate: float = 7e-4
+    checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR
+    precompute_candidate_masks: bool = True
+
+    learning_rate: float = 5e-4
     beta_start: float = 1e-4
     beta_end: float = 0.003
-    beta_warmup_epochs: int = 20
+    beta_warmup_epochs: int = 10
     lambda_recon: float = 1.0
     lambda_cost: float = 0.01
     lambda_nce: float = 0.2
-    tau_nce: float = 0.3
+    tau_nce: float = 0.2
     cost_ridge_vec: bool = True
     ridge_alpha: float | List[float] = 0.1
-    checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR
-    precompute_candidate_masks: bool = True
     order_nce: bool = True
     order_nce_pos_weight_by_percentile: bool = False
     order_nce_pos_weight_sigma: float = 0.2
     nce_mu: bool = False
     
     latent_walk_top_k: int = 1
-    latent_walk_num_steps: int = 20
+    latent_walk_num_steps: int = 30
     latent_walk_step_size: float = 0.25
     latent_walk_every_n_epochs: int = 10
     latent_walk_predict_every_n_epochs: int = 10
@@ -97,7 +98,7 @@ class TrainConfig:
     weight_sigma: float = 0.25
     cobo_apply_to: List[str] = field(default_factory=lambda: ["kld", "cost", "nce"])
     cost_ridge_weighted: bool = False
-    latent_walk_use_cost_head: bool = True
+    latent_walk_use_cost_head: bool = False
 
     # Which predictor to use for the re-encode (encoder -> predictor) score
     # displayed in measurement output. One of:
@@ -105,7 +106,7 @@ class TrainConfig:
     latent_walk_predict_use_gp: bool = False
     latent_walk_predict_gp_top_k: int = 100
     latent_walk_predict_gp_random_n: int = 0
-    re_encode_predictor: str = "lightgbm_ranker"
+    re_encode_predictor: str = "cost_vec"
 
 
     # scheduler_milestones: List[int] = field(default_factory=lambda: [30, 50])
@@ -165,7 +166,7 @@ class SamplingConfig:
 
 @dataclass
 class WandbConfig:
-    project: Optional[str] = "v1.5_ori_sampling"
+    project: Optional[str] = "v1.5_ori"
 
 
 @dataclass
@@ -178,8 +179,9 @@ class GeneratorConfig:
     differ from the defaults affect the precompute mask cache name.
     """
 
-    # hw_param: Dict[str, Any] = field(default_factory=dict)
-    hw_param: Dict[str, Any] = field(default_factory=lambda: {"max_vthread_extent": 15})
+    hw_param: Dict[str, Any] = field(default_factory=dict)
+    # hw_param: Dict[str, Any] = field(default_factory=lambda: {"max_vthread_extent": 15})
+
 
     disable_constraint: List[str] = field(default_factory=list)
     # disable_constraint: List[str] = field(default_factory=lambda: ["vectorize"])
@@ -227,3 +229,17 @@ CONFIG = ExperimentConfig()
 
 def build_config() -> ExperimentConfig:
     return copy.deepcopy(CONFIG)
+
+
+def resolve_task_paths(cfg: ExperimentConfig) -> None:
+    """Recompute ``cfg.data.json_paths`` and ``cfg.train.checkpoint_dir`` from
+    ``cfg.data.task_index``. Call this after overriding ``task_index`` on an
+    already-built config (e.g., from a grid-search sweep)."""
+    task_index = cfg.data.task_index
+    if task_index is None:
+        return
+    prefix = f"{int(task_index)}_"
+    cfg.data.json_paths = [
+        p for p in DEFAULT_JSON_PATHS if Path(p).name.startswith(prefix)
+    ]
+    cfg.train.checkpoint_dir = str(Path(DEFAULT_CHECKPOINT_DIR) / str(task_index))

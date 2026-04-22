@@ -15,8 +15,44 @@ from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples, spl
 from .tokenizer import ParamTokenizer
 
 
-_CANDIDATE_MASK_CACHE_VERSION = "v4"
+_CANDIDATE_MASK_CACHE_VERSION = "v5"
 _CANDIDATE_MASK_CACHE_FLUSH_EVERY = 100
+
+
+def _remap_cached_mask_to_tokenizer(
+    mask: torch.Tensor,
+    saved_id_to_token: Sequence[str],
+    tokenizer: "ParamTokenizer",
+) -> torch.Tensor:
+    """Remap a cached candidate mask from its build-time vocab to the current
+    tokenizer's vocab. Tokens absent from the current vocab are aggregated into
+    ``tokenizer.unk_id`` (mirroring ``candidate_mask_from_values(allow_unk=True)``).
+
+    The cached mask's last dim is indexed by token_id, which depends on the
+    training split (and therefore ``data.seed``). This remapping lets a cache
+    built under one seed be reused under another while keeping the tokenizer's
+    train-only build order (for backward compatibility with existing runs).
+    """
+    saved_id_to_token = list(saved_id_to_token)
+    current_vocab = list(tokenizer.id_to_token)
+    if saved_id_to_token == current_vocab:
+        return mask
+    mask = mask.to(dtype=torch.bool, device="cpu")
+    seq_len = int(mask.shape[0])
+    new_mask = torch.zeros((seq_len, len(current_vocab)), dtype=torch.bool)
+    unk_id = int(tokenizer.unk_id)
+    for old_id, token in enumerate(saved_id_to_token):
+        if old_id >= mask.shape[1]:
+            break
+        col = mask[:, old_id]
+        if not col.any():
+            continue
+        new_id = tokenizer.token_to_id.get(token)
+        if new_id is None:
+            new_mask[:, unk_id] |= col
+        else:
+            new_mask[:, int(new_id)] |= col
+    return new_mask
 
 
 @dataclass
@@ -544,6 +580,7 @@ def _save_candidate_mask_cache_files(
     subset: Sequence[JsonSampleRecord],
     cached_candidate_masks: Dict[str, torch.Tensor],
     cache_paths_by_workload: Dict[tuple[str, str], Path],
+    tokenizer: "ParamTokenizer",
 ) -> None:
     sample_masks_by_workload: Dict[tuple[str, str], Dict[str, torch.Tensor]] = {}
     for record in subset:
@@ -559,6 +596,7 @@ def _save_candidate_mask_cache_files(
             mask.clone().to(device="cpu")
         )
 
+    id_to_token = list(tokenizer.id_to_token)
     for workload_sig, sample_masks in sample_masks_by_workload.items():
         cache_path = cache_paths_by_workload.get(workload_sig)
         if cache_path is None:
@@ -572,6 +610,7 @@ def _save_candidate_mask_cache_files(
                 "workload_key": workload_sig[0],
                 "target_kind": workload_sig[1],
                 "sample_masks": sample_masks,
+                "id_to_token": id_to_token,
             },
             cache_path,
         )
@@ -668,11 +707,14 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         config.data.seed,
     )
 
+    # Tokenizer build order is intentionally train-only (seed-dependent) to
+    # stay compatible with existing checkpoints and wandb baselines. The cache
+    # records its build-time ``id_to_token`` and is remapped on load when a
+    # different seed produces a different token ordering.
     train_record_ids = {id(record) for record in train_records}
     train_orders: List[List[str]] = []
     train_values: List[List[int]] = []
     all_orders: List[List[str]] = []
-
     for record in valid_records:
         order, values = prepared_cache[id(record)]
         all_orders.append(order)
@@ -697,9 +739,12 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     precompute_candidate_masks = bool(getattr(config.train, "precompute_candidate_masks", False))
     cached_candidate_masks: Dict[str, torch.Tensor] = {}
     cache_paths_by_workload: Dict[tuple[str, str], Path] = {}
-    precompute_records = list(train_records) + list(val_records)
+    # Precompute over ALL valid records (not just the current train+val split)
+    # so the cache is seed-invariant: changing ``data.seed`` only reshuffles
+    # which records land in train/val/test, never triggers recomputation.
+    precompute_records = list(valid_records)
     if precompute_candidate_masks:
-        print("[dataset] precomputing candidate masks for train+val splits")
+        print("[dataset] precomputing candidate masks for all valid records")
         precompute_workload_keys = sorted(
             {
                 (record.workload_key, record.target_kind)
@@ -715,9 +760,26 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             print(f"[dataset] loading cached candidate masks from {cache_path}")
             payload = torch.load(cache_path, map_location="cpu")
             sample_masks = payload.get("sample_masks", {})
+            saved_id_to_token = payload.get("id_to_token")
+            if saved_id_to_token is None:
+                print(
+                    f"[dataset] cache at {cache_path} lacks id_to_token; "
+                    f"ignoring (rebuild required)"
+                )
+                continue
+            needs_remap = list(saved_id_to_token) != list(tokenizer.id_to_token)
+            if needs_remap:
+                print(
+                    f"[dataset] remapping cached masks to current tokenizer "
+                    f"(saved_vocab={len(saved_id_to_token)} "
+                    f"current_vocab={len(tokenizer.id_to_token)})"
+                )
             loaded_count = 0
             for sample_id, mask in sample_masks.items():
-                cached_candidate_masks[str(sample_id)] = mask.clone().to(dtype=torch.bool, device="cpu")
+                m = mask.to(dtype=torch.bool, device="cpu")
+                if needs_remap:
+                    m = _remap_cached_mask_to_tokenizer(m, saved_id_to_token, tokenizer)
+                cached_candidate_masks[str(sample_id)] = m.clone()
                 loaded_count += 1
             print(
                 f"[dataset] loaded cached masks for workload_key={workload_key} "
@@ -856,6 +918,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                     subset,
                     cached_candidate_masks,
                     cache_paths_by_workload,
+                    tokenizer,
                 )
             if idx == total:
                 print(
@@ -887,7 +950,13 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 persist_cache=precompute_candidate_masks,
             )
         ),
-        test_dataset=LatentParamDataset(build_samples(test_records, include_candidate_masks=False)),
+        test_dataset=LatentParamDataset(
+            build_samples(
+                test_records,
+                include_candidate_masks=precompute_candidate_masks,
+                persist_cache=precompute_candidate_masks,
+            )
+        ),
         tokenizer=tokenizer,
         train_records=list(train_records),
         val_records=list(val_records),
@@ -899,6 +968,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             precompute_records,
             cached_candidate_masks,
             cache_paths_by_workload,
+            tokenizer,
         )
         for workload_sig in sorted(cache_paths_by_workload):
             cache_path = cache_paths_by_workload[workload_sig]
