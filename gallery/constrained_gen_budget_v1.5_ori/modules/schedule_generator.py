@@ -134,6 +134,7 @@ class ScheduleGenerator:
         self.domain_propagator = DomainPropagator(self)
         self.param_sampler = ParamSampler(self)
         self._inspector = _ScheduleGeneratorInspector(self)
+        self._vectorize_split_step_indices = self._find_vectorize_split_step_indices()
 
         self.constraint_set.preprocess()
 
@@ -247,6 +248,21 @@ class ScheduleGenerator:
         self._concrete_final_cache[cache_key] = dict(result)
         return result
 
+
+    def _find_vectorize_split_step_indices(self):
+        """SplitStep 바로 뒤에 vectorize AnnotationStep이 오는 step index 집합을 반환한다."""
+        indices = set()
+        if self.s._state is None:
+            return indices
+        steps = self.s._state.transform_steps
+        for i in range(len(steps) - 1):
+            s = steps[i]
+            ns = steps[i + 1]
+            if (s.type_key.split(".")[-1] == "SplitStep"
+                    and ns.type_key.split(".")[-1] == "AnnotationStep"
+                    and int(ns.annotation) == 2):
+                indices.add(i)
+        return indices
 
     def _build_split_domains(self):
         """모든 split 변수의 초기 도메인 사전을 만든다."""

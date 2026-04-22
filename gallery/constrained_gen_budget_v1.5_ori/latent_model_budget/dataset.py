@@ -15,7 +15,7 @@ from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples, spl
 from .tokenizer import ParamTokenizer
 
 
-_CANDIDATE_MASK_CACHE_VERSION = "v5"
+_CANDIDATE_MASK_CACHE_VERSION = "v7"
 _CANDIDATE_MASK_CACHE_FLUSH_EVERY = 100
 
 
@@ -502,6 +502,8 @@ def _collect_generator_domain_values(
     domain_values_by_name: Dict[str, Set[int]] = {}
     split_domains = gen._build_split_domains()
     split_candidate_values: Dict[str, List[int]] = {}
+    innermost_names = getattr(gen, "_innermost_names", set())
+    innermost_limit = int(gen.hw.get("max_innermost_split_factor", 0)) or None
 
     for name in order:
         if name.startswith("ur_"):
@@ -516,6 +518,14 @@ def _collect_generator_domain_values(
                 values = [int(v) for v in gen._enumerate_split_candidates(name, extent)]
             else:
                 values = [int(domain)]
+            # Innermost split factors are capped at max_innermost_split_factor
+            # by the sampler/constraints, so values exceeding it (e.g. the
+            # full-extent divisor 100352 when extent=100352, limit=64) can
+            # never appear as a parameter — drop them from vocab. We still
+            # enumerate divisors of the real extent first, so legal values
+            # like 7 (a divisor of 100352 that is ≤ 64) are preserved.
+            if innermost_limit is not None and name in innermost_names:
+                values = [v for v in values if v <= innermost_limit]
             split_candidate_values[name] = list(values)
             domain_values_by_name.setdefault(name, set()).update(values)
 
@@ -656,7 +666,18 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 order,
                 include_budget=include_budget,
             )
+            # Skip dynamic-extent split steps (SplitStep immediately followed
+            # by a vectorize AnnotationStep): their divisor-based initial
+            # domain is meaningless because the extent varies per record.
+            _vec_step_indices = getattr(gen, "_vectorize_split_step_indices", set())
             for name, values in generator_domain_values.items():
+                if name.startswith("sp_"):
+                    try:
+                        _step_idx = int(name.split("_")[1])
+                    except (ValueError, IndexError):
+                        _step_idx = None
+                    if _step_idx is not None and _step_idx in _vec_step_indices:
+                        continue
                 domain_values_by_name.setdefault(name, set()).update(int(v) for v in values)
         order = list(cached_meta["order"])
         budget_specs = list(cached_meta["budget_specs"])

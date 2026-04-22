@@ -122,15 +122,15 @@ metric은 `-ln(mean_cost_seconds)`, `higher=better`. 같은 스케줄이 여러 
 
 ## 6. 결론
 
-**탐색 성능 저하의 원인은 학습-time (A) 하나**. 구체적으로 `masked_cross_entropy`
-에서 hw=15 candidate mask를 softmax 분모로 쓰는 것이 모델의 **탐색 품질**을
-떨어뜨림. 다만 **어떤 메커니즘으로 그렇게 되는지는 아직 불확정**.
+**저하의 원인은 학습-time (A) 하나**. 구체적으로 `masked_cross_entropy`에서
+hw=15 candidate mask를 softmax 분모로 쓰는 것이 모델 품질을 떨어뜨림. 다만
+**(A)가 어떤 메커니즘으로 모델을 나쁘게 만드는지는 아직 불확정**.
 
 근거 (확실히 말할 수 있는 범위):
 - hw=8로 학습된 모델은 탐색 domain이 hw=15로 넓어져도 노이즈 내 동일 성능
   (Step 2 ≈ baseline). → 탐색-time domain 확장은 본질적 문제 아님.
 - hw=15로 학습된 모델은 어떤 탐색 domain에서도 baseline보다 유의하게 못함
-  (Step 1, hw=15 모두). → 학습 자체가 모델의 탐색 품질을 망침.
+  (Step 1, hw=15 모두). → 학습 자체가 모델을 망침.
 - (B)만 제거한 diag(§3.1)도 baseline까지 회복 안 됨. → "hw=8에서 singleton
   이던 위치가 hw=15에서 정상 후보로 부활" 경로는 주범 아님. **(A)**, 즉
   기존 비-fallback 위치의 mask 분모 확장이 남은 범인.
@@ -142,48 +142,32 @@ Step 2가 baseline 수준임이 드러나면서 이 해석은 기각. 실제 구
 - 학습 hw=15 + 탐색 hw=15 조합에서 추가 −0.110 상호작용 발생 (학습-망가진
   모델이 hw=15 후보를 특별히 잘못 다루는 효과)
 
-### 핵심 제약: recon은 **오히려 올라간다**
+### 메커니즘 미확정 — 기각된 가설
 
-추가 관측: hw=15 학습에서 **reconstruction 성능(teacher-forcing recon
-accuracy / recon loss)은 baseline보다 좋아짐**. 그런데 탐색 성능은 나빠짐.
-이 사실이 메커니즘 공간을 크게 좁힘.
+초기 가설 "hw=15-only 후보는 gold로 등장하지 않아 positive supervision이
+0이고 모델이 이들을 능동적으로 억제하도록 학습된다"는 **training record에
+vthread extent > 8 gold가 실제로 존재함이 확인되어 기각**. 존재하는 이상
+그 샘플들의 해당 position은 정상 positive gradient를 받음 (`_build_teacher_forcing_candidate_masks`
+의 fallback 경로에 빠지지 않음).
 
-recon loss는 `masked_cross_entropy`의 직접적 결과이므로:
-- "mask 분모 확장이 recon 학습을 방해한다"는 단순 가설들은 **모두 기각**.
-- 기각되는 가설:
-  - "분모 희석으로 모델이 classification을 잘 못 배운다" — recon이 올랐으므로 X
-  - "희귀한 extent>8 gold가 학습을 불안정하게 만든다" — recon 지표가 개선
-    됐다면 오히려 그 샘플들을 잘 배운다는 뜻에 가까움
-  - "용량 경쟁으로 common domain 학습 정확도가 떨어진다" — recon 지표 개선
-    이면 classification-level 용량은 모자라지 않음
-- 즉 gap은 **"teacher-forcing 분류 정확도"와 "latent walk의 측정 품질"**
-  사이에 있음.
+### 남은 가설 (검증 필요)
 
-### 가능한 메커니즘 (recon↑, walk↓ 현상에 맞춰)
+- **데이터 불균형**: extent > 8 gold 샘플 비율이 낮아 hw=15에서만 살아나는
+  희귀 gold에 대해 high-variance gradient가 흐름. hw=8 학습에서는 같은 샘플
+  들의 해당 position이 오라클 외 gold → singleton fallback → position
+  weight 0으로 제거됨(train_epoch.py:107). hw=15에서 갑자기 살아나면서
+  학습 안정성에 악영향 가능.
+- **Softmax 분모 희석**: gold ≤ 8이 다수인 common position에서도 hw=15는
+  extent > 8 distractor logit을 추가로 낮추도록 push함. 모델 용량이
+  distractor 억제에 소비되면서 common domain 학습이 저하될 가능성.
+- **용량 경쟁**: 같은 파라미터로 더 넓은 출력 domain을 커버해야 함 → 흔한
+  domain의 정확도 희생.
 
-1. **Latent geometry 변형**: mask 분모 확장이 encoder 표현을 재배열함
-   → teacher-forcing 디코딩은 오히려 잘 되지만, latent walk이 의존하는
-   cost surface의 smoothness/방향이 틀어짐. walk의 `cost_pred` gradient가
-   예전만큼 좋은 방향을 가리키지 못함.
-
-2. **Exposure bias 심화**: autoregressive 생성에서 모델이 초기 토큰을
-   hw=15-only 값(특히 extent>8)으로 고르는 경향이 강해졌는데, 그 경로가
-   실제 측정에서는 대체로 안 좋아 walk 최종 후보가 나빠짐. recon은
-   teacher-forcing이라 이 경향이 드러나지 않음.
-
-3. **Cost-head / encoder 상호작용**: recon gradient의 변화가 encoder에
-   역류해 cost_pred·NCE의 latent 분리에 영향. mask를 안 쓰는 cost/nce
-   loss 값 자체도 같이 변했는지 확인 필요.
-
-4. **Decoder의 rare-token 과신**: extent>8 gold를 학습에서 정상적으로
-   배웠지만, 해당 token에 대한 confidence가 과하게 높아져 sampling 시
-   과대 선택됨.
-
-판별을 위해 필요:
-- hw=15 학습 중 cost_loss, kl_loss, nce_loss의 baseline 대비 변화
-- walk 생성된 schedule의 vthread extent 분포 (실제로 hw=15만에 있는 값을
-  과도하게 뽑는지)
-- latent space에서 cost ridge의 곡률/smoothness 지표 (before/after)
+이 셋을 판별하려면 다음이 필요:
+- record 내 vthread extent gold 분포 (>8 비율, var별/task별 분포)
+- hw=8 학습 중 fallback에 빠진 position 개수 (per-epoch)
+- hw=15 학습 시 extent > 8 gold position의 loss 궤적 vs extent ≤ 8 gold
+  position의 loss 궤적
 
 ## 7. 해결 방향
 
@@ -195,22 +179,19 @@ recon loss는 `masked_cross_entropy`의 직접적 결과이므로:
 
 다만 이 경로는 hw=8 학습 시 extent > 8 gold를 가진 record의 해당 position이
 singleton fallback으로 zero-weight 되는 것을 감수함. 즉 "그 데이터를 못
-배우는 대신 탐색 품질을 얻는" 트레이드오프. recon 품질은 hw=15 학습이 더
-좋지만 최종 목적(탐색)에서는 hw=8 학습이 유리.
+배우는 대신 모델 안정성을 얻는" 트레이드오프.
 
 ### 7.2 중·장기 근본 해결 (메커니즘 확인 후 선택)
 
 메커니즘이 확정되지 않았으므로 아래는 가설별 후보.
 
-- **Latent geometry 가설이 맞다면**: cost-head 쪽 regularization 강화
-  (cost ridge 계수 상향, cost-aware NCE 비중 조정). recon-cost trade-off
-  를 명시적으로 관리.
-- **Exposure bias / decoder 과신 가설이 맞다면**: hw=15-only 후보에 대해
-  decoder-level temperature 상향, 또는 asymmetric label smoothing으로
-  해당 토큰 confidence를 눌러줌. 학습 시 position_weights에 rare-gold
-  downweight 추가.
+- **데이터 불균형 가설이 맞다면**: extent > 8 gold 샘플 부스팅 (sample
+  weighting, 또는 해당 position에 position_weights 가중). hw=15 학습에서
+  희귀 gold가 안정적인 gradient를 받도록.
+- **분모 희석 / 용량 경쟁 가설이 맞다면**: hw=15-only 후보에 대해 gradient
+  완화 (label_smoothing 비대칭 재배분, margin loss 변형, 또는 temperature
+  scaling). common domain 학습 왜곡 축소.
 - **공통 안전책 — self-training 부트스트랩**: 현재 모델로 hw=15 탐색 → 측정
   → 좋은 스케줄만 training set에 추가 → hw=15 mask로 재학습. 반복. extent
-  > 8 영역에서 "실제 측정이 좋은" gold를 주입하는 효과 — walk-측정 gap을
-  직접 메움. `walk_sample_buffer` 인프라 재활용 가능하지만 현재는 학습
-  피드백 경로가 없어 별도 연결 필요.
+  > 8 영역의 gold 밀도를 높이는 효과. `walk_sample_buffer` 인프라 재활용
+  가능하지만 현재는 학습 피드백 경로가 없어 별도 연결 필요.
