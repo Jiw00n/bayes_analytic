@@ -118,6 +118,53 @@ def weighted_cost_loss(
     return F.mse_loss(cost_pred[cost_mask], costs[cost_mask])
 
 
+def pairwise_rank_loss(
+    cost_pred: torch.Tensor,
+    costs: torch.Tensor,
+    cost_mask: torch.Tensor,
+    method: str = "ranknet",
+    margin: float = 1.0,
+    sample_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pairwise rank loss on (pred, actual) pairs.
+
+    A pair (i, j) contributes when actual[i] > actual[j]; the loss pushes
+    pred[i] above pred[j]. ``costs`` and ``cost_pred`` must be in a space
+    where "higher is better" (same ordering convention as the rest of the
+    training code — see ``cost_target`` docstring).
+
+    - ``method="ranknet"``: softplus(-(pred[i] - pred[j])) (logistic)
+    - ``method="hinge"``: relu(margin - (pred[i] - pred[j]))
+    """
+    if cost_mask.sum() < 2:
+        return cost_pred.new_tensor(0.0)
+    preds = cost_pred[cost_mask]
+    actuals = costs[cost_mask]
+
+    pred_diff = preds.unsqueeze(1) - preds.unsqueeze(0)  # [N, N]
+    actual_diff = actuals.unsqueeze(1) - actuals.unsqueeze(0)
+    pair_mask = actual_diff > 0
+    if not bool(pair_mask.any()):
+        return cost_pred.new_tensor(0.0)
+
+    method_lower = method.lower()
+    if method_lower == "ranknet":
+        pair_losses = F.softplus(-pred_diff)
+    elif method_lower == "hinge":
+        pair_losses = F.relu(float(margin) - pred_diff)
+    else:
+        raise ValueError(
+            f"Unknown cost_rank_method: {method!r} (expected 'ranknet' or 'hinge')"
+        )
+
+    pair_weights = pair_mask.to(pair_losses.dtype)
+    if sample_weights is not None:
+        sw = sample_weights[cost_mask].to(pair_losses.dtype)
+        pair_weights = pair_weights * sw.unsqueeze(1) * sw.unsqueeze(0)
+    denom = pair_weights.sum().clamp_min(1e-8)
+    return (pair_losses * pair_weights).sum() / denom
+
+
 def _weighted_token_mean(losses: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (losses * weights).sum() / weights.sum().clamp_min(1.0)
 

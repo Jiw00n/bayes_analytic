@@ -822,6 +822,15 @@ def _iter_walk_ridges(latent_cost_ridges, config):
         yield weighted, "w_ridge_", False
 
 
+def _cost_ranking_space_kwargs(bundle, config) -> Dict[str, object]:
+    mins = list(getattr(bundle, "task_min_costs", {}).values())
+    return {
+        "cost_target": str(getattr(config.data, "cost_target", "neg_log")),
+        "cost_target_regression": getattr(config.data, "cost_target_regression", None),
+        "task_min_cost": float(mins[0]) if mins else None,
+    }
+
+
 def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
     if not bool(getattr(config.train, "cost_ridge_vec", False)):
         return [], None, {}
@@ -840,10 +849,6 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
     _ridge_mins = list(bundle.task_min_costs.values())
     _ridge_task_min_cost = float(_ridge_mins[0]) if _ridge_mins else None
     _ridge_fit_target = _ridge_cost_target_regression or _ridge_cost_target
-    print(
-        f"[ridge] fit_target={_ridge_fit_target!r} output_target={_ridge_cost_target!r} "
-        f"task_min_cost={_ridge_task_min_cost!r}"
-    )
     latent_cost_ridges = fit_latent_cost_ridges(
         model,
         ridge_dataset,
@@ -890,7 +895,7 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
     return latent_cost_ridges, ridge_metrics
 
 
-def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, device, epoch, latent_cost_ridges):
+def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, device, epoch, latent_cost_ridges, train_cost_metrics=None):
     summary: Dict[str, float] = {}
     if not bundle.val_dataset.samples:
         return summary
@@ -919,36 +924,46 @@ def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, devic
         device,
         batch_size=config.eval.batch_size,
         latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
+        **_cost_ranking_space_kwargs(bundle, config),
     )
     summary.update({f"val_{k}": v for k, v in cost_metrics.items()})
 
+    tcm = train_cost_metrics or {}
     if "cost_head_actual_top1_pred_rank" in cost_metrics:
         print(
+            f"train_cost_head_r2 : {tcm.get('cost_head_r2', float('nan')):.4f}\n"
+            f"val_cost_head_r2 : {cost_metrics.get('cost_head_r2', float('nan')):.4f}\n"
             f"val_cost_head_actual_top1_pred_rank : {int(cost_metrics['cost_head_actual_top1_pred_rank'])}\n"
-            f"val_cost_head_pred_top1_actual_cost : {cost_metrics['cost_head_pred_top1_actual_cost']:.6f}\n"
-            f"val_cost_head_pred_top10_mean_actual_cost : {cost_metrics['cost_head_pred_top10_mean_actual_cost']:.6f}\n"
-            # f"val_cost_head_pred_top20_mean_actual_cost : {cost_metrics['cost_head_pred_top20_mean_actual_cost']:.6f}\n"
+            f"val_cost_head_pred_top1_actual_cost : {cost_metrics['cost_head_pred_top1_actual_cost']:.4f}\n"
+            f"val_cost_head_pred_top10_mean_actual_cost : {cost_metrics['cost_head_pred_top10_mean_actual_cost']:.4f}\n"
+            # f"val_cost_head_pred_top20_mean_actual_cost : {cost_metrics['cost_head_pred_top20_mean_actual_cost']:.4f}\n"
         )
     if "cost_vec_actual_top1_pred_rank" in cost_metrics:
         print(
+            f"train_cost_vec_r2 : {tcm.get('cost_vec_r2', float('nan')):.4f}\n"
+            f"val_cost_vec_r2 : {cost_metrics.get('cost_vec_r2', float('nan')):.4f}\n"
             f"val_cost_vec_actual_top1_pred_rank : {int(cost_metrics['cost_vec_actual_top1_pred_rank'])}\n"
-            f"val_cost_vec_pred_top1_actual_cost : {cost_metrics['cost_vec_pred_top1_actual_cost']:.6f}\n"
-            f"val_cost_vec_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_pred_top10_mean_actual_cost']:.6f}\n"
-            # f"val_cost_vec_pred_top20_mean_actual_cost : {cost_metrics['cost_vec_pred_top20_mean_actual_cost']:.6f}\n"
+            f"val_cost_vec_pred_top1_actual_cost : {cost_metrics['cost_vec_pred_top1_actual_cost']:.4f}\n"
+            f"val_cost_vec_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_pred_top10_mean_actual_cost']:.4f}\n"
+            # f"val_cost_vec_pred_top20_mean_actual_cost : {cost_metrics['cost_vec_pred_top20_mean_actual_cost']:.4f}\n"
         )
     if "cost_vec_weighted_actual_top1_pred_rank" in cost_metrics:
         print(
+            f"train_cost_vec_weighted_r2 : {tcm.get('cost_vec_weighted_r2', float('nan')):.4f}\n"
+            f"val_cost_vec_weighted_r2 : {cost_metrics.get('cost_vec_weighted_r2', float('nan')):.4f}\n"
             f"val_cost_vec_weighted_actual_top1_pred_rank : {int(cost_metrics['cost_vec_weighted_actual_top1_pred_rank'])}\n"
-            f"val_cost_vec_weighted_pred_top1_actual_cost : {cost_metrics['cost_vec_weighted_pred_top1_actual_cost']:.6f}\n"
-            f"val_cost_vec_weighted_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_weighted_pred_top10_mean_actual_cost']:.6f}\n"
+            f"val_cost_vec_weighted_pred_top1_actual_cost : {cost_metrics['cost_vec_weighted_pred_top1_actual_cost']:.4f}\n"
+            f"val_cost_vec_weighted_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_weighted_pred_top10_mean_actual_cost']:.4f}\n"
         )
     for key, value in sorted(cost_metrics.items()):
         if key.startswith("cost_vec_alpha_") and key.endswith("_actual_top1_pred_rank"):
             prefix = key[: -len("_actual_top1_pred_rank")]
+            r2_key = f"{prefix}_r2"
             top1_cost_key = f"{prefix}_pred_top1_actual_cost"
             top10_key = f"{prefix}_pred_top10_mean_actual_cost"
             top20_key = f"{prefix}_pred_top20_mean_actual_cost"
             print(
+                f"val_{r2_key} : {cost_metrics.get(r2_key, float('nan')):.6f}\n"
                 f"{'val_' + key} : {int(value)}\n"
                 f"{'val_' + top1_cost_key} : {cost_metrics[top1_cost_key]:.6f}\n"
                 f"{'val_' + top10_key} : {cost_metrics[top10_key]:.6f}\n"
@@ -982,6 +997,7 @@ def _evaluate_final_checkpoint(model, bundle, registry, tokenizer, config, devic
             device,
             batch_size=config.eval.batch_size,
             latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
+            **_cost_ranking_space_kwargs(bundle, config),
         )
         summary.update({f"eval_val_{k}": float(v) for k, v in val_cost_metrics.items()})
 
@@ -1018,6 +1034,7 @@ def _evaluate_final_checkpoint(model, bundle, registry, tokenizer, config, devic
             device,
             batch_size=config.eval.batch_size,
             latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
+            **_cost_ranking_space_kwargs(bundle, config),
         )
         summary.update({f"eval_test_{k}": float(v) for k, v in test_cost_metrics.items()})
 
@@ -1309,6 +1326,7 @@ def train_main(config) -> Dict[str, float]:
             device,
             batch_size=config.eval.batch_size,
             latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
+            **_cost_ranking_space_kwargs(bundle, config),
         )
         summary.update({f"train_{k}": float(v) for k, v in train_cost_metrics.items()})
 
@@ -1322,6 +1340,7 @@ def train_main(config) -> Dict[str, float]:
                 device,
                 epoch,
                 latent_cost_ridges,
+                train_cost_metrics=train_cost_metrics,
             )
         )
 

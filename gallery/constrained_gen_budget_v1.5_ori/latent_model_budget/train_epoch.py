@@ -71,6 +71,7 @@ from .train_losses import (
     latent_use_margin_loss,
     masked_cross_entropy,
     ordered_infonce_loss,
+    pairwise_rank_loss,
     soft_infonce_loss,
     weighted_cost_loss,
 )
@@ -97,6 +98,7 @@ def train_one_epoch(
     total_recon = 0.0
     total_kl = 0.0
     total_cost = 0.0
+    total_cost_rank = 0.0
     total_nce = 0.0
     total_latent_use = 0.0
     total_latent_use_rank = 0.0
@@ -201,6 +203,18 @@ def train_one_epoch(
             else:
                 cost_regression_targets = batch["costs"]
             cost_loss = weighted_cost_loss(out.cost_pred, cost_regression_targets, batch["cost_mask"], sample_weights=cost_sw)
+            lambda_cost_rank = float(getattr(cfg.train, "lambda_cost_rank", 0.0))
+            if lambda_cost_rank > 0.0:
+                cost_rank_loss = pairwise_rank_loss(
+                    out.cost_pred,
+                    cost_regression_targets,
+                    batch["cost_mask"],
+                    method=str(getattr(cfg.train, "cost_rank_method", "ranknet")),
+                    margin=float(getattr(cfg.train, "cost_rank_margin", 1.0)),
+                    sample_weights=cost_sw,
+                )
+            else:
+                cost_rank_loss = out.cost_pred.new_tensor(0.0)
             latent_use_loss, latent_use_rank_loss, latent_use_top1_drop_loss = latent_use_margin_loss(
                 model,
                 out.logits,
@@ -236,6 +250,7 @@ def train_one_epoch(
                 float(getattr(cfg.train, "lambda_recon", 1.0)) * recon_loss
                 + beta * kl_loss
                 + float(cfg.train.lambda_cost) * cost_loss
+                + lambda_cost_rank * cost_rank_loss
                 + float(cfg.train.lambda_nce) * nce_loss
                 + float(getattr(cfg.train, "lambda_latent_use", 0.0)) * latent_use_loss
             )
@@ -263,6 +278,7 @@ def train_one_epoch(
         total_recon += float(recon_loss.item())
         total_kl += float(kl_loss.item())
         total_cost += float(cost_loss.item())
+        total_cost_rank += float(cost_rank_loss.item())
         total_nce += float(nce_loss.item())
         total_latent_use += float(latent_use_loss.item())
         total_latent_use_rank += float(latent_use_rank_loss.item())
@@ -279,6 +295,7 @@ def train_one_epoch(
         "recon_loss": total_recon / denom,
         "kl_loss": total_kl / denom,
         "cost_loss": total_cost / denom,
+        "cost_rank_loss": total_cost_rank / denom,
         "nce_loss": total_nce / denom,
         "latent_use_loss": total_latent_use / denom,
         "latent_use_rank_loss": total_latent_use_rank / denom,

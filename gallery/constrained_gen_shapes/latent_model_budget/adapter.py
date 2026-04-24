@@ -203,7 +203,88 @@ def _extract_search_task_signature(task) -> Tuple[Optional[str], Optional[str], 
     return workload_key, target_kind, target_model, task_desc
 
 
-def _transform_cost_for_training(cost: Optional[float]) -> Optional[float]:
+def cost_raw_to_label(
+    raw: Optional[float],
+    cost_target: str,
+    task_min_cost: Optional[float] = None,
+) -> Optional[float]:
+    """Raw seconds → training-label value.
+
+    - ``neg_log``: ``-log(raw)``.
+    - ``norm_throughput``: ``task_min_cost / raw`` (Ansor XGB label).
+    - ``log_norm_throughput``: ``log(task_min_cost / raw)``.
+    """
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0.0:
+        return None
+    if cost_target == "neg_log":
+        return float(-math.log(v))
+    if cost_target in ("norm_throughput", "log_norm_throughput"):
+        if task_min_cost is None:
+            return None
+        m = float(task_min_cost)
+        if not math.isfinite(m) or m <= 0.0:
+            return None
+        ratio = m / v
+        if cost_target == "norm_throughput":
+            return float(ratio)
+        return float(math.log(ratio))
+    raise ValueError(f"Unknown cost_target: {cost_target!r}")
+
+
+def cost_label_to_raw(
+    label: Optional[float],
+    cost_target: str,
+    task_min_cost: Optional[float] = None,
+) -> Optional[float]:
+    """Inverse of :func:`cost_raw_to_label`."""
+    if label is None:
+        return None
+    try:
+        v = float(label)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    if cost_target == "neg_log":
+        try:
+            return float(math.exp(-v))
+        except OverflowError:
+            return None
+    if cost_target in ("norm_throughput", "log_norm_throughput"):
+        if task_min_cost is None:
+            return None
+        m = float(task_min_cost)
+        if not math.isfinite(m) or m <= 0.0:
+            return None
+        if cost_target == "norm_throughput":
+            if v <= 0.0:
+                return None
+            return float(m / v)
+        # log_norm_throughput: raw = m * exp(-label)
+        try:
+            return float(m * math.exp(-v))
+        except OverflowError:
+            return None
+    raise ValueError(f"Unknown cost_target: {cost_target!r}")
+
+
+def _transform_cost_for_training(
+    cost: Optional[float],
+    cost_target: str = "neg_log",
+) -> Optional[float]:
+    """Validate ``cost`` and apply the training-label transform.
+
+    For ``norm_throughput`` the raw (positive, finite) cost is returned
+    unchanged; Ansor-style ``min_cost_of_task / raw_cost`` normalization is
+    applied later by :func:`apply_norm_throughput` once all records for a
+    task are available.
+    """
     if cost is None:
         return None
     try:
@@ -216,10 +297,18 @@ def _transform_cost_for_training(cost: Optional[float]) -> Optional[float]:
         return None
     if value <= 0.0:
         return None
-    return float(-math.log(value))
+    if cost_target == "neg_log":
+        return float(-math.log(value))
+    if cost_target in ("norm_throughput", "log_norm_throughput"):
+        # Return raw cost unchanged; the throughput / log-throughput
+        # normalization is applied later once per-task ``min_cost`` is known.
+        return float(value)
+    raise ValueError(f"Unknown cost_target: {cost_target!r}")
 
 
-def _extract_measure_cost(result) -> Optional[float]:
+def _extract_measure_cost(
+    result, cost_target: str = "neg_log"
+) -> Optional[float]:
     try:
         error_no = int(result.error_no)
     except (TypeError, ValueError):
@@ -232,10 +321,15 @@ def _extract_measure_cost(result) -> Optional[float]:
     if not costs:
         return None
     mean_cost = float(sum(costs) / len(costs))
-    return _transform_cost_for_training(mean_cost)
+    return _transform_cost_for_training(mean_cost, cost_target=cost_target)
 
 
-def _load_custom_json_sample(path: Path, payload: dict, record_index: Optional[int] = None) -> JsonSampleRecord:
+def _load_custom_json_sample(
+    path: Path,
+    payload: dict,
+    record_index: Optional[int] = None,
+    cost_target: str = "neg_log",
+) -> JsonSampleRecord:
     task_index, workload_key, target_kind, target_model, task_desc = _extract_task_signature(payload)
     sketch_index = _maybe_int((payload.get("meta", {}) or {}).get("sketch_index"))
     if sketch_index is None:
@@ -244,7 +338,7 @@ def _load_custom_json_sample(path: Path, payload: dict, record_index: Optional[i
     cost = payload.get("cost")
     if cost is None:
         cost = payload.get("cost_target")
-    cost = _transform_cost_for_training(cost)
+    cost = _transform_cost_for_training(cost, cost_target=cost_target)
 
     params = _extract_param_dict(payload)
 
@@ -273,7 +367,12 @@ def _load_custom_json_sample(path: Path, payload: dict, record_index: Optional[i
     )
 
 
-def _load_measure_record_sample(path: Path, line: str, record_index: int) -> JsonSampleRecord:
+def _load_measure_record_sample(
+    path: Path,
+    line: str,
+    record_index: int,
+    cost_target: str = "neg_log",
+) -> JsonSampleRecord:
     from tvm.auto_scheduler.measure_record import load_record_from_string
 
     payload = json.loads(line)
@@ -293,7 +392,7 @@ def _load_measure_record_sample(path: Path, line: str, record_index: int) -> Jso
         json_path=str(path),
         sketch_index=0,
         params=params,
-        cost=_extract_measure_cost(res),
+        cost=_extract_measure_cost(res, cost_target=cost_target),
         raw=payload,
         workload_key=workload_key,
         target_kind=target_kind,
@@ -306,15 +405,21 @@ def _load_measure_record_sample(path: Path, line: str, record_index: int) -> Jso
     )
 
 
-def load_json_sample(path: str | Path) -> JsonSampleRecord:
+def load_json_sample(
+    path: str | Path,
+    cost_target: str = "neg_log",
+) -> JsonSampleRecord:
     path = Path(path)
-    samples = load_json_samples(path)
+    samples = load_json_samples(path, cost_target=cost_target)
     if not samples:
         raise ValueError(f"No samples found in {path}")
     return samples[0]
 
 
-def load_json_samples(path: str | Path) -> List[JsonSampleRecord]:
+def load_json_samples(
+    path: str | Path,
+    cost_target: str = "neg_log",
+) -> List[JsonSampleRecord]:
     path = Path(path)
     text = path.read_text(encoding="utf-8")
 
@@ -325,8 +430,8 @@ def load_json_samples(path: str | Path) -> List[JsonSampleRecord]:
 
     if isinstance(payload, dict):
         if "i" in payload and "r" in payload:
-            return [_load_measure_record_sample(path, text.strip(), 0)]
-        return [_load_custom_json_sample(path, payload)]
+            return [_load_measure_record_sample(path, text.strip(), 0, cost_target=cost_target)]
+        return [_load_custom_json_sample(path, payload, cost_target=cost_target)]
 
     samples: List[JsonSampleRecord] = []
     for record_index, line in enumerate(text.splitlines()):
@@ -335,11 +440,42 @@ def load_json_samples(path: str | Path) -> List[JsonSampleRecord]:
             continue
         payload = json.loads(line)
         if isinstance(payload, dict) and "i" in payload and "r" in payload:
-            samples.append(_load_measure_record_sample(path, line, record_index))
+            samples.append(
+                _load_measure_record_sample(path, line, record_index, cost_target=cost_target)
+            )
         else:
-            samples.append(_load_custom_json_sample(path, payload, record_index=record_index))
+            samples.append(
+                _load_custom_json_sample(
+                    path, payload, record_index=record_index, cost_target=cost_target
+                )
+            )
 
     return samples
+
+
+def compute_task_min_costs(
+    records: Sequence[JsonSampleRecord],
+) -> Dict[Tuple[Optional[str], Optional[str]], float]:
+    """Scan records whose ``cost`` is raw seconds and return
+    ``{(workload_key, target_kind): min_raw_cost}`` over finite positive costs.
+    Records with missing/invalid cost are cleared to ``None`` in-place."""
+    groups: Dict[Tuple[Optional[str], Optional[str]], float] = {}
+    for record in records:
+        if record.cost is None:
+            continue
+        try:
+            v = float(record.cost)
+        except (TypeError, ValueError):
+            record.cost = None
+            continue
+        if not math.isfinite(v) or v <= 0.0:
+            record.cost = None
+            continue
+        key = (record.workload_key, record.target_kind)
+        prev = groups.get(key)
+        if prev is None or v < prev:
+            groups[key] = v
+    return groups
 
 
 # -----------------------------------------------------------------------------

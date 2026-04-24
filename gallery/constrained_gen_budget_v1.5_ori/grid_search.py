@@ -37,7 +37,7 @@ SEARCH_SPACE = {
     "data.seed": [42,0,1],
     # "model.seed": [0],
 
-    "train.beta_end": [0.003],
+    "train.beta_end": [0.003, 0.005],
     "train.beta_warmup_epochs": [10],
     "train.order_nce": [True],
     "train.nce_mu": [False],
@@ -57,7 +57,7 @@ SEARCH_SPACE = {
 
     "train.num_epochs": [100],
     "train.learning_rate": [5e-4],
-    "train.lambda_nce": [0.2],
+    "train.lambda_nce": [0.2, 0.1],
     "train.tau_nce": [0.2],
     "train.latent_walk_top_k": [2],
 
@@ -66,7 +66,8 @@ SEARCH_SPACE = {
     # "train.weight_quantile": [0.85],         # cobo, weighted_cost_Vec
     # "train.weight_sigma": [0.5],        # cobo, weighted_cost_Vec
 
-    "train.lambda_cost": [0.01],
+    "train.lambda_cost": [0.001, 0.005, 0.01],
+    "train.lambda_cost_rank": [0.01, 0.1],
 
     "sampling.strategy": ["sampling"],
     "sampling.top_k": [2],
@@ -187,8 +188,8 @@ def main():
     for idx, params in enumerate(combos, start=1):
         # if idx <= 1: 
         #     continue
-        # if idx not in [1,2,9,10,17,18]: 
-        #     continue
+        if idx in [2, 3]: 
+            continue
         print(f"\n===== [{idx}/{len(combos)}] {params} =====")
         run_one(idx, deepcopy(params))
 

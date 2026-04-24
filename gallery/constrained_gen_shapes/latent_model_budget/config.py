@@ -25,6 +25,11 @@ class DataConfig:
     filter_invalid_records: bool = False
     budget: bool = False
     pad_vocab_to: Optional[int] = None
+    cost_target: str = "norm_throughput"   # "neg_log" | "norm_throughput" | "log_norm_throughput"
+    # Override used ONLY for the cost regression loss (weighted_cost_loss).
+    # None → fall back to ``cost_target``. Other consumers (NCE ordering,
+    # walk record sorting, measurement lookup, etc.) keep using ``cost_target``.
+    cost_target_regression: Optional[str] = None
 
 
 @dataclass
@@ -65,6 +70,9 @@ class TrainConfig:
     order_nce_pos_weight_sigma: float = 0.2
     nce_mu: bool = False
     
+    latent_walk_sort_by: str = "re_pred"   # "re_pred" | "measured"
+    latent_walk_show_neg_log: bool = False   # extra "-log=" column in walk output
+
     latent_walk_top_k: int = 1
     latent_walk_num_steps: int = 30
     latent_walk_step_size: float = 0.25

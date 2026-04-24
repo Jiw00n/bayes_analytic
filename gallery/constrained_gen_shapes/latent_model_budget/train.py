@@ -13,10 +13,17 @@ try:
 except Exception:  # pragma: no cover
     wandb = None
 
+import copy
 import dataclasses
 import math
 
-from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples
+from .adapter import (
+    GeneratorRegistry,
+    JsonSampleRecord,
+    cost_label_to_raw,
+    cost_raw_to_label,
+    load_json_samples,
+)
 from .dataset import (
     DatasetBundle,
     LatentParamDataset,
@@ -365,6 +372,10 @@ def _run_periodic_latent_walk(
     walk_key_prefix: str = "",
     measurement_cache: Optional[dict] = None,
     sampling_options: Optional[SamplingOptions] = None,
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
+    sort_by: str = "re_pred",
+    show_neg_log: bool = False,
 ) -> Dict[str, float]:
     here = Path(__file__).resolve().parent.parent
     if str(here) not in sys.path:
@@ -431,6 +442,10 @@ def _run_periodic_latent_walk(
                     keep_bundle=True,
                     measurement_cache=measurement_cache,
                     sampling_options=sampling_options,
+                    cost_target=cost_target,
+                    task_min_cost=task_min_cost,
+                    sort_by=sort_by,
+                    show_neg_log=show_neg_log,
                 ) or []
             except Exception as err:  # pragma: no cover
                 print(f"[train] latent walk rank={rank} failed: {type(err).__name__}: {err}")
@@ -628,35 +643,52 @@ def _build_wandb_run_name(config, bundle: DatasetBundle | None = None) -> str:
 def _seed_measurement_cache_from_buffer(
     walk_buffer: Optional[WalkSampleBuffer],
     disk_cache: Optional[dict] = None,
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
 ) -> dict:
     """Pre-populate the measurement cache with prior measurements so that
     sym_maps already measured in earlier epochs skip re-measurement.
 
     If ``disk_cache`` is provided, its entries are merged in first (walk-buffer
-    entries from the current run take precedence on conflict)."""
+    entries from the current run take precedence on conflict).
+
+    ``sample.cost`` lives in ``cost_target`` label space; we also back-compute
+    the raw-seconds value and stash it in ``costs=[raw]`` so display paths
+    (log_grouped_candidate_result) can show ``measured=`` for buffer-hit
+    entries."""
     cache: dict = {}
     if disk_cache:
         for sym_key, entry in disk_cache.items():
-            cache[sym_key] = dict(entry)
+            cache[sym_key] = copy.deepcopy(entry)
     if walk_buffer is None:
         return cache
     for sym_key, sample in walk_buffer.items():
         cost = getattr(sample, "cost", None)
         if cost is None or not math.isfinite(float(cost)):
             continue
-        cache[sym_key] = {
+        entry = {
             "ok": True,
             "usable_measurement": True,
             "mean_cost": float(cost),
             "from_walk_buffer": True,
         }
+        raw = cost_label_to_raw(cost, cost_target, task_min_cost=task_min_cost)
+        if raw is not None and math.isfinite(raw):
+            entry["costs"] = [float(raw)]
+        cache[sym_key] = entry
     return cache
 
 
-def _load_measurement_lookup(path: Path) -> dict:
+def _load_measurement_lookup(
+    path: Path,
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
+) -> dict:
     """Load the persisted sym_map→cost table into a measurement_cache-compatible
-    dict. Each JSONL line stores ``{"sym_map": {name: int, ...}, "cost": float}``.
-    Missing files return an empty dict."""
+    dict. Each JSONL line stores ``{"sym_map": {name: int, ...}, "cost": float}``
+    where ``cost`` is the raw (seconds) mean cost; it is converted to the
+    in-memory ``mean_cost`` (``cost_target``-space) on load via
+    :func:`cost_raw_to_label`. Missing files return an empty dict."""
     cache: dict = {}
     if not path.exists():
         return cache
@@ -671,32 +703,41 @@ def _load_measurement_lookup(path: Path) -> dict:
                 continue
             sym_map = entry.get("sym_map") or {}
             cost = entry.get("cost")
-            if cost is None:
-                continue
-            try:
-                cost_f = float(cost)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(cost_f):
+            mean_cost = cost_raw_to_label(
+                cost, cost_target, task_min_cost=task_min_cost
+            )
+            if mean_cost is None:
                 continue
             try:
                 normalized = {str(k): int(v) for k, v in sym_map.items()}
             except (TypeError, ValueError):
                 continue
             sym_key = make_sym_map_key(normalized)
+            # Stash the raw (seconds) cost in ``costs`` too so display paths
+            # (e.g. log_grouped_candidate_result) can report raw-seconds
+            # ``measured=`` values for lookup-hit cache entries just like for
+            # freshly-measured ones.
             cache[sym_key] = {
                 "ok": True,
                 "usable_measurement": True,
-                "mean_cost": cost_f,
+                "mean_cost": mean_cost,
+                "costs": [float(cost)],
                 "from_lookup": True,
             }
     return cache
 
 
-def _save_measurement_lookup(path: Path, cache: dict) -> int:
+def _save_measurement_lookup(
+    path: Path,
+    cache: dict,
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
+) -> int:
     """Persist all usable measurements in ``cache`` to ``path`` (JSONL, one
-    ``{"sym_map": ..., "cost": ...}`` per line). Returns the number of entries
-    written. Non-usable or non-finite entries are skipped."""
+    ``{"sym_map": ..., "cost": ...}`` per line). ``cost`` on disk is always
+    the raw (seconds) mean cost, inverted from the in-memory ``mean_cost``
+    (``cost_target``-space) via :func:`cost_label_to_raw`. Returns the number
+    of entries written. Non-usable or non-finite entries are skipped."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     written = 0
@@ -704,19 +745,15 @@ def _save_measurement_lookup(path: Path, cache: dict) -> int:
         for sym_key, entry in cache.items():
             if not entry.get("ok") or not entry.get("usable_measurement"):
                 continue
-            cost = entry.get("mean_cost")
-            if cost is None:
-                continue
-            try:
-                cost_f = float(cost)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(cost_f):
+            raw_cost = cost_label_to_raw(
+                entry.get("mean_cost"), cost_target, task_min_cost=task_min_cost
+            )
+            if raw_cost is None:
                 continue
             sym_map = {str(name): int(value) for name, value in sym_key}
             f.write(
                 json.dumps(
-                    {"sym_map": sym_map, "cost": cost_f}, ensure_ascii=False
+                    {"sym_map": sym_map, "cost": raw_cost}, ensure_ascii=False
                 )
                 + "\n"
             )
@@ -744,12 +781,16 @@ def _merge_cache_into_lookup(persistent: dict, shared: dict) -> int:
             continue
         if not math.isfinite(cost_f):
             continue
-        persistent[sym_key] = {
+        new_entry = {
             "ok": True,
             "usable_measurement": True,
             "mean_cost": cost_f,
             "from_lookup": True,
         }
+        raw_costs = entry.get("costs")
+        if raw_costs:
+            new_entry["costs"] = list(raw_costs)
+        persistent[sym_key] = new_entry
         added += 1
     return added
 
@@ -790,6 +831,15 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
         ridge_dataset = bundle.train_dataset
 
     ridge_alphas = _resolve_ridge_alphas(config)
+    _ridge_cost_target = str(getattr(config.data, "cost_target", "neg_log"))
+    _ridge_cost_target_regression = getattr(config.data, "cost_target_regression", None)
+    _ridge_mins = list(bundle.task_min_costs.values())
+    _ridge_task_min_cost = float(_ridge_mins[0]) if _ridge_mins else None
+    _ridge_fit_target = _ridge_cost_target_regression or _ridge_cost_target
+    print(
+        f"[ridge] fit_target={_ridge_fit_target!r} output_target={_ridge_cost_target!r} "
+        f"task_min_cost={_ridge_task_min_cost!r}"
+    )
     latent_cost_ridges = fit_latent_cost_ridges(
         model,
         ridge_dataset,
@@ -797,6 +847,9 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
         device,
         alphas=ridge_alphas,
         batch_size=config.eval.batch_size,
+        cost_target=_ridge_cost_target,
+        cost_target_regression=_ridge_cost_target_regression,
+        task_min_cost=_ridge_task_min_cost,
     )
     ridge_metrics = {}
     for ridge_payload in latent_cost_ridges:
@@ -816,6 +869,9 @@ def _fit_epoch_ridges(model, bundle, tokenizer, config, device):
             batch_size=config.eval.batch_size,
             sample_weight_quantile=float(getattr(config.train, "weight_quantile", 0.85)),
             sample_weight_sigma=float(getattr(config.train, "weight_sigma", 0.25)),
+            cost_target=_ridge_cost_target,
+            cost_target_regression=_ridge_cost_target_regression,
+            task_min_cost=_ridge_task_min_cost,
         )
         for ridge_payload in weighted_ridges:
             alpha = float(ridge_payload["alpha"])
@@ -1172,12 +1228,20 @@ def train_main(config) -> Dict[str, float]:
         latent_walk_on_final = False
 
     measurement_lookup_task_index = _resolve_run_task_index(bundle)
+    # A bundle is built from a single task's json_paths so ``task_min_costs``
+    # has exactly one entry. Walk measurements, on-disk raw costs, and the
+    # cost-regression target transform all route through this scalar so every
+    # pathway shares the same label space.
+    _mins = list(bundle.task_min_costs.values())
+    _lookup_task_min_cost: Optional[float] = float(_mins[0]) if _mins else None
     measurement_lookup_path = (
         Path(checkpoint_dir)
         / f"{measurement_lookup_task_index}_measurement_lookup.jsonl"
     )
     persistent_measurement_cache: dict = _load_measurement_lookup(
-        measurement_lookup_path
+        measurement_lookup_path,
+        cost_target=bundle.cost_target,
+        task_min_cost=_lookup_task_min_cost,
     )
     if persistent_measurement_cache:
         print(
@@ -1199,6 +1263,7 @@ def train_main(config) -> Dict[str, float]:
             config,
             device,
             epoch,
+            task_min_cost=_lookup_task_min_cost,
         )
         # print(f"[train] evaluating train split with offline teacher forcing after epoch {epoch}")
         train_eval_metrics = evaluate_teacher_forcing(
@@ -1310,6 +1375,8 @@ def train_main(config) -> Dict[str, float]:
             shared_measurement_cache: dict = _seed_measurement_cache_from_buffer(
                 walk_sample_buffer,
                 disk_cache=persistent_measurement_cache,
+                cost_target=bundle.cost_target,
+                task_min_cost=_lookup_task_min_cost,
             )
             reencode_predictor_name = str(
                 getattr(config.train, "re_encode_predictor", "cost_head")
@@ -1351,6 +1418,10 @@ def train_main(config) -> Dict[str, float]:
                     walk_key_prefix=walk_prefix,
                     measurement_cache=shared_measurement_cache,
                     sampling_options=latent_walk_sampling_options,
+                    cost_target=bundle.cost_target,
+                    task_min_cost=_lookup_task_min_cost,
+                    sort_by=str(getattr(config.train, "latent_walk_sort_by", "re_pred")),
+                    show_neg_log=bool(getattr(config.train, "latent_walk_show_neg_log", False)),
                 )
                 if sub_summary:
                     walk_summary.update(sub_summary)
@@ -1361,7 +1432,10 @@ def train_main(config) -> Dict[str, float]:
             )
             if added:
                 _save_measurement_lookup(
-                    measurement_lookup_path, persistent_measurement_cache
+                    measurement_lookup_path,
+                    persistent_measurement_cache,
+                    cost_target=bundle.cost_target,
+                    task_min_cost=_lookup_task_min_cost,
                 )
                 print(
                     f"[train] measurement lookup: +{added} new "
@@ -1512,6 +1586,8 @@ def train_main(config) -> Dict[str, float]:
         final_measurement_cache: dict = _seed_measurement_cache_from_buffer(
             walk_sample_buffer,
             disk_cache=persistent_measurement_cache,
+            cost_target=bundle.cost_target,
+            task_min_cost=_lookup_task_min_cost,
         )
         final_reencode_predictor_name = str(
             getattr(config.train, "re_encode_predictor", "cost_head")
@@ -1552,6 +1628,10 @@ def train_main(config) -> Dict[str, float]:
                 walk_key_prefix=walk_prefix,
                 measurement_cache=final_measurement_cache,
                 sampling_options=latent_walk_sampling_options,
+                cost_target=bundle.cost_target,
+                task_min_cost=_lookup_task_min_cost,
+                sort_by=str(getattr(config.train, "latent_walk_sort_by", "re_pred")),
+                show_neg_log=bool(getattr(config.train, "latent_walk_show_neg_log", False)),
             )
             if sub_summary:
                 final_walk_summary.update(sub_summary)
@@ -1560,7 +1640,10 @@ def train_main(config) -> Dict[str, float]:
         )
         if added:
             _save_measurement_lookup(
-                measurement_lookup_path, persistent_measurement_cache
+                measurement_lookup_path,
+                persistent_measurement_cache,
+                cost_target=bundle.cost_target,
+                task_min_cost=_lookup_task_min_cost,
             )
             print(
                 f"[train] measurement lookup: +{added} new "

@@ -359,6 +359,31 @@ def _alpha_metric_suffix(alpha: float) -> str:
     return text.replace("-", "m").replace("+", "").replace(".", "p")
 
 
+def _r2_from_pairs(
+    scored_items: Sequence[tuple[float, float, str]],
+    *,
+    actuals_override: Sequence[float] | None = None,
+) -> float:
+    if len(scored_items) < 2:
+        return float("nan")
+    preds = [item[0] for item in scored_items]
+    if actuals_override is not None:
+        if len(actuals_override) != len(scored_items):
+            return float("nan")
+        actuals = [float(a) for a in actuals_override]
+    else:
+        actuals = [item[1] for item in scored_items]
+    if not all(math.isfinite(p) and math.isfinite(a) for p, a in zip(preds, actuals)):
+        return float("nan")
+    mean_actual = sum(actuals) / len(actuals)
+    ss_tot = sum((a - mean_actual) ** 2 for a in actuals)
+    if ss_tot <= 0.0:
+        return float("nan")
+    ss_res = sum((a - p) ** 2 for p, a in zip(preds, actuals))
+    r2 = 1.0 - ss_res / ss_tot
+    return float(r2) if math.isfinite(r2) else float("nan")
+
+
 def _spearman_from_pairs(scored_items: Sequence[tuple[float, float, str]]) -> float:
     if len(scored_items) < 2:
         return float("nan")
@@ -526,8 +551,13 @@ def evaluate_cost_ranking(
     batch_size: int = 64,
     latent_cost_ridge: dict | None = None,
     latent_cost_ridges: Dict[str, dict] | None = None,
+    cost_target: str = "neg_log",
+    cost_target_regression: str | None = None,
+    task_min_cost: float | None = None,
 ) -> Dict[str, float]:
     model.eval()
+
+    fit_target = cost_target_regression or cost_target
 
     scored_by_source: Dict[str, List[tuple[float, float, str]]] = {"cost_head": []}
     vector_payloads: Dict[str, dict] = {}
@@ -578,6 +608,26 @@ def evaluate_cost_ranking(
             continue
         pred_sorted = sorted(scored_items, key=lambda item: item[0], reverse=True)
         actual_sorted = sorted(scored_items, key=lambda item: item[1], reverse=True)
+
+        if fit_target != cost_target:
+            from .train_epoch import _convert_cost_tensor_space
+            actual_tensor = torch.tensor(
+                [item[1] for item in scored_items], dtype=torch.float64
+            )
+            try:
+                converted = _convert_cost_tensor_space(
+                    actual_tensor, cost_target, fit_target, task_min_cost
+                )
+                actuals_for_r2 = converted.tolist()
+            except ValueError:
+                actuals_for_r2 = None
+            metrics[f"{source_name}_r2"] = (
+                _r2_from_pairs(scored_items, actuals_override=actuals_for_r2)
+                if actuals_for_r2 is not None
+                else float("nan")
+            )
+        else:
+            metrics[f"{source_name}_r2"] = _r2_from_pairs(scored_items)
 
         actual_top1_id = actual_sorted[0][2]
         actual_top1_pred_rank = 1

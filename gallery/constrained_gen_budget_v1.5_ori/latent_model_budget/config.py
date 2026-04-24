@@ -67,6 +67,9 @@ class TrainConfig:
     beta_warmup_epochs: int = 10
     lambda_recon: float = 1.0
     lambda_cost: float = 0.01
+    lambda_cost_rank: float = 0.0
+    cost_rank_method: str = "ranknet"   # "ranknet" | "hinge"
+    cost_rank_margin: float = 1.0
     lambda_nce: float = 0.2
     tau_nce: float = 0.2
     cost_ridge_vec: bool = True
@@ -83,7 +86,7 @@ class TrainConfig:
     latent_walk_every_n_epochs: int = 10
     latent_walk_predict_every_n_epochs: int = 10
     latent_walk_sort_by: str = "measured"   # "re_pred" | "measured"
-    latent_walk_show_neg_log: bool = False   # extra "-log=" column in walk output
+    latent_walk_show_neg_log: bool = True   # extra "-log=" column in walk output
 
     label_smoothing: float = 0.0
 

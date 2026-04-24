@@ -22,6 +22,8 @@ if __package__ in (None, ""):
         JsonSampleRecord,
         LegalPrefixOracle,
         _parse_shapes_from_workload_key,
+        cost_label_to_raw,
+        cost_raw_to_label,
         load_json_sample,
         load_json_samples,
     )
@@ -48,6 +50,8 @@ else:
         JsonSampleRecord,
         LegalPrefixOracle,
         _parse_shapes_from_workload_key,
+        cost_label_to_raw,
+        cost_raw_to_label,
         load_json_sample,
         load_json_samples,
     )
@@ -126,20 +130,28 @@ def measure_candidate(
     session: MeasurementSession,
     result: Any,
     meta: Dict[str, Any],
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """단일 MeasureResult를 요약 딕셔너리로 변환한다."""
+    """단일 MeasureResult를 요약 딕셔너리로 변환한다.
+
+    ``mean_cost`` 필드는 ``cost_target`` 공간의 라벨 값 (훈련 라벨과 같은
+    스케일). 원시 초단위 값은 ``costs`` 필드에 보존된다."""
     error_no = int(result.error_no)
     costs = [float(x) for x in result.costs]
-    mean_cost = float(sum(costs) / len(costs)) if costs else None
+    raw_mean_cost = float(sum(costs) / len(costs)) if costs else None
     usable_measurement = error_no == int(auto_scheduler.measure.MeasureErrorNo.NO_ERROR)
     error_msg = str(result.error_msg)
+    mean_cost_label = cost_raw_to_label(
+        raw_mean_cost, cost_target, task_min_cost=task_min_cost
+    )
     return {
         "ok": True,
         "usable_measurement": usable_measurement,
         "error_no": error_no,
         "error_msg": error_msg or None,
         "costs": costs,
-        "mean_cost": -math.log(mean_cost),
+        "mean_cost": mean_cost_label,
         "all_cost": float(result.all_cost),
         "timestamp": float(result.timestamp),
         "measure_record_path": session.output_path,
@@ -153,6 +165,8 @@ def measure_candidates_batch(
     task: Any,
     states: List[Any],
     metas: List[Dict[str, Any]],
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """여러 candidate를 한 번의 measurer.measure 호출로 측정한다."""
     if not states:
@@ -191,7 +205,13 @@ def measure_candidates_batch(
         ]
 
     return [
-        measure_candidate(result=result, meta=meta, session=session)
+        measure_candidate(
+            result=result,
+            meta=meta,
+            session=session,
+            cost_target=cost_target,
+            task_min_cost=task_min_cost,
+        )
         for result, meta in zip(results, metas)
     ]
 
@@ -250,29 +270,23 @@ def log_grouped_candidate_result(
     grouped_record: Dict[str, Any],
     *,
     reencode_label: str = "re_pred",
+    show_neg_log: bool = False,
 ) -> None:
     record = grouped_record["record"]
     alphas = grouped_record["alphas"]
-    pred_costs = grouped_record["pred_costs"]
 
     alpha_text = json.dumps(alphas, ensure_ascii=False)
-    pred_mean = (
-        float(sum(float(x) for x in pred_costs) / len(pred_costs))
-        if pred_costs
-        else None
-    )
-    pred_mean_text = "n/a" if pred_mean is None else f"{pred_mean:.6f}"
 
     if record.final_violations:
         print(
-            f"[latent-walk] alphas={alpha_text} pred_mean={pred_mean_text} status=violated "
+            f"[latent-walk] alphas={alpha_text} status=violated "
             f"violations={len(record.final_violations)}"
         )
         return
 
     if not record.state_build_ok:
         print(
-            f"[latent-walk] alphas={alpha_text} pred_mean={pred_mean_text} status=state_build_failed "
+            f"[latent-walk] alphas={alpha_text} status=state_build_failed "
             f"error={record.state_build_error}"
         )
         return
@@ -280,28 +294,38 @@ def log_grouped_candidate_result(
     measurement = record.measurement or {}
     if not measurement.get("ok"):
         print(
-            f"[latent-walk] alphas={alpha_text} pred_mean={pred_mean_text} status=measure_failed "
+            f"[latent-walk] alphas={alpha_text} status=measure_failed "
             f"error={measurement.get('error')}"
         )
         return
 
     if not measurement.get("usable_measurement"):
         print(
-            f"[latent-walk] alphas={alpha_text} pred_mean={pred_mean_text} status=measure_error "
+            f"[latent-walk] alphas={alpha_text} status=measure_error "
             f"error_no={measurement.get('error_no')} "
             f"error_msg={measurement.get('error_msg')}"
         )
         return
 
-    mean_cost = measurement.get("mean_cost")
-    mean_cost_text = "n/a" if mean_cost is None else f"{mean_cost:.4f}"
-    reencode_pred = record.reencode_cost_pred
-    reencode_text = "n/a" if reencode_pred is None else f"{reencode_pred:.6f}"
-    print(
-        f"mean_cost={mean_cost_text}, pred_mean={pred_mean_text}, "
-        f"{reencode_label}={reencode_text}, {alpha_text}"
-        # f"log={measurement.get('measure_record_path')}"
+    raw_costs = measurement.get("costs") or []
+    measured_raw = (
+        float(sum(float(c) for c in raw_costs) / len(raw_costs))
+        if raw_costs
+        else None
     )
+    measured_text = "n/a" if measured_raw is None else f"{measured_raw:.5g}"
+    reencode_pred = record.reencode_cost_pred
+    reencode_text = "n/a" if reencode_pred is None else f"{reencode_pred:.4f}"
+    parts = [f"measured={measured_text}"]
+    if show_neg_log:
+        if measured_raw is not None and measured_raw > 0.0:
+            neg_log_text = f"{-math.log(measured_raw):.4f}"
+        else:
+            neg_log_text = "n/a"
+        parts.append(f"-log={neg_log_text}")
+    parts.append(f"{reencode_label}={reencode_text}")
+    parts.append(alpha_text)
+    print(", ".join(parts))
 
 
 def _default_walk_output_path(
@@ -425,6 +449,13 @@ class LoadedBundle:
     recon_predictor: Optional[Any] = None  # GPReconPredictor; swaps in for cost_head in predict_recon_score
     reencode_predictor: Optional[Any] = None  # ReEncodePredictor; used by predict_reencode_score
     reencode_predictor_name: str = "cost_head"
+    # Space metadata for the cost ridge (``cost_weight``/``cost_bias``). The
+    # raw ``z @ weight + bias`` output is in ``ridge_fit_target`` space; it is
+    # converted to ``ridge_output_target`` (which callers assume = cost_target)
+    # by ``predict_score`` using ``ridge_task_min_cost`` when needed.
+    ridge_fit_target: str = "neg_log"
+    ridge_output_target: str = "neg_log"
+    ridge_task_min_cost: Optional[float] = None
 
 
 @dataclass
@@ -501,6 +532,9 @@ def load_bundle(
     cost_weight = None
     cost_bias = 0.0
     cost_source = "missing_cost_vector"
+    ridge_fit_target = "neg_log"
+    ridge_output_target = "neg_log"
+    ridge_task_min_cost: Optional[float] = None
     if latent_cost_ridge is not None and "weight" in latent_cost_ridge:
         cost_weight = latent_cost_ridge["weight"].detach().to(
             dtype=torch.float32,
@@ -508,6 +542,10 @@ def load_bundle(
         )
         cost_bias = float(latent_cost_ridge.get("bias", 0.0))
         cost_source = "latent_cost_ridge"
+        ridge_fit_target = str(latent_cost_ridge.get("target_name", "neg_log"))
+        ridge_output_target = str(latent_cost_ridge.get("cost_target", ridge_fit_target))
+        tmc = latent_cost_ridge.get("task_min_cost")
+        ridge_task_min_cost = float(tmc) if tmc is not None else None
     elif use_latent_gradient:
         cost_source = "cost_head_gradient"
 
@@ -529,6 +567,9 @@ def load_bundle(
         cost_bias=cost_bias,
         cost_source=cost_source,
         device=torch_device,
+        ridge_fit_target=ridge_fit_target,
+        ridge_output_target=ridge_output_target,
+        ridge_task_min_cost=ridge_task_min_cost,
     )
 
 
@@ -555,6 +596,9 @@ def make_bundle(
     cost_weight = None
     cost_bias = 0.0
     cost_source = "missing_cost_vector"
+    ridge_fit_target = "neg_log"
+    ridge_output_target = "neg_log"
+    ridge_task_min_cost: Optional[float] = None
     if latent_cost_ridge is not None and "weight" in latent_cost_ridge:
         cost_weight = latent_cost_ridge["weight"].detach().to(
             dtype=torch.float32,
@@ -562,6 +606,10 @@ def make_bundle(
         )
         cost_bias = float(latent_cost_ridge.get("bias", 0.0))
         cost_source = "latent_cost_ridge"
+        ridge_fit_target = str(latent_cost_ridge.get("target_name", "neg_log"))
+        ridge_output_target = str(latent_cost_ridge.get("cost_target", ridge_fit_target))
+        tmc = latent_cost_ridge.get("task_min_cost")
+        ridge_task_min_cost = float(tmc) if tmc is not None else None
     elif use_latent_gradient:
         cost_source = "cost_head_gradient"
 
@@ -581,6 +629,9 @@ def make_bundle(
         recon_predictor=recon_predictor,
         reencode_predictor=reencode_predictor,
         reencode_predictor_name=reencode_predictor_name,
+        ridge_fit_target=ridge_fit_target,
+        ridge_output_target=ridge_output_target,
+        ridge_task_min_cost=ridge_task_min_cost,
     )
 
 
@@ -836,6 +887,22 @@ def make_shifted_zs(
 
 
 
+def _convert_scalar_cost_space(
+    value: float,
+    src: str,
+    dst: str,
+    task_min_cost: Optional[float],
+) -> float:
+    """Raw seconds 경유해서 src → dst 공간으로 스칼라 cost 변환."""
+    if src == dst:
+        return float(value)
+    raw = cost_label_to_raw(value, src, task_min_cost=task_min_cost)
+    if raw is None:
+        return float("nan")
+    out = cost_raw_to_label(raw, dst, task_min_cost=task_min_cost)
+    return float("nan") if out is None else float(out)
+
+
 def predict_score(bundle: LoadedBundle, z: torch.Tensor) -> float:
     if bundle.cost_source == "cost_head_gradient":
         z = z.to(device=bundle.device, dtype=torch.float32).view(1, -1)
@@ -843,7 +910,13 @@ def predict_score(bundle: LoadedBundle, z: torch.Tensor) -> float:
     if bundle.cost_weight is None:
         raise RuntimeError("No stored cost vector in checkpoint. Re-run with --latent-gradient.")
     z = z.to(device=bundle.device, dtype=torch.float32)
-    return float((z @ bundle.cost_weight + bundle.cost_bias).item())
+    raw_pred = float((z @ bundle.cost_weight + bundle.cost_bias).item())
+    return _convert_scalar_cost_space(
+        raw_pred,
+        bundle.ridge_fit_target,
+        bundle.ridge_output_target,
+        bundle.ridge_task_min_cost,
+    )
 
 
 @dataclass
@@ -859,15 +932,24 @@ class CostHeadReEncodePredictor:
 
 @dataclass
 class RidgeReEncodePredictor:
-    """Linear predictor: z @ weight + bias."""
+    """Linear predictor: ``z @ weight + bias``. The raw output is in
+    ``fit_target`` space; ``predict`` returns a value in ``output_target``
+    space (defaults to ``fit_target`` if not set). ``task_min_cost`` is
+    required whenever a throughput variant appears in either field."""
 
     weight: torch.Tensor
     bias: float
     name: str = "cost_vec"
+    fit_target: str = "neg_log"
+    output_target: str = "neg_log"
+    task_min_cost: Optional[float] = None
 
     def predict(self, z: torch.Tensor) -> float:
         z = z.to(device=self.weight.device, dtype=torch.float32).view(-1)
-        return float((z @ self.weight + self.bias).item())
+        raw_pred = float((z @ self.weight + self.bias).item())
+        return _convert_scalar_cost_space(
+            raw_pred, self.fit_target, self.output_target, self.task_min_cost
+        )
 
 
 @torch.no_grad()
@@ -992,6 +1074,10 @@ def build_walk_records(
     keep_bundle: bool = False,
     measurement_cache: Optional[Dict[tuple, Any]] = None,
     sampling_options: Optional[SamplingOptions] = None,
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
+    sort_by: str = "re_pred",
+    show_neg_log: bool = False,
 ) -> tuple[List[WalkRecord], StartZContext]:
     options = sampling_options or SamplingOptions()
     decode_rng: Optional[torch.Generator] = None
@@ -1180,6 +1266,8 @@ def build_walk_records(
                 task=task_for_measure,
                 states=pending_measure_states,
                 metas=pending_measure_metas,
+                cost_target=cost_target,
+                task_min_cost=task_min_cost,
             )
             for sym_key, measurement in zip(pending_measure_keys, measured_results):
                 for result_index in pending_measure_indices_by_key[sym_key]:
@@ -1198,18 +1286,31 @@ def build_walk_records(
 
             print("[latent-walk] measurement results")
             grouped = _group_walk_records_by_sym_map(results)
-            grouped.sort(
-                key=lambda g: (
-                    g["record"].reencode_cost_pred
-                    if g["record"].reencode_cost_pred is not None
-                    else float("-inf")
-                ),
-                reverse=True,
-            )
+            if sort_by == "measured":
+                # Ascending raw seconds: fastest measured candidates first.
+                # Records without a usable measurement fall to the end.
+                def _measured_key(g):
+                    meas = (g["record"].measurement or {})
+                    raw_costs = meas.get("costs") or []
+                    if not raw_costs or not meas.get("usable_measurement"):
+                        return float("inf")
+                    return float(sum(float(c) for c in raw_costs) / len(raw_costs))
+                grouped.sort(key=_measured_key)
+            else:  # "re_pred"
+                grouped.sort(
+                    key=lambda g: (
+                        g["record"].reencode_cost_pred
+                        if g["record"].reencode_cost_pred is not None
+                        else float("-inf")
+                    ),
+                    reverse=True,
+                )
             reencode_label = f"re_pred[{bundle.reencode_predictor_name}]"
             for grouped_record in grouped:
                 log_grouped_candidate_result(
-                    grouped_record, reencode_label=reencode_label
+                    grouped_record,
+                    reencode_label=reencode_label,
+                    show_neg_log=show_neg_log,
                 )
             print("=" * 80)
         finally:
@@ -1349,6 +1450,10 @@ def run_latent_walk(
     keep_bundle: bool = False,
     measurement_cache: Optional[Dict[tuple, Any]] = None,
     sampling_options: Optional[SamplingOptions] = None,
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
+    sort_by: str = "re_pred",
+    show_neg_log: bool = False,
 ) -> List[WalkRecord]:
     walk_output_path, _ = _resolve_output_layout(
         checkpoint_path=checkpoint_path,
@@ -1384,6 +1489,10 @@ def run_latent_walk(
         keep_bundle=keep_bundle,
         measurement_cache=measurement_cache,
         sampling_options=sampling_options,
+        cost_target=cost_target,
+        task_min_cost=task_min_cost,
+        sort_by=sort_by,
+        show_neg_log=show_neg_log,
     )
     if walk_output_path is not None:
         save_walk_records(records, walk_output_path)

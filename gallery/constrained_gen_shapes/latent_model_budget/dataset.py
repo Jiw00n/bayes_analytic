@@ -11,7 +11,14 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .adapter import GeneratorRegistry, JsonSampleRecord, load_json_samples, split_records
+from .adapter import (
+    GeneratorRegistry,
+    JsonSampleRecord,
+    compute_task_min_costs,
+    cost_raw_to_label,
+    load_json_samples,
+    split_records,
+)
 from .shape_semantics import flatten_labels, semantic_labels_for_task
 from .tokenizer import ParamTokenizer
 
@@ -90,6 +97,17 @@ class DatasetBundle:
     train_records: List[JsonSampleRecord]
     val_records: List[JsonSampleRecord]
     test_records: List[JsonSampleRecord]
+    cost_target: str = "neg_log"
+    # Populated only when cost_target == "norm_throughput": maps
+    # (workload_key, target_kind) → the raw ``min_cost`` used for normalization.
+    task_min_costs: Dict[Tuple[Optional[str], Optional[str]], float] = field(
+        default_factory=dict
+    )
+
+    def task_min_cost_for(
+        self, workload_key: Optional[str], target_kind: Optional[str]
+    ) -> Optional[float]:
+        return self.task_min_costs.get((workload_key, target_kind))
 
 
 class LatentParamDataset(Dataset):
@@ -819,11 +837,33 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         raise ValueError("No json_paths were provided")
     print(f"[dataset] expanding {len(raw_paths)} json path(s)")
 
+    cost_target = getattr(config.data, "cost_target", "neg_log")
+    print(f"[dataset] cost_target={cost_target!r}")
+
+    # Load raw costs first (regardless of cost_target) so task_min_costs can
+    # always be computed; the cost_target transform is applied below. This
+    # keeps ``task_min_costs`` available even when ``cost_target='neg_log'``,
+    # which lets ``cost_target_regression`` pick a throughput variant.
     records: List[JsonSampleRecord] = []
     for path in raw_paths:
         print(f"[dataset] loading {path}")
-        records.extend(load_json_samples(path))
+        records.extend(load_json_samples(path, cost_target="norm_throughput"))
     print(f"[dataset] loaded {len(records)} record(s)")
+
+    task_min_costs = compute_task_min_costs(records)
+    if task_min_costs:
+        print(
+            f"[dataset] task_min_costs="
+            f"{ {k: float(f'{v:.6g}') for k, v in task_min_costs.items()} }"
+        )
+
+    for record in records:
+        if record.cost is None:
+            continue
+        key = (record.workload_key, record.target_kind)
+        record.cost = cost_raw_to_label(
+            record.cost, cost_target, task_min_cost=task_min_costs.get(key)
+        )
 
     _validate_record_group_consistency(records)
     shape_info_by_record, canonical_shape_labels, unique_shape_values = (
@@ -1217,6 +1257,8 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         train_records=list(train_records),
         val_records=list(val_records),
         test_records=list(test_records),
+        cost_target=cost_target,
+        task_min_costs=dict(task_min_costs),
     )
     if precompute_candidate_masks:
         _save_candidate_mask_cache_files(
