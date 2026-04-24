@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import copy
+import math
+
 import torch
 import torch.nn as nn
 
@@ -165,7 +167,19 @@ class LatentParamVAE(nn.Module):
         self.num_vars = num_vars
 
         d_model = cfg.d_model
+        # If vocab_align_to is set and larger than vocab_size, drain extra RNG
+        # after each vocab-dependent layer so the global torch RNG phase matches
+        # what a run with vocab=vocab_align_to would have. This lets A/B compare
+        # vocab sizes without confounding DataLoader shuffle / dropout RNG shift.
+        _align_to = getattr(cfg, "vocab_align_to", None)
+        _deficit = (int(_align_to) - int(vocab_size)) if _align_to is not None else 0
+        if _deficit < 0:
+            _deficit = 0
+
         self.token_emb = nn.Embedding(vocab_size, d_model)
+        if _deficit > 0:
+            # nn.Embedding uses init.normal_(mean=0, std=1).
+            torch.empty(_deficit, d_model).normal_()
         self.var_emb = nn.Embedding(num_vars, d_model)
         self.pos_emb = nn.Embedding(2048, d_model)
         self.dropout = nn.Dropout(cfg.dropout)
@@ -222,6 +236,13 @@ class LatentParamVAE(nn.Module):
         # self.cost_head = nn.Parameter(torch.randn(cfg.latent_dim))
 
         self.lm_head = nn.Linear(d_model, vocab_size)
+        if _deficit > 0:
+            # nn.Linear.reset_parameters: kaiming_uniform_(a=sqrt(5)) on weight
+            # with bound=1/sqrt(fan_in)=1/sqrt(d_model), and uniform_(-bound,bound)
+            # on bias (fan_in is still d_model for the bias calculation).
+            _bound = 1.0 / math.sqrt(d_model)
+            torch.empty(_deficit, d_model).uniform_(-_bound, _bound)
+            torch.empty(_deficit).uniform_(-_bound, _bound)
 
     def _positions(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
         return torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)

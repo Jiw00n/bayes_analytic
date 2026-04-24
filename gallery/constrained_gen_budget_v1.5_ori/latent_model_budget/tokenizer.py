@@ -54,6 +54,7 @@ class ParamTokenizer:
         train_ordered_values: Sequence[Sequence[int]],
         all_ordered_names: Sequence[Sequence[str]],
         domain_values_by_name: Mapping[str, Sequence[int]] | None = None,
+        pad_to_vocab_size: int | None = None,
     ) -> "ParamTokenizer":
         tokens: List[str] = [cls.PAD, cls.BOS, cls.UNK]
         token_seen = set(tokens)
@@ -72,6 +73,22 @@ class ParamTokenizer:
                     if token not in token_seen:
                         token_seen.add(token)
                         tokens.append(token)
+
+        # Optionally pad vocab with unreachable dummy tokens so the output
+        # softmax / embedding table can be kept at a target size independent
+        # of how many legal tokens were discovered. Dummies never match
+        # value_to_token output (neither int strings nor auto_unroll_max_step$*),
+        # so they can never be produced or masked-in.
+        if pad_to_vocab_size is not None and len(tokens) < int(pad_to_vocab_size):
+            target = int(pad_to_vocab_size)
+            idx = 0
+            while len(tokens) < target:
+                dummy = f"__DUMMY_{idx}"
+                idx += 1
+                if dummy in token_seen:
+                    continue
+                token_seen.add(dummy)
+                tokens.append(dummy)
 
         vars_: List[str] = ["<VAR_PAD>"]
         var_seen = set(vars_)

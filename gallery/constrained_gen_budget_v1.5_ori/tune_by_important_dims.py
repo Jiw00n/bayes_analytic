@@ -24,6 +24,8 @@ if __package__ in (None, ""):
             GeneratorRegistry,
             JsonSampleRecord,
             LegalPrefixOracle,
+            cost_label_to_raw,
+            cost_raw_to_label,
             load_json_sample,
             load_json_samples,
             split_records,
@@ -36,6 +38,8 @@ if __package__ in (None, ""):
             GeneratorRegistry,
             JsonSampleRecord,
             LegalPrefixOracle,
+            cost_label_to_raw,
+            cost_raw_to_label,
             load_json_sample,
             load_json_samples,
             split_records,
@@ -58,6 +62,8 @@ else:
             GeneratorRegistry,
             JsonSampleRecord,
             LegalPrefixOracle,
+            cost_label_to_raw,
+            cost_raw_to_label,
             load_json_sample,
             load_json_samples,
             split_records,
@@ -70,6 +76,8 @@ else:
             GeneratorRegistry,
             JsonSampleRecord,
             LegalPrefixOracle,
+            cost_label_to_raw,
+            cost_raw_to_label,
             load_json_sample,
             load_json_samples,
             split_records,
@@ -128,6 +136,9 @@ class LoadedBundle:
     cost_bias: float
     cost_source: str
     device: torch.device
+    ridge_fit_target: str = "neg_log"
+    ridge_output_target: str = "neg_log"
+    ridge_task_min_cost: Optional[float] = None
 
 
 @dataclass
@@ -401,10 +412,17 @@ def load_bundle(
     cost_weight = None
     cost_bias = 0.0
     cost_source = "cost_head"
+    ridge_fit_target = "neg_log"
+    ridge_output_target = "neg_log"
+    ridge_task_min_cost: Optional[float] = None
     if latent_cost_ridge is not None and "weight" in latent_cost_ridge:
         cost_weight = latent_cost_ridge["weight"].detach().to(dtype=torch.float32, device=torch_device)
         cost_bias = float(latent_cost_ridge.get("bias", 0.0))
         cost_source = "latent_cost_ridge"
+        ridge_fit_target = str(latent_cost_ridge.get("target_name", "neg_log"))
+        ridge_output_target = str(latent_cost_ridge.get("cost_target", ridge_fit_target))
+        tmc = latent_cost_ridge.get("task_min_cost")
+        ridge_task_min_cost = float(tmc) if tmc is not None else None
 
     if network_info_folder is None:
         network_info_folder = payload["config"]["data"]["network_info_folder"]
@@ -419,6 +437,9 @@ def load_bundle(
         cost_bias=cost_bias,
         cost_source=cost_source,
         device=torch_device,
+        ridge_fit_target=ridge_fit_target,
+        ridge_output_target=ridge_output_target,
+        ridge_task_min_cost=ridge_task_min_cost,
     )
 
 
@@ -605,7 +626,16 @@ def greedy_decode_from_z(
 def predict_score(bundle: LoadedBundle, z: torch.Tensor) -> float:
     if bundle.cost_weight is not None:
         z = z.to(device=bundle.device, dtype=torch.float32)
-        return float((z @ bundle.cost_weight + bundle.cost_bias).item())
+        raw_pred = float((z @ bundle.cost_weight + bundle.cost_bias).item())
+        src = bundle.ridge_fit_target
+        dst = bundle.ridge_output_target
+        if src == dst:
+            return raw_pred
+        raw = cost_label_to_raw(raw_pred, src, task_min_cost=bundle.ridge_task_min_cost)
+        if raw is None:
+            return float("nan")
+        out = cost_raw_to_label(raw, dst, task_min_cost=bundle.ridge_task_min_cost)
+        return float("nan") if out is None else float(out)
     z = z.to(device=bundle.device, dtype=torch.float32).view(1, -1)
     return float(bundle.model.cost_head(z).squeeze(-1).item())
 

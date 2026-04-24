@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict
 
 import torch
@@ -11,9 +12,50 @@ try:
 except Exception:  # pragma: no cover
     tqdm = None
 
+from typing import Optional
+
 from .adapter import GeneratorRegistry
 from .model import LatentParamVAE
 from .tokenizer import ParamTokenizer
+
+
+def _convert_cost_tensor_space(
+    costs: torch.Tensor,
+    src: str,
+    dst: str,
+    task_min_cost: Optional[float],
+) -> torch.Tensor:
+    """Convert a cost-label tensor from ``src`` space to ``dst`` space by
+    routing through raw seconds. Throughput variants require ``task_min_cost``.
+    """
+    if src == dst:
+        return costs
+    eps = 1e-30
+    # label → raw
+    if src == "neg_log":
+        raw = torch.exp(-costs)
+    elif src == "norm_throughput":
+        if task_min_cost is None:
+            raise ValueError("task_min_cost required for norm_throughput")
+        raw = task_min_cost / costs.clamp_min(eps)
+    elif src == "log_norm_throughput":
+        if task_min_cost is None:
+            raise ValueError("task_min_cost required for log_norm_throughput")
+        raw = task_min_cost * torch.exp(-costs)
+    else:
+        raise ValueError(f"Unknown cost_target: {src!r}")
+    # raw → label
+    if dst == "neg_log":
+        return -torch.log(raw.clamp_min(eps))
+    if dst == "norm_throughput":
+        if task_min_cost is None:
+            raise ValueError("task_min_cost required for norm_throughput")
+        return task_min_cost / raw.clamp_min(eps)
+    if dst == "log_norm_throughput":
+        if task_min_cost is None:
+            raise ValueError("task_min_cost required for log_norm_throughput")
+        return math.log(task_min_cost) - torch.log(raw.clamp_min(eps))
+    raise ValueError(f"Unknown cost_target: {dst!r}")
 from .train_eval import (
     _batch_to_device,
     _build_early_param_position_weights,
@@ -44,7 +86,12 @@ def train_one_epoch(
     cfg,
     device: torch.device,
     epoch: int,
+    task_min_cost: Optional[float] = None,
 ) -> Dict[str, float]:
+    cost_target = str(getattr(cfg.data, "cost_target", "neg_log"))
+    cost_target_regression = (
+        getattr(cfg.data, "cost_target_regression", None) or cost_target
+    )
     model.train()
     total_loss = 0.0
     total_recon = 0.0
@@ -144,7 +191,16 @@ def train_one_epoch(
                 label_smoothing=float(getattr(cfg.train, "label_smoothing", 0.0)),
             )
             kl_loss = kl_divergence(out.mu, out.logvar, sample_weights=kld_sw)
-            cost_loss = weighted_cost_loss(out.cost_pred, batch["costs"], batch["cost_mask"], sample_weights=cost_sw)
+            if cost_target_regression != cost_target:
+                cost_regression_targets = _convert_cost_tensor_space(
+                    batch["costs"],
+                    cost_target,
+                    cost_target_regression,
+                    task_min_cost,
+                )
+            else:
+                cost_regression_targets = batch["costs"]
+            cost_loss = weighted_cost_loss(out.cost_pred, cost_regression_targets, batch["cost_mask"], sample_weights=cost_sw)
             latent_use_loss, latent_use_rank_loss, latent_use_top1_drop_loss = latent_use_margin_loss(
                 model,
                 out.logits,

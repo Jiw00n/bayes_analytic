@@ -84,7 +84,17 @@ def _build_reencode_predictor(
             return None
         weight = payload["weight"].detach().to(dtype=torch.float32, device=device)
         bias = float(payload.get("bias", 0.0))
-        return RidgeReEncodePredictor(weight=weight, bias=bias, name=name)
+        fit_target = str(payload.get("target_name", "neg_log"))
+        output_target = str(payload.get("cost_target", fit_target))
+        tmc = payload.get("task_min_cost")
+        return RidgeReEncodePredictor(
+            weight=weight,
+            bias=bias,
+            name=name,
+            fit_target=fit_target,
+            output_target=output_target,
+            task_min_cost=float(tmc) if tmc is not None else None,
+        )
     if name == "gp":
         return fit_gp_recon_predictor(
             model=model,
@@ -604,8 +614,20 @@ def fit_latent_cost_ridge(
     batch_size: int = 128,
     sample_weight_quantile: float | None = None,
     sample_weight_sigma: float | None = None,
+    cost_target: str = "neg_log",
+    cost_target_regression: str | None = None,
+    task_min_cost: float | None = None,
 ) -> dict | None:
     model.eval()
+
+    # Ridge is fit in ``cost_target_regression`` space (defaults to
+    # ``cost_target``). ``batch["costs"]`` is in ``cost_target`` space, so we
+    # convert it once per batch before fitting.
+    fit_target = cost_target_regression or cost_target
+    if fit_target != cost_target:
+        from .train_epoch import _convert_cost_tensor_space
+    else:
+        _convert_cost_tensor_space = None  # type: ignore[assignment]
 
     latent_batches: List[torch.Tensor] = []
     cost_batches: List[torch.Tensor] = []
@@ -626,7 +648,12 @@ def fit_latent_cost_ridge(
 
         valid_mask_device = valid_mask.to(device=device, non_blocking=device.type == "cuda")
         latent_batches.append(z[valid_mask_device].detach().cpu().to(dtype=torch.float64))
-        cost_batches.append(batch["costs"][valid_mask].detach().cpu().to(dtype=torch.float64))
+        costs_for_fit = batch["costs"][valid_mask]
+        if _convert_cost_tensor_space is not None:
+            costs_for_fit = _convert_cost_tensor_space(
+                costs_for_fit, cost_target, fit_target, task_min_cost
+            )
+        cost_batches.append(costs_for_fit.detach().cpu().to(dtype=torch.float64))
 
     if not latent_batches:
         return None
@@ -674,7 +701,14 @@ def fit_latent_cost_ridge(
         "num_samples": int(num_samples),
         "latent_dim": int(latent_dim),
         "feature_name": "deterministic_z",
-        "target_name": "neg_log_cost",
+        "target_name": fit_target,
+        # Output-space metadata: ``z @ weight + bias`` is in ``fit_target``
+        # space. Consumers of ridge predictions (predict_score,
+        # RidgeReEncodePredictor.score) convert back to ``cost_target`` space
+        # using ``task_min_cost`` so walk-side comparisons remain in
+        # ``cost_target`` space regardless of ``cost_target_regression``.
+        "cost_target": cost_target,
+        "task_min_cost": task_min_cost,
         "train_mse": float(torch.mean((pred - y) ** 2).item()),
         "weighted": bool(weighted),
     }
@@ -694,6 +728,9 @@ def fit_latent_cost_ridges(
     batch_size: int = 128,
     sample_weight_quantile: float | None = None,
     sample_weight_sigma: float | None = None,
+    cost_target: str = "neg_log",
+    cost_target_regression: str | None = None,
+    task_min_cost: float | None = None,
 ) -> List[dict]:
     fitted: List[dict] = []
     for alpha in alphas:
@@ -706,6 +743,9 @@ def fit_latent_cost_ridges(
             batch_size=batch_size,
             sample_weight_quantile=sample_weight_quantile,
             sample_weight_sigma=sample_weight_sigma,
+            cost_target=cost_target,
+            cost_target_regression=cost_target_regression,
+            task_min_cost=task_min_cost,
         )
         if payload is not None:
             fitted.append(payload)

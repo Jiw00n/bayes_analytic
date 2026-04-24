@@ -8,14 +8,14 @@ from typing import Any, Dict, List, Optional
 from glob import glob
 
 
-DEFAULT_JSON_PATHS = glob("/root/work/tvm-ansor/gallery/constrained_gen/data/measured_*/*.json")
+DEFAULT_JSON_PATHS = glob("/root/work/tvm-ansor/gallery/constrained_gen/data/measured_ansor*/*.json")
 DEFAULT_NETWORK_INFO_FOLDER = "/root/work/tvm-ansor/gallery/dataset/network_info_all"
 DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_budget_v1.5_ori/checkpoints_all"
 
 
 @dataclass
 class DataConfig:
-    task_index: Optional[int] = 415
+    task_index: Optional[int] = 1490
     json_paths: List[str] = field(default_factory=list)
     network_info_folder: str = DEFAULT_NETWORK_INFO_FOLDER
     train_ratio: float = 0.9
@@ -24,6 +24,12 @@ class DataConfig:
     seed: int = 42
     filter_invalid_records: bool = False
     budget: bool = False
+    pad_vocab_to: Optional[int] = None
+    cost_target: str = "norm_throughput"   # "neg_log" | "norm_throughput" | "log_norm_throughput"
+    # Override used ONLY for the cost regression loss (weighted_cost_loss).
+    # None → fall back to ``cost_target``. Other consumers (NCE ordering,
+    # walk record sorting, measurement lookup, etc.) keep using ``cost_target``.
+    cost_target_regression: Optional[str] = 'log_norm_throughput'
 
     def __post_init__(self):
         if not self.json_paths and self.task_index is not None:
@@ -46,6 +52,8 @@ class ModelConfig:
     latent_dim: int = 64
     latent_token_count: int = 4
     adaln: bool = True
+    seed: Optional[int] = 42
+    vocab_align_to: Optional[int] = None
 
 
 @dataclass
@@ -62,6 +70,7 @@ class TrainConfig:
     lambda_nce: float = 0.2
     tau_nce: float = 0.2
     cost_ridge_vec: bool = True
+    cost_ridge_include_val: bool = True
     ridge_alpha: float | List[float] = 0.1
     order_nce: bool = True
     order_nce_pos_weight_by_percentile: bool = False
@@ -73,6 +82,8 @@ class TrainConfig:
     latent_walk_step_size: float = 0.25
     latent_walk_every_n_epochs: int = 10
     latent_walk_predict_every_n_epochs: int = 10
+    latent_walk_sort_by: str = "measured"   # "re_pred" | "measured"
+    latent_walk_show_neg_log: bool = False   # extra "-log=" column in walk output
 
     label_smoothing: float = 0.0
 
@@ -100,13 +111,11 @@ class TrainConfig:
     cost_ridge_weighted: bool = False
     latent_walk_use_cost_head: bool = False
 
-    # Which predictor to use for the re-encode (encoder -> predictor) score
-    # displayed in measurement output. One of:
     # "cost_head" | "cost_vec" | "cost_vec_weighted" | "gp" | "lightgbm_ranker"
-    latent_walk_predict_use_gp: bool = False
+    re_encode_predictor: str = "cost_vec"
     latent_walk_predict_gp_top_k: int = 100
     latent_walk_predict_gp_random_n: int = 0
-    re_encode_predictor: str = "cost_vec"
+    latent_walk_predict_use_gp: bool = False
 
 
     # scheduler_milestones: List[int] = field(default_factory=lambda: [30, 50])

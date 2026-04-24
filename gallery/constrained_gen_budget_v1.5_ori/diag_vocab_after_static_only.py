@@ -17,9 +17,12 @@ def _run_once(label: str):
     cfg = build_config()
     cfg.train.precompute_candidate_masks = False
     cfg.data.task_index = 1490
+    cfg.data.pad_vocab_to = 48
     from latent_model_budget.config import resolve_task_paths
     resolve_task_paths(cfg)
-    print(f"[diag:{label}] task_index={cfg.data.task_index} json_paths={len(cfg.data.json_paths)}")
+    print(f"[diag:{label}] task_index={cfg.data.task_index} "
+          f"pad_vocab_to={cfg.data.pad_vocab_to} "
+          f"json_paths={len(cfg.data.json_paths)}")
     registry = GeneratorRegistry(
         cfg.data.network_info_folder,
         hw_param=getattr(cfg.generator, "hw_param", None),

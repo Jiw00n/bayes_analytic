@@ -23,13 +23,19 @@ else:
 
 
 SEARCH_SPACE = {
-    "wandb.project": ["v1.5_ori_sample"],
+    "wandb.project": ["v1.5_ori_min_throuput"],
     # "wandb.project": [None],
 
-    # "data.seed": [42],
-    "data.task_index": [302],
-    "generator.hw_param": [{}, {"max_vthread_extent": 15}],
-    "data.seed": [0,1,42],
+
+    # 해볼 것
+    # "model.vocab_align_to":  [None, None, 48  ],
+    
+    # "data.pad_vocab_to": [48],
+    "data.task_index": [1490],
+    # "generator.hw_param": [{}, {"max_vthread_extent": 15}],
+    # "generator.hw_param": [{"max_vthread_extent": 15}],
+    "data.seed": [42,0,1],
+    # "model.seed": [0],
 
     "train.beta_end": [0.003],
     "train.beta_warmup_epochs": [10],
@@ -51,9 +57,9 @@ SEARCH_SPACE = {
 
     "train.num_epochs": [100],
     "train.learning_rate": [5e-4],
-    "train.lambda_nce": [0.1, 0.2, 0.3],
+    "train.lambda_nce": [0.2],
     "train.tau_nce": [0.2],
-    "train.latent_walk_top_k": [3],
+    "train.latent_walk_top_k": [2],
 
     # "train.cobo_sample_weighting": [True],
     # "train.cobo_apply_to": [["cost", "nce"]],
@@ -63,12 +69,13 @@ SEARCH_SPACE = {
     "train.lambda_cost": [0.01],
 
     "sampling.strategy": ["sampling"],
-    "sampling.temperature": [0.8, 1.1],
-    "sampling.top_k": [2, 4],
-    # "sampling.top_p": [1.0],
-    "sampling.seed": [42],
+    "sampling.top_k": [2],
+    "sampling.temperature": [0.8],
+    # "sampling.seed": [0, 1, 2],
 
-    # "train.label_smoothing": [0],
+    # "sampling.top_p": [1.0],
+
+    # "train.label_smoothing": [0.02, 0.05, 0.1, 0.2],
     # "train.lambda_recon": [1.0],
 }
 
@@ -179,6 +186,8 @@ def main():
 
     for idx, params in enumerate(combos, start=1):
         # if idx <= 1: 
+        #     continue
+        # if idx not in [1,2,9,10,17,18]: 
         #     continue
         print(f"\n===== [{idx}/{len(combos)}] {params} =====")
         run_one(idx, deepcopy(params))
