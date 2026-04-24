@@ -205,12 +205,17 @@ def train_one_epoch(
             cost_loss = weighted_cost_loss(out.cost_pred, cost_regression_targets, batch["cost_mask"], sample_weights=cost_sw)
             lambda_cost_rank = float(getattr(cfg.train, "lambda_cost_rank", 0.0))
             if lambda_cost_rank > 0.0:
+                _rank_margin_min = getattr(cfg.train, "cost_rank_margin_min", None)
+                _rank_margin_max = getattr(cfg.train, "cost_rank_margin_max", None)
                 cost_rank_loss = pairwise_rank_loss(
                     out.cost_pred,
                     cost_regression_targets,
                     batch["cost_mask"],
                     method=str(getattr(cfg.train, "cost_rank_method", "ranknet")),
                     margin=float(getattr(cfg.train, "cost_rank_margin", 1.0)),
+                    margin_mode=str(getattr(cfg.train, "cost_rank_margin_mode", "fixed")),
+                    margin_min=None if _rank_margin_min is None else float(_rank_margin_min),
+                    margin_max=None if _rank_margin_max is None else float(_rank_margin_max),
                     sample_weights=cost_sw,
                 )
             else:

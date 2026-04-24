@@ -65,9 +65,11 @@ SEARCH_SPACE = {
     # "train.cobo_apply_to": [["cost", "nce"]],
     # "train.weight_quantile": [0.85],         # cobo, weighted_cost_Vec
     # "train.weight_sigma": [0.5],        # cobo, weighted_cost_Vec
+    "train.cost_rank_method": ["ranknet", "hinge"],
 
-    "train.lambda_cost": [0.001, 0.005, 0.01],
-    "train.lambda_cost_rank": [0.01, 0.1],
+    "train.lambda_cost": [0.0, 0.001],
+    "train.lambda_cost_rank": [0.05, 0.1],
+    "train.cost_rank_margin": [0.5, 1.0],
 
     "sampling.strategy": ["sampling"],
     "sampling.top_k": [2],
@@ -79,6 +81,20 @@ SEARCH_SPACE = {
     # "train.label_smoothing": [0.02, 0.05, 0.1, 0.2],
     # "train.lambda_recon": [1.0],
 }
+
+SKIP_OPTIONS: list[dict] = [
+    # Example: skip ranknet with these margin values (margin is a no-op for ranknet)
+    {
+        "train.cost_rank_method": ["ranknet"],
+        "train.cost_rank_margin": [1.0],
+    },
+    {
+        "train.cost_rank_method": ["ranknet"],
+        "train.lambda_cost_rank": [0.1],
+        "train.cost_rank_margin": [0.5, 1.0],
+    },
+]
+
 
 # BEST_METRIC = "val_full_sequence_exact_match"
 # BEST_MODE = "max"
@@ -180,16 +196,38 @@ def run_one(exp_idx: int, params: dict) -> None:
         print(f"[grid] run failed: {type(e).__name__}: {e}")
 
 
+
+
+
+def _combo_matches_skip(params: dict, skip: dict) -> bool:
+    for key, allowed in skip.items():
+        if key not in params:
+            return False
+        if params[key] not in allowed:
+            return False
+    return True
+
+
+def _should_skip(params: dict, skip_options: list[dict]) -> bool:
+    return any(_combo_matches_skip(params, s) for s in skip_options)
+
+
 def main():
     keys = list(SEARCH_SPACE.keys())
     values = [SEARCH_SPACE[k] for k in keys]
     combos = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    before = len(combos)
+    combos = [c for c in combos if not _should_skip(c, SKIP_OPTIONS)]
+    dropped = before - len(combos)
+    if dropped:
+        print(f"[grid] skipped {dropped} combos via SKIP_OPTIONS "
+              f"({before} → {len(combos)})")
 
     for idx, params in enumerate(combos, start=1):
         # if idx <= 1: 
         #     continue
-        if idx in [2, 3]: 
-            continue
+        # if idx in [2, 3, 4]: 
+        #     continue
         print(f"\n===== [{idx}/{len(combos)}] {params} =====")
         run_one(idx, deepcopy(params))
 

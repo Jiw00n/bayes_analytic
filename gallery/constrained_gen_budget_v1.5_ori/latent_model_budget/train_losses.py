@@ -124,6 +124,9 @@ def pairwise_rank_loss(
     cost_mask: torch.Tensor,
     method: str = "ranknet",
     margin: float = 1.0,
+    margin_mode: str = "fixed",
+    margin_min: float | None = None,
+    margin_max: float | None = None,
     sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pairwise rank loss on (pred, actual) pairs.
@@ -133,8 +136,18 @@ def pairwise_rank_loss(
     where "higher is better" (same ordering convention as the rest of the
     training code — see ``cost_target`` docstring).
 
-    - ``method="ranknet"``: softplus(-(pred[i] - pred[j])) (logistic)
-    - ``method="hinge"``: relu(margin - (pred[i] - pred[j]))
+    - ``method="ranknet"``: softplus(-(pred[i] - pred[j])) (logistic).
+      ``margin`` / ``margin_mode`` are ignored.
+    - ``method="hinge"``: relu(m_ij - (pred[i] - pred[j])), where
+      ``m_ij`` depends on ``margin_mode``:
+        * ``"fixed"``   → m_ij = margin (constant)
+        * ``"pair_gap"`` → m_ij = margin * (actual[i] - actual[j])  (the
+          required prediction gap scales with the true cost gap, so
+          pairs that are far apart in cost must also be far apart in
+          prediction)
+      In ``pair_gap`` mode the per-pair margin is optionally clamped to
+      ``[margin_min, margin_max]`` (each bound is ignored when None).
+      In ``fixed`` mode these clamps are ignored.
     """
     if cost_mask.sum() < 2:
         return cost_pred.new_tensor(0.0)
@@ -151,7 +164,24 @@ def pairwise_rank_loss(
     if method_lower == "ranknet":
         pair_losses = F.softplus(-pred_diff)
     elif method_lower == "hinge":
-        pair_losses = F.relu(float(margin) - pred_diff)
+        mode_lower = margin_mode.lower()
+        if mode_lower == "fixed":
+            effective_margin = float(margin)
+        elif mode_lower == "pair_gap":
+            # ``actual_diff`` on off-diagonal entries where pair_mask is
+            # False will be non-positive; pair_mask filters them out of
+            # the final sum, so their negative margins never contribute.
+            effective_margin = float(margin) * actual_diff
+            if margin_min is not None or margin_max is not None:
+                clamp_min = float(margin_min) if margin_min is not None else None
+                clamp_max = float(margin_max) if margin_max is not None else None
+                effective_margin = effective_margin.clamp(min=clamp_min, max=clamp_max)
+        else:
+            raise ValueError(
+                f"Unknown cost_rank_margin_mode: {margin_mode!r} "
+                "(expected 'fixed' or 'pair_gap')"
+            )
+        pair_losses = F.relu(effective_margin - pred_diff)
     else:
         raise ValueError(
             f"Unknown cost_rank_method: {method!r} (expected 'ranknet' or 'hinge')"

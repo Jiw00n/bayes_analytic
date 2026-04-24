@@ -69,7 +69,10 @@ class TrainConfig:
     lambda_cost: float = 0.01
     lambda_cost_rank: float = 0.0
     cost_rank_method: str = "ranknet"   # "ranknet" | "hinge"
+    cost_rank_margin_mode: str = "pair_gap"   # "fixed" | "pair_gap" (hinge only)
     cost_rank_margin: float = 1.0
+    cost_rank_margin_min: Optional[float] = 0.01   # pair_gap only; None → no lower clamp
+    cost_rank_margin_max: Optional[float] = 0.1   # pair_gap only; None → no upper clamp
     lambda_nce: float = 0.2
     tau_nce: float = 0.2
     cost_ridge_vec: bool = True
@@ -81,7 +84,7 @@ class TrainConfig:
     nce_mu: bool = False
     
     latent_walk_top_k: int = 1
-    latent_walk_num_steps: int = 30
+    latent_walk_num_steps: int = 40
     latent_walk_step_size: float = 0.25
     latent_walk_every_n_epochs: int = 10
     latent_walk_predict_every_n_epochs: int = 10

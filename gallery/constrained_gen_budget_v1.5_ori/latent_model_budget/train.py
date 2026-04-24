@@ -592,8 +592,12 @@ def _build_wandb_run_name(config, bundle: DatasetBundle | None = None) -> str:
 
     if config.train.lambda_recon != 1.0:
         name += f"_lamr{config.train.lambda_recon}"
-    if config.train.lambda_cost != 0.01:
+    if config.train.lambda_cost != 0.0:
         name += f"_lamc{config.train.lambda_cost}"
+    if config.train.cost_rank_method is not None and config.train.lambda_cost_rank != 0.0:
+        name += f"_{config.train.cost_rank_method}_lamcr{config.train.lambda_cost_rank}"
+        if config.train.cost_rank_method == "hinge":
+            name += f"_margin{config.train.cost_rank_margin}"
     if bool(config.train.order_nce):
         name += "_order"
     if bool(getattr(config.train, "nce_mu", False)):
@@ -929,10 +933,16 @@ def _evaluate_validation_epoch(model, bundle, registry, tokenizer, config, devic
     summary.update({f"val_{k}": v for k, v in cost_metrics.items()})
 
     tcm = train_cost_metrics or {}
+    _lambda_cost = float(getattr(config.train, "lambda_cost", 0.0))
     if "cost_head_actual_top1_pred_rank" in cost_metrics:
-        print(
+        _cost_head_r2_lines = (
             f"train_cost_head_r2 : {tcm.get('cost_head_r2', float('nan')):.4f}\n"
             f"val_cost_head_r2 : {cost_metrics.get('cost_head_r2', float('nan')):.4f}\n"
+            if _lambda_cost > 0.0
+            else ""
+        )
+        print(
+            f"{_cost_head_r2_lines}"
             f"val_cost_head_actual_top1_pred_rank : {int(cost_metrics['cost_head_actual_top1_pred_rank'])}\n"
             f"val_cost_head_pred_top1_actual_cost : {cost_metrics['cost_head_pred_top1_actual_cost']:.4f}\n"
             f"val_cost_head_pred_top10_mean_actual_cost : {cost_metrics['cost_head_pred_top10_mean_actual_cost']:.4f}\n"
@@ -1355,7 +1365,7 @@ def train_main(config) -> Dict[str, float]:
             if tr_all is None and va_all is None:
                 continue
             print(
-                f"[epoch {epoch}] {source.replace('cost_', '')} spearman "
+                f"{source.replace('cost_', '')} spearman "
                 f"train={_fmt(tr_all)} (top5%={_fmt(tr_top)}) "
                 f"val={_fmt(va_all)} (top5%={_fmt(va_top)})"
             )
