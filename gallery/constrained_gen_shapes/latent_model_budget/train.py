@@ -518,7 +518,43 @@ def build_everything(config):
     return registry, bundle, tokenizer, model
 
 
+def _family_from_json_path(json_path: str | Path) -> str:
+    """Extract the dataset family name from a measure-record JSON path.
+
+    Layout: ``.../measure_tenset_filtered_family/{family}/{target}/{N}_*.json``
+    so the family is ``parents[1].name``. Returns "na" if the layout is too
+    shallow.
+    """
+    p = Path(json_path)
+    if len(p.parents) >= 2:
+        return p.parents[1].name
+    return "na"
+
+
+def _resolve_run_family(bundle: DatasetBundle) -> str:
+    """Family identifier for run-level naming (wandb / checkpoints).
+    Per-task / per-workload artifacts (e.g. the candidate_mask_cache) and the
+    measurement lookup file intentionally keep task-specific names and do
+    NOT use this helper.
+    """
+    all_records = (
+        list(bundle.train_records) + list(bundle.val_records) + list(bundle.test_records)
+    )
+    for record in all_records:
+        json_path = getattr(record, "json_path", None)
+        if not json_path:
+            continue
+        family = _family_from_json_path(json_path)
+        if family != "na":
+            return family
+    return "na"
+
+
 def _resolve_run_task_index(bundle: DatasetBundle) -> str:
+    """Task-index identifier kept for the measurement_lookup filename, where
+    measurements are inherently per-task and the file should not be shared
+    across tasks within the same family.
+    """
     import re
 
     all_records = (
@@ -527,9 +563,6 @@ def _resolve_run_task_index(bundle: DatasetBundle) -> str:
     for record in all_records:
         if record.task_index is not None:
             return str(int(record.task_index))
-    # Fall back: leading digits of the record JSON filename (e.g.
-    # "1490_([...],cuda).json" → "1490"). Measure-record JSONs don't carry a
-    # task_index field, so this keeps wandb project names meaningful.
     for record in all_records:
         json_path = getattr(record, "json_path", None)
         if not json_path:
@@ -540,23 +573,21 @@ def _resolve_run_task_index(bundle: DatasetBundle) -> str:
     return "na"
 
 
-def _resolve_task_index_from_config(config) -> str:
-    import re
-
+def _resolve_run_family_from_config(config) -> str:
     for p in getattr(config.data, "json_paths", []) or []:
-        m = re.match(r"^(\d+)", Path(p).stem)
-        if m:
-            return m.group(1)
+        family = _family_from_json_path(p)
+        if family != "na":
+            return family
     return "na"
 
 
 def _build_wandb_project_name(config, bundle: DatasetBundle | None = None) -> str:
     if bundle is not None:
-        task_index = _resolve_run_task_index(bundle)
+        family = _resolve_run_family(bundle)
     else:
-        task_index = _resolve_task_index_from_config(config)
+        family = _resolve_run_family_from_config(config)
     project_suffix = getattr(config.wandb, "project", None) or "single_v1"
-    return f"Task{task_index}_{project_suffix}"
+    return f"{family}_{project_suffix}"
 
 
 def _build_wandb_run_name(config, bundle: DatasetBundle | None = None) -> str:
@@ -1163,10 +1194,11 @@ def train_main(config) -> Dict[str, float]:
     best_val_acc = float("-inf")
     best_checkpoint_path = pt_dir / "best.pt"
     last_checkpoint_path = pt_dir / "last.pt"
-    checkpoint_path = pt_dir / f"{_resolve_run_task_index(bundle)}_{run_name}.pt"
+    run_family = _resolve_run_family(bundle)
+    checkpoint_path = pt_dir / f"{run_family}_{run_name}.pt"
     if checkpoint_path.exists():
         timestamp = time.strftime("%m%d%H%M")
-        checkpoint_path = pt_dir / f"{_resolve_run_task_index(bundle)}_{run_name}_{timestamp}.pt"
+        checkpoint_path = pt_dir / f"{run_family}_{run_name}_{timestamp}.pt"
         print(f"[train] checkpoint already exists; using timestamped path: {checkpoint_path}")
     if best_metric_mode == "max":
         best_metric_value = float("-inf")

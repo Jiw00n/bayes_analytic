@@ -8,11 +8,10 @@ from typing import Any, Dict, List, Optional
 from glob import glob
 
 
-# DEFAULT_JSON_PATHS = glob("/root/work/tvm-ansor/gallery/constrained_gen/data/measured_*/*.json")
-DEFAULT_JSON_PATHS = glob("/root/work/tvm-ansor/gallery/dataset/measure_tenset_filtered_family/nn_contrib_conv2d_winograd_without_weight_transform/t4/*.json")
-DEFAULT_NETWORK_INFO_FOLDER = "/root/work/tvm-ansor/gallery/dataset/network_info_all"
-DEFAULT_CHECKPOINT_DIR = "/root/work/tvm-ansor/gallery/constrained_gen_v1.5_ori_shapes/checkpoints_all"
-
+# DEFAULT_JSON_PATHS = glob("/workspace/tvm_gits/tvm-ansor/gallery/constrained_gen/data/measured_*/*.json")
+DEFAULT_JSON_PATHS = glob("/workspace/tvm_gits/tvm-ansor/gallery/dataset/measure_tenset_filtered_family/nn_contrib_conv2d_winograd_without_weight_transform/t4/*.json")
+DEFAULT_NETWORK_INFO_FOLDER = "/workspace/tvm_gits/tvm-ansor/gallery/dataset/network_info_all"
+DEFAULT_CHECKPOINT_DIR = "/workspace/tvm_gits/tvm-ansor/gallery/constrained_gen_shapes/checkpoints_all"
 
 @dataclass
 class DataConfig:
@@ -24,6 +23,12 @@ class DataConfig:
     seed: int = 42
     filter_invalid_records: bool = False
     budget: bool = False
+    # When True, the encoder/decoder prefix becomes
+    # ``[shape | extent | PARAM_START | params]``: one extent token per
+    # SplitStep, in step-index order, registered under the var name
+    # ``sp_extent_{step_idx}``. Extent values are taken from the record's
+    # generator (``gen._sp_extents``).
+    extent_token: bool = True
     pad_vocab_to: Optional[int] = None
     cost_target: str = "norm_throughput"   # "neg_log" | "norm_throughput" | "log_norm_throughput"
     # Override used ONLY for the cost regression loss (weighted_cost_loss).
@@ -57,9 +62,9 @@ class TrainConfig:
     learning_rate: float = 5e-4
     beta_start: float = 1e-4
     beta_end: float = 0.003
-    beta_warmup_epochs: int = 10
+    beta_warmup_epochs: int = 5
     lambda_recon: float = 1.0
-    lambda_cost: float = 0.01
+    lambda_cost: float = 0.001
     lambda_nce: float = 0.2
     tau_nce: float = 0.2
     cost_ridge_vec: bool = True
@@ -95,7 +100,7 @@ class TrainConfig:
     scheduler_name: str = "cosine"   # "none" | "multistep" | "plateau" | "cosine"
     cosine_t_max: int = 0
     cosine_eta_min: float = 1e-5
-    warmup_epochs: int = 5
+    warmup_epochs: int = 3
     warmup_start_factor: float = 0.1
 
     cobo_sample_weighting: bool = False

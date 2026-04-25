@@ -157,6 +157,110 @@ def _extract_measure_record_params(state) -> Tuple[Dict[str, int], Tuple[str, ..
     return params, tuple(param_signature)
 
 
+def _extract_measure_record_params_from_payload(
+    payload: dict,
+) -> Optional[Tuple[Dict[str, int], Tuple[str, ...]]]:
+    try:
+        steps = payload["i"][1][1]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    params: Dict[str, int] = {}
+    param_signature: List[str] = []
+    for step_idx, step in enumerate(steps):
+        if not isinstance(step, list) or not step:
+            continue
+        step_type = step[0]
+        if step_type == "SP":
+            try:
+                lengths = step[4]
+            except IndexError:
+                return None
+            for length_idx, length in enumerate(lengths):
+                name = f"sp_{step_idx}_{length_idx}"
+                params[name] = int(length)
+                param_signature.append(name)
+            continue
+
+        if step_type != "PR":
+            continue
+
+        try:
+            pragma_type = str(step[3])
+        except IndexError:
+            return None
+        if not pragma_type.startswith("auto_unroll_max_step$"):
+            continue
+
+        name = f"ur_{step_idx}"
+        params[name] = int(pragma_type.split("$")[-1])
+        param_signature.append(name)
+
+    if not params:
+        return None
+    return params, tuple(param_signature)
+
+
+def _extract_measure_record_task_signature_from_payload(
+    payload: dict,
+) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]]:
+    try:
+        task_payload = payload["i"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    try:
+        workload_key = str(task_payload[0])
+        target_text = str(task_payload[1])
+    except (IndexError, TypeError):
+        return None
+
+    target_parts = target_text.split()
+    target_kind = target_parts[0] if target_parts else None
+    target_model: Optional[str] = None
+    for idx, part in enumerate(target_parts):
+        if part == "-model" and idx + 1 < len(target_parts):
+            target_model = target_parts[idx + 1]
+            break
+        if part.startswith("-model="):
+            target_model = part.split("=", 1)[1]
+            break
+    if target_model is None:
+        target_model = "unknown"
+
+    task_desc = None
+    if len(task_payload) > 3 and task_payload[3] is not None:
+        task_desc = str(task_payload[3])
+
+    return workload_key, target_kind, target_model, task_desc
+
+
+def _extract_measure_cost_from_payload(
+    payload: dict,
+    cost_target: str = "neg_log",
+) -> Optional[float]:
+    result_payload = payload.get("r")
+    if not isinstance(result_payload, list) or len(result_payload) < 2:
+        return None
+
+    try:
+        error_no = int(result_payload[1])
+    except (TypeError, ValueError):
+        error_no = 0
+    if error_no != 0:
+        return None
+
+    try:
+        costs = [float(x) for x in result_payload[0]]
+    except (TypeError, ValueError):
+        return None
+    if not costs:
+        return None
+
+    mean_cost = float(sum(costs) / len(costs))
+    return _transform_cost_for_training(mean_cost, cost_target=cost_target)
+
+
 def _augment_record_budget_params(record: JsonSampleRecord, generator) -> None:
     params = record.params
     budget_specs = list(getattr(generator, "_budget_specs", ()))
@@ -373,12 +477,20 @@ def _load_measure_record_sample(
     record_index: int,
     cost_target: str = "neg_log",
 ) -> JsonSampleRecord:
-    from tvm.auto_scheduler.measure_record import load_record_from_string
-
     payload = json.loads(line)
-    inp, res = load_record_from_string(line)
-    params, param_signature = _extract_measure_record_params(inp.state)
-    workload_key, target_kind, target_model, task_desc = _extract_search_task_signature(inp.task)
+    parsed_params = _extract_measure_record_params_from_payload(payload)
+    parsed_signature = _extract_measure_record_task_signature_from_payload(payload)
+    if parsed_params is not None and parsed_signature is not None:
+        params, param_signature = parsed_params
+        workload_key, target_kind, target_model, task_desc = parsed_signature
+        cost = _extract_measure_cost_from_payload(payload, cost_target=cost_target)
+    else:
+        from tvm.auto_scheduler.measure_record import load_record_from_string
+
+        inp, res = load_record_from_string(line)
+        params, param_signature = _extract_measure_record_params(inp.state)
+        workload_key, target_kind, target_model, task_desc = _extract_search_task_signature(inp.task)
+        cost = _extract_measure_cost(res, cost_target=cost_target)
 
     return JsonSampleRecord(
         sample_id=_build_sample_id(
@@ -392,7 +504,7 @@ def _load_measure_record_sample(
         json_path=str(path),
         sketch_index=0,
         params=params,
-        cost=_extract_measure_cost(res, cost_target=cost_target),
+        cost=cost,
         raw=payload,
         workload_key=workload_key,
         target_kind=target_kind,

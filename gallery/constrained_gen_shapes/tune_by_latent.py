@@ -693,6 +693,47 @@ def shape_prefix_for_record(
     return shape_token_ids, shape_var_ids
 
 
+def _extent_token_enabled_for_bundle(bundle: "LoadedBundle") -> bool:
+    cfg_payload = bundle.checkpoint_payload.get("config", {})
+    if isinstance(cfg_payload, dict):
+        data_payload = cfg_payload.get("data", {})
+        if isinstance(data_payload, dict):
+            return bool(data_payload.get("extent_token", False))
+    return False
+
+
+@torch.no_grad()
+def extent_prefix_for_record(
+    bundle: "LoadedBundle",
+    record: JsonSampleRecord,
+    gen: Optional[Any] = None,
+) -> tuple[List[int], List[int]]:
+    """Return ``(extent_token_ids, extent_var_ids)`` for the record.
+
+    Mirrors the prefix laid out at training time when
+    ``data.extent_token=True``: one token per SplitStep, in step-index order,
+    using ``gen._sp_extents`` for the value and ``sp_extent_{step_idx}`` for
+    the var label. Returns empty lists when extent_token is disabled.
+    """
+    if not _extent_token_enabled_for_bundle(bundle):
+        return [], []
+    if gen is None:
+        gen = bundle.registry.get_generator_from_record(record)
+    sp_extents: Dict[int, int] = dict(getattr(gen, "_sp_extents", {}))
+    if not sp_extents:
+        return [], []
+    sorted_indices = sorted(int(idx) for idx in sp_extents.keys())
+    tokenizer = bundle.tokenizer
+    extent_token_ids = [
+        tokenizer.token_to_id.get(str(int(sp_extents[idx])), tokenizer.unk_id)
+        for idx in sorted_indices
+    ]
+    extent_var_ids = [
+        tokenizer.var_to_id[f"sp_extent_{idx}"] for idx in sorted_indices
+    ]
+    return extent_token_ids, extent_var_ids
+
+
 @torch.no_grad()
 def encode_record_to_z(
     bundle: LoadedBundle,
@@ -703,10 +744,17 @@ def encode_record_to_z(
     gen, ordered_names, ordered_values = prepare_record_context(bundle, record)
 
     shape_token_ids, shape_var_ids = shape_prefix_for_record(bundle, record)
-    enc_token_list = shape_token_ids + bundle.tokenizer.encode_values(
-        ordered_names, ordered_values
+    extent_token_ids, extent_var_ids = extent_prefix_for_record(bundle, record, gen=gen)
+    enc_token_list = (
+        shape_token_ids
+        + extent_token_ids
+        + bundle.tokenizer.encode_values(ordered_names, ordered_values)
     )
-    enc_var_list = shape_var_ids + bundle.tokenizer.encode_var_names(ordered_names)
+    enc_var_list = (
+        shape_var_ids
+        + extent_var_ids
+        + bundle.tokenizer.encode_var_names(ordered_names)
+    )
     enc_ids = torch.tensor([enc_token_list], dtype=torch.long, device=bundle.device)
     enc_var_ids = torch.tensor([enc_var_list], dtype=torch.long, device=bundle.device)
     enc_pad = enc_ids.eq(bundle.tokenizer.pad_id)
@@ -794,6 +842,8 @@ def greedy_decode_from_z(
     rng: Optional[torch.Generator] = None,
     shape_token_ids: Optional[List[int]] = None,
     shape_var_ids: Optional[List[int]] = None,
+    extent_token_ids: Optional[List[int]] = None,
+    extent_var_ids: Optional[List[int]] = None,
 ) -> DecodeRecord:
     options = sampling_options or SamplingOptions()
     model = bundle.model
@@ -810,10 +860,19 @@ def greedy_decode_from_z(
             f"shape_token_ids ({len(shape_token_list)}) and shape_var_ids "
             f"({len(shape_var_list)}) length mismatch"
         )
+    extent_token_list = list(extent_token_ids or [])
+    extent_var_list = list(extent_var_ids or [])
+    if len(extent_token_list) != len(extent_var_list):
+        raise ValueError(
+            f"extent_token_ids ({len(extent_token_list)}) and extent_var_ids "
+            f"({len(extent_var_list)}) length mismatch"
+        )
+    prefix_token_list = shape_token_list + extent_token_list
+    prefix_var_list = shape_var_list + extent_var_list
     param_var_ids = [tokenizer.var_to_id[name] for name in ordered_names]
-    full_var_ids = shape_var_list + param_var_ids
+    full_var_ids = prefix_var_list + param_var_ids
 
-    decoder_input_ids: List[int] = list(shape_token_list) + [tokenizer.param_start_id]
+    decoder_input_ids: List[int] = list(prefix_token_list) + [tokenizer.param_start_id]
     decoded_params: Dict[str, int] = {}
 
     for step_idx, var_name in enumerate(ordered_names):
@@ -1123,6 +1182,7 @@ def build_walk_records(
     pending_measure_metas: List[Dict[str, Any]] = []
     pending_measure_keys: List[tuple[tuple[str, int], ...]] = []
     shape_token_ids, shape_var_ids = shape_prefix_for_record(bundle, record)
+    extent_token_ids, extent_var_ids = extent_prefix_for_record(bundle, record, gen=gen)
     for step_index, alpha, z in shifted_zs:
         oracle = bundle.registry.build_oracle_from_record(record)
         decoded = greedy_decode_from_z(
@@ -1134,6 +1194,8 @@ def build_walk_records(
             rng=decode_rng,
             shape_token_ids=shape_token_ids,
             shape_var_ids=shape_var_ids,
+            extent_token_ids=extent_token_ids,
+            extent_var_ids=extent_var_ids,
         )
 
         decoded_sym_map_int = {
@@ -1242,6 +1304,13 @@ def build_walk_records(
         f"total={len(results)} "
         f"ref_skipped={ref_match_count} "
     )
+    # ``record.cost`` lives in the loader's training-label space (default
+    # ``neg_log``); convert back to raw seconds for human-readable output.
+    ref_raw_cost = cost_label_to_raw(record.cost, "neg_log")
+    ref_cost_str = (
+        f"{float(ref_raw_cost):.6g}s" if ref_raw_cost is not None else "<none>"
+    )
+    print(f"Reference cost: {ref_cost_str} (sample_id={record.sample_id})")
 
     _release_measurement_environment(bundle, generator=gen, keep_bundle=keep_bundle)
 
@@ -1296,6 +1365,13 @@ def build_walk_records(
                         return float("inf")
                     return float(sum(float(c) for c in raw_costs) / len(raw_costs))
                 grouped.sort(key=_measured_key)
+            elif sort_by == "alpha":
+                # Ascending walk progression: anchor (alpha=0) first, then
+                # outward. Within a group we use the smallest alpha at which
+                # that sym_map first appeared.
+                grouped.sort(
+                    key=lambda g: min(g["alphas"]) if g["alphas"] else float("inf")
+                )
             else:  # "re_pred"
                 grouped.sort(
                     key=lambda g: (
@@ -1373,6 +1449,8 @@ def _append_latent_result_csv(
     random_z: bool,
     seed: Optional[int],
     latent_gradient: bool,
+    cost_target: str = "neg_log",
+    task_min_cost: Optional[float] = None,
 ) -> None:
     if random_z and seed is not None:
         existing_random_seeds = load_existing_random_seeds(csv_path)
@@ -1392,7 +1470,15 @@ def _append_latent_result_csv(
             )
             return
 
-    true_mean_cost = None if random_z else extract_true_mean_cost(record)
+    true_mean_cost = (
+        None
+        if random_z
+        else extract_true_mean_cost(
+            record,
+            cost_target=cost_target,
+            task_min_cost=task_min_cost,
+        )
+    )
     rows: List[Dict[str, Any]] = []
     for grouped_record in _group_walk_records_by_sym_map(records):
         walk_record = grouped_record["record"]
@@ -1511,6 +1597,8 @@ def run_latent_walk(
         random_z=random_z,
         seed=seed,
         latent_gradient=latent_gradient,
+        cost_target=cost_target,
+        task_min_cost=task_min_cost,
     )
     return records
 
@@ -1574,6 +1662,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Optional RNG seed for sampling decoding",
     )
+    p.add_argument(
+        "--sort-by",
+        type=str,
+        default="measured",
+        choices=["measured", "re_pred", "alpha"],
+        help="How to order the printed walk results: measured raw cost (asc), "
+             "reencode-predicted cost (desc), or walk alpha (asc)",
+    )
     return p
 
 
@@ -1587,6 +1683,60 @@ def main() -> List[WalkRecord]:
         top_p=float(args.decode_top_p),
         seed=args.decode_seed,
     )
+
+    record_json = Path(args.record_json)
+    if record_json.is_dir():
+        # Directory mode: one task per JSON file. The directory is expected
+        # to look like ``.../{family}/{target}/`` and contain task JSONs
+        # named ``{task_index}_(...).json``. Each file gets exactly one walk
+        # (top-1 anchor when --best-cost). The bundle (model + registry +
+        # tokenizer) is loaded once and reused across files.
+        json_files = sorted(record_json.glob("*.json"))
+        if not json_files:
+            print(f"[latent-walk] no json files in {record_json}")
+            return []
+        print(
+            f"[latent-walk] directory mode: {len(json_files)} task(s) in {record_json}"
+        )
+        bundle = load_bundle(
+            args.checkpoint,
+            network_info_folder=args.network_info_folder,
+            device=args.device,
+            use_latent_gradient=args.latent_gradient,
+        )
+        all_records: List[WalkRecord] = []
+        for idx, json_file in enumerate(json_files, start=1):
+            print(
+                f"[latent-walk] [{idx}/{len(json_files)}] task json: {json_file.name}"
+            )
+            try:
+                records = run_latent_walk(
+                    checkpoint_path=args.checkpoint,
+                    record_json_path=str(json_file),
+                    network_info_folder=args.network_info_folder,
+                    device=args.device,
+                    num_steps=args.num_steps,
+                    step_size=args.step_size,
+                    normalize_direction=not args.no_normalize_direction,
+                    random_z=bool(args.random),
+                    seed=args.seed,
+                    best_cost=bool(args.best_cost),
+                    output=args.output,
+                    latent_gradient=args.latent_gradient,
+                    deterministic_start=bool(args.deterministic),
+                    sampling_options=sampling_options,
+                    sort_by=args.sort_by,
+                    bundle=bundle,
+                    keep_bundle=True,
+                )
+                all_records.extend(records)
+            except Exception as err:  # pylint: disable=broad-except
+                print(
+                    f"[latent-walk] failed on {json_file.name}: "
+                    f"{type(err).__name__}: {err}"
+                )
+        return all_records
+
     return run_latent_walk(
         checkpoint_path=args.checkpoint,
         record_json_path=args.record_json,
@@ -1602,6 +1752,7 @@ def main() -> List[WalkRecord]:
         latent_gradient=args.latent_gradient,
         deterministic_start=bool(args.deterministic),
         sampling_options=sampling_options,
+        sort_by=args.sort_by,
     )
 
 

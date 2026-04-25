@@ -25,6 +25,10 @@ from .tokenizer import ParamTokenizer
 # v12: shape prefix + dedicated PARAM_START token present in both encoder and
 # decoder (replaces the old BOS). Encoder length = S + 1 + n; decoder length =
 # S + n. candidate_masks align with decoder/target (shape S + n).
+# When ``data.extent_token=True`` an additional extent prefix is inserted
+# between shape and PARAM_START — that variant gets a ``_withExtent`` tag in
+# the cache filename so the no-extent caches stay reusable under the same
+# version.
 _CANDIDATE_MASK_CACHE_VERSION = "v12"
 _CANDIDATE_MASK_CACHE_FLUSH_EVERY = 100
 
@@ -86,6 +90,8 @@ class PreparedSample:
     task_index: Optional[int] = None
     shape_token_ids: List[int] = field(default_factory=list)
     shape_var_ids: List[int] = field(default_factory=list)
+    extent_token_ids: List[int] = field(default_factory=list)
+    extent_var_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -160,6 +166,7 @@ def _prepare_single_sample(
     tokenizer: ParamTokenizer | None,
     include_budget: bool = True,
     shape_tokens_and_vars: tuple[List[int], List[int]] | None = None,
+    extent_tokens_and_vars: tuple[List[int], List[int]] | None = None,
 ) -> tuple[List[str], List[int], PreparedSample | None]:
     gen = _get_generator_for_record(record, registry)
     order = get_model_param_order(gen, include_budget=include_budget)
@@ -177,6 +184,10 @@ def _prepare_single_sample(
     shape_var_ids: List[int] = []
     if shape_tokens_and_vars is not None:
         shape_token_ids, shape_var_ids = shape_tokens_and_vars
+    extent_token_ids: List[int] = []
+    extent_var_ids: List[int] = []
+    if extent_tokens_and_vars is not None:
+        extent_token_ids, extent_var_ids = extent_tokens_and_vars
     return order, ordered_values, _build_prepared_sample(
         record,
         order,
@@ -184,6 +195,8 @@ def _prepare_single_sample(
         tokenizer,
         shape_token_ids=shape_token_ids,
         shape_var_ids=shape_var_ids,
+        extent_token_ids=extent_token_ids,
+        extent_var_ids=extent_var_ids,
     )
 
 
@@ -198,6 +211,8 @@ def _build_prepared_sample(
     prefix_len: int = 0,
     shape_token_ids: Sequence[int] = (),
     shape_var_ids: Sequence[int] = (),
+    extent_token_ids: Sequence[int] = (),
+    extent_var_ids: Sequence[int] = (),
 ) -> PreparedSample:
     param_token_ids = tokenizer.encode_values(order, ordered_values)
     param_var_ids = tokenizer.encode_var_names(order)
@@ -209,30 +224,42 @@ def _build_prepared_sample(
             f"({len(shape_var_list)}) length mismatch for {record.sample_id}"
         )
     shape_len = len(shape_token_list)
+    extent_token_list = list(int(v) for v in extent_token_ids)
+    extent_var_list = list(int(v) for v in extent_var_ids)
+    if len(extent_token_list) != len(extent_var_list):
+        raise ValueError(
+            f"extent_token_ids ({len(extent_token_list)}) and extent_var_ids "
+            f"({len(extent_var_list)}) length mismatch for {record.sample_id}"
+        )
+    extent_len = len(extent_token_list)
+    # Combined non-param prefix laid out as [shape | extent].
+    prefix_token_list = shape_token_list + extent_token_list
+    prefix_var_list = shape_var_list + extent_var_list
+    prefix_total_len = shape_len + extent_len
 
-    # Encoder: [shape | PARAM_START | params]   (length S + 1 + n).
+    # Encoder: [shape | extent | PARAM_START | params]   (length P + 1 + n).
     encoder_token_ids = (
-        shape_token_list + [tokenizer.param_start_id] + param_token_ids
+        prefix_token_list + [tokenizer.param_start_id] + param_token_ids
     )
     encoder_var_ids = (
-        shape_var_list + [tokenizer.param_start_var_id] + param_var_ids
+        prefix_var_list + [tokenizer.param_start_var_id] + param_var_ids
     )
-    # Decoder input: [shape | PARAM_START | params[:-1]]   (length S + n).
+    # Decoder input: [shape | extent | PARAM_START | params[:-1]]   (length P + n).
     # Decoder uses target-var-ids convention: decoder_var_ids[k] = var id of
-    # the token being predicted at position k, so positions S..S+n-1 carry
-    # v0..v_{n-1}. Position S (PARAM_START input) predicts param_0 → var v0.
+    # the token being predicted at position k, so positions P..P+n-1 carry
+    # v0..v_{n-1}. Position P (PARAM_START input) predicts param_0 → var v0.
     if param_token_ids:
         decoder_input_ids = (
-            shape_token_list + [tokenizer.param_start_id] + param_token_ids[:-1]
+            prefix_token_list + [tokenizer.param_start_id] + param_token_ids[:-1]
         )
     else:
-        decoder_input_ids = shape_token_list + [tokenizer.param_start_id]
-    decoder_var_ids = shape_var_list + list(param_var_ids)
+        decoder_input_ids = prefix_token_list + [tokenizer.param_start_id]
+    decoder_var_ids = prefix_var_list + list(param_var_ids)
     if not param_token_ids:
-        decoder_var_ids = shape_var_list + [tokenizer.var_pad_id]
-    # Target: shape positions are pad_id (ignored by loss); param positions
-    # carry gold token ids.
-    target_ids = [tokenizer.pad_id] * shape_len + param_token_ids
+        decoder_var_ids = prefix_var_list + [tokenizer.var_pad_id]
+    # Target: shape/extent positions are pad_id (ignored by loss); param
+    # positions carry gold token ids.
+    target_ids = [tokenizer.pad_id] * prefix_total_len + param_token_ids
 
     candidate_masks = None
     if include_candidate_masks:
@@ -242,15 +269,17 @@ def _build_prepared_sample(
             oracle = registry.build_oracle_from_record(record)
             prefix_len = 0
         vocab_size = len(tokenizer.id_to_token)
-        # Candidate masks align with decoder/target positions (length S + n).
-        candidate_masks = torch.zeros((shape_len + len(order), vocab_size), dtype=torch.bool)
-        # Shape-prefix rows pinned to pad_id so `masked_fill(~mask, -inf)` is
-        # not all-masked at those positions; loss ignores them via
-        # ignore_index=pad_id.
-        if shape_len:
-            candidate_masks[:shape_len, tokenizer.pad_id] = True
+        # Candidate masks align with decoder/target positions (length P + n).
+        candidate_masks = torch.zeros(
+            (prefix_total_len + len(order), vocab_size), dtype=torch.bool
+        )
+        # Shape/extent-prefix rows pinned to pad_id so
+        # ``masked_fill(~mask, -inf)`` is not all-masked at those positions;
+        # loss ignores them via ignore_index=pad_id.
+        if prefix_total_len:
+            candidate_masks[:prefix_total_len, tokenizer.pad_id] = True
         for t, (name, value) in enumerate(zip(order, ordered_values)):
-            row = shape_len + t
+            row = prefix_total_len + t
             gold_token = tokenizer.value_to_token(name, value)
             gold_id = tokenizer.token_to_id.get(gold_token, tokenizer.unk_id)
             try:
@@ -276,7 +305,7 @@ def _build_prepared_sample(
                 for rem_t, rem_name, rem_value in zip(range(t + 1, len(order)), order[t + 1:], ordered_values[t + 1:]):
                     rem_gold_token = tokenizer.value_to_token(rem_name, rem_value)
                     rem_gold_id = tokenizer.token_to_id.get(rem_gold_token, tokenizer.unk_id)
-                    rem_row = shape_len + rem_t
+                    rem_row = prefix_total_len + rem_t
                     candidate_masks[rem_row].zero_()
                     candidate_masks[rem_row, rem_gold_id] = True
                 break
@@ -301,6 +330,8 @@ def _build_prepared_sample(
         task_index=record.task_index,
         shape_token_ids=shape_token_list,
         shape_var_ids=shape_var_list,
+        extent_token_ids=extent_token_list,
+        extent_var_ids=extent_var_list,
     )
     return sample
 
@@ -438,6 +469,22 @@ def budget_enabled(config_or_payload=None) -> bool:
     return True
 
 
+def extent_token_enabled(config_or_payload=None) -> bool:
+    if config_or_payload is None:
+        return False
+
+    data_cfg = getattr(config_or_payload, "data", None)
+    if data_cfg is not None:
+        return bool(getattr(data_cfg, "extent_token", False))
+
+    if isinstance(config_or_payload, dict):
+        data_payload = config_or_payload.get("data", {})
+        if isinstance(data_payload, dict):
+            return bool(data_payload.get("extent_token", False))
+
+    return False
+
+
 def filter_param_order(order: Sequence[str], *, include_budget: bool = True) -> List[str]:
     if include_budget:
         return [str(name) for name in order]
@@ -543,9 +590,10 @@ def _candidate_mask_cache_path_for_workload(config, workload_key: str, target_ki
         else ""
     )
     generator_tag = _generator_cache_suffix(config)
+    extent_tag = "_withExtent" if extent_token_enabled(config) else ""
     return cache_dir / (
         f"{stem}_{_CANDIDATE_MASK_CACHE_VERSION}_{budget_tag}"
-        f"{compressed_tag}{generator_tag}.pt"
+        f"{compressed_tag}{extent_tag}{generator_tag}.pt"
     )
 
 
@@ -674,6 +722,7 @@ def _save_candidate_mask_cache_files(
     cached_candidate_masks: Dict[str, torch.Tensor],
     cache_paths_by_workload: Dict[tuple[str, str], Path],
     tokenizer: "ParamTokenizer",
+    restrict_to_workloads: Optional[Set[Tuple[str, str]]] = None,
 ) -> None:
     sample_masks_by_workload: Dict[tuple[str, str], Dict[str, torch.Tensor]] = {}
     for record in subset:
@@ -681,12 +730,14 @@ def _save_candidate_mask_cache_files(
         target_kind = record.target_kind
         if not workload_key or not target_kind:
             continue
+        workload_sig = (str(workload_key), str(target_kind))
+        if restrict_to_workloads is not None and workload_sig not in restrict_to_workloads:
+            continue
         mask = cached_candidate_masks.get(record.sample_id)
         if mask is None:
             continue
-        workload_sig = (str(workload_key), str(target_kind))
         sample_masks_by_workload.setdefault(workload_sig, {})[record.sample_id] = (
-            mask.clone().to(device="cpu")
+            mask.to(device="cpu")
         )
 
     id_to_token = list(tokenizer.id_to_token)
@@ -707,6 +758,385 @@ def _save_candidate_mask_cache_files(
             },
             cache_path,
         )
+
+
+def _precompute_masks_worker(args: tuple) -> Dict[str, torch.Tensor]:
+    """Compute candidate masks for one (workload_key, target_kind) group.
+
+    Module-level so it pickles cleanly for ``multiprocessing.Pool``. Each
+    worker rebuilds its own ``GeneratorRegistry`` (so generator caches and TVM
+    C-extension state stay process-local) and runs the same prefix-snapshot
+    logic as the sequential path, preserving ``_lpm_mask_cache`` hit rate
+    inside the group. Workers report progress in chunks via a shared Queue
+    and write the workload's pt cache file directly, avoiding a
+    main-process I/O bottleneck.
+    """
+    (
+        workload_key,
+        target_kind,
+        records,
+        record_param_data,
+        tokenizer_state,
+        registry_init_args,
+        existing_masks,
+        cache_path,
+        cached_id_to_token,
+        progress_queue,
+        progress_chunk,
+    ) = args
+
+    from .adapter import GeneratorRegistry
+    from .tokenizer import ParamTokenizer
+
+    registry = GeneratorRegistry(**registry_init_args)
+    tokenizer = ParamTokenizer.from_state_dict(tokenizer_state)
+
+    indexed = list(enumerate(records))
+    indexed.sort(
+        key=lambda ir: (
+            -1 if ir[1].task_index is None else int(ir[1].task_index),
+            int(ir[1].sketch_index),
+            tuple(ir[1].param_signature or ()),
+            tuple(record_param_data[ir[0]][1]),
+        )
+    )
+
+    current_group_key = None
+    current_oracle = None
+    current_order: List[str] = []
+    current_values: List[int] = []
+    new_masks: Dict[str, torch.Tensor] = {}
+    pending_progress = 0
+
+    def _flush_progress(final: bool = False) -> None:
+        nonlocal pending_progress
+        if progress_queue is None or pending_progress <= 0:
+            return
+        if final or pending_progress >= progress_chunk:
+            try:
+                progress_queue.put(int(pending_progress))
+            except Exception:  # pylint: disable=broad-except
+                pass
+            pending_progress = 0
+
+    for orig_idx, record in indexed:
+        rec_data = record_param_data[orig_idx]
+        if len(rec_data) >= 6:
+            (
+                order,
+                values,
+                shape_token_ids,
+                shape_var_ids,
+                extent_token_ids,
+                extent_var_ids,
+            ) = rec_data
+        else:
+            order, values, shape_token_ids, shape_var_ids = rec_data
+            extent_token_ids, extent_var_ids = [], []
+        group_key = (
+            record.workload_key,
+            record.target_kind,
+            record.task_index,
+            record.sketch_index,
+            tuple(record.param_signature or ()),
+        )
+        prefix_len = 0
+        if current_group_key != group_key:
+            current_group_key = group_key
+            current_oracle = registry.build_oracle_from_record(record)
+            current_order = list(order)
+            current_values = []
+        else:
+            limit = min(
+                len(current_order), len(current_values), len(order), len(values)
+            )
+            while (
+                prefix_len < limit
+                and current_order[prefix_len] == order[prefix_len]
+                and current_values[prefix_len] == int(values[prefix_len])
+            ):
+                prefix_len += 1
+            prefix_key = tuple(
+                (order[pos], int(values[pos])) for pos in range(prefix_len)
+            )
+            snapshot = current_oracle.generator._lpm_prefix_state_cache.get(prefix_key)
+            if snapshot is None:
+                current_oracle = registry.build_oracle_from_record(record)
+                prefix_len = 0
+            else:
+                current_oracle.assignment.clear()
+                current_oracle.assignment.update(snapshot[0])
+                current_oracle._domains = current_oracle.generator.param_sampler._copy_domains(snapshot[1])
+                current_oracle._group_remaining = current_oracle.generator.param_sampler._copy_group_remaining(snapshot[2])
+                current_oracle._budget_remaining = current_oracle.generator.param_sampler._copy_budget_remaining(snapshot[3])
+                current_oracle._sym_map = dict(snapshot[4])
+                current_oracle.generator.param_sampler._restore_sym_map(snapshot[4])
+                current_oracle.last_report = None
+
+        sample = _build_prepared_sample(
+            record,
+            order,
+            values,
+            tokenizer,
+            registry=registry,
+            include_candidate_masks=True,
+            oracle=current_oracle,
+            prefix_len=prefix_len,
+            shape_token_ids=shape_token_ids,
+            shape_var_ids=shape_var_ids,
+            extent_token_ids=extent_token_ids,
+            extent_var_ids=extent_var_ids,
+        )
+        new_masks[record.sample_id] = sample.candidate_masks
+        current_order = list(order)
+        current_values = list(values)
+        pending_progress += 1
+        _flush_progress(final=False)
+
+    _flush_progress(final=True)
+
+    if cache_path is not None:
+        merged = dict(existing_masks)
+        merged.update(new_masks)
+        if merged:
+            torch.save(
+                {
+                    "workload_key": str(workload_key),
+                    "target_kind": str(target_kind),
+                    "sample_masks": merged,
+                    "id_to_token": cached_id_to_token,
+                },
+                cache_path,
+            )
+
+    # Return numpy arrays instead of torch tensors so the IPC pickle path
+    # uses numpy's plain buffer reducer rather than torch's shared-memory /
+    # file-descriptor reducer. With tens of thousands of mask tensors per
+    # group, the torch reducer exhausts system fd/shm limits during result
+    # collection (RuntimeError: unable to mmap ... Cannot allocate memory).
+    return {sid: mask.numpy() for sid, mask in new_masks.items()}
+
+
+def _load_json_worker(args: tuple) -> List[JsonSampleRecord]:
+    """Module-level worker for parallel JSON loading.
+
+    Returns parsed records for a single path so the main process can extend
+    its accumulator. Costs are loaded with ``cost_target="norm_throughput"``
+    (raw); the actual cost_target transform happens in the main process.
+    """
+    path, cost_target = args
+    return load_json_samples(path, cost_target=cost_target)
+
+
+def _run_parallel_json_load(
+    raw_paths: Sequence[Path],
+    *,
+    cost_target: str,
+    requested_workers: int,
+) -> List[JsonSampleRecord]:
+    """Load N json files in parallel processes; falls back to sequential when
+    requested_workers <= 1 or there's only one file. Preserves order is *not*
+    guaranteed (we use ``imap_unordered`` for a smoother tqdm), but downstream
+    code does not depend on file order.
+    """
+    import os as _os
+
+    if requested_workers <= 0:
+        n_workers = min(_os.cpu_count() or 1, len(raw_paths))
+    else:
+        n_workers = min(requested_workers, len(raw_paths))
+
+    if n_workers < 2 or len(raw_paths) < 2:
+        records: List[JsonSampleRecord] = []
+        for path in tqdm(raw_paths, desc="[dataset] loading json"):
+            records.extend(load_json_samples(path, cost_target=cost_target))
+        return records
+
+    print(
+        f"[dataset] launching json load: "
+        f"workers={n_workers} files={len(raw_paths)}"
+    )
+    import multiprocessing as _mp
+
+    ctx = _mp.get_context("fork")
+    args_iter = [(path, cost_target) for path in raw_paths]
+    records: List[JsonSampleRecord] = []
+    with ctx.Pool(processes=n_workers) as pool:
+        for batch in tqdm(
+            pool.imap_unordered(_load_json_worker, args_iter),
+            total=len(raw_paths),
+            desc="[dataset] loading json",
+        ):
+            records.extend(batch)
+    return records
+
+
+def _build_registry_init_args(config) -> Dict[str, object]:
+    args: Dict[str, object] = {
+        "network_info_folder": config.data.network_info_folder,
+    }
+    gen_cfg = getattr(config, "generator", None)
+    if gen_cfg is not None:
+        hw_param = getattr(gen_cfg, "hw_param", None)
+        disable_constraint = getattr(gen_cfg, "disable_constraint", None)
+        if hw_param:
+            args["hw_param"] = dict(hw_param)
+        if disable_constraint:
+            args["disable_constraint"] = list(disable_constraint)
+    return args
+
+
+def _run_parallel_mask_precompute(
+    *,
+    config,
+    precompute_records: Sequence[JsonSampleRecord],
+    cached_candidate_masks: Dict[str, torch.Tensor],
+    cache_paths_by_workload: Dict[Tuple[str, str], Path],
+    tokenizer: "ParamTokenizer",
+    prepared_cache: Dict[int, tuple],
+    shape_ids_for_record,
+    extent_ids_for_record=None,
+) -> None:
+    """Compute cache-miss candidate masks across (workload_key, target_kind)
+    groups in parallel processes. Populates ``cached_candidate_masks`` in
+    place; each worker also persists its own pt cache file so an interrupted
+    run keeps progress.
+
+    Falls back to no-op when there are no missing records or when
+    ``config.train.precompute_workers`` resolves to <= 1 (callers handle the
+    sequential path inside ``build_samples``).
+    """
+    miss_by_workload: Dict[Tuple[str, str], List[JsonSampleRecord]] = {}
+    for record in precompute_records:
+        if record.sample_id in cached_candidate_masks:
+            continue
+        if not (record.workload_key and record.target_kind):
+            continue
+        sig = (str(record.workload_key), str(record.target_kind))
+        miss_by_workload.setdefault(sig, []).append(record)
+
+    if not miss_by_workload:
+        return
+
+    requested = getattr(getattr(config, "train", None), "precompute_workers", None)
+    requested = int(requested) if requested is not None else 0
+    n_groups = len(miss_by_workload)
+    import os as _os
+    if requested <= 0:
+        n_workers = min(_os.cpu_count() or 1, n_groups)
+    else:
+        n_workers = min(requested, n_groups)
+
+    if n_workers < 2:
+        # Caller's sequential build_samples path will compute these.
+        return
+
+    print(
+        f"[dataset] launching mask precompute: "
+        f"workers={n_workers} groups={n_groups} "
+        f"missing={sum(len(r) for r in miss_by_workload.values())}"
+    )
+
+    registry_init_args = _build_registry_init_args(config)
+    tokenizer_state = tokenizer.to_state_dict()
+    cached_id_to_token = list(tokenizer.id_to_token)
+
+    per_group_args: List[tuple] = []
+    for sig, recs in miss_by_workload.items():
+        workload_key, target_kind = sig
+        cache_path = cache_paths_by_workload.get(sig)
+        if cache_path is None:
+            cache_path = _candidate_mask_cache_path_for_workload(
+                config, workload_key, target_kind
+            )
+            cache_paths_by_workload[sig] = cache_path
+
+        record_param_data: List[tuple] = []
+        for rec in recs:
+            order, values = prepared_cache[id(rec)]
+            stoks, svars = shape_ids_for_record(rec)
+            if extent_ids_for_record is not None:
+                etoks, evars = extent_ids_for_record(rec)
+            else:
+                etoks, evars = [], []
+            record_param_data.append(
+                (
+                    list(order),
+                    [int(v) for v in values],
+                    list(stoks),
+                    list(svars),
+                    list(etoks),
+                    list(evars),
+                )
+            )
+
+        existing_for_workload = {
+            rec.sample_id: cached_candidate_masks[rec.sample_id]
+            for rec in precompute_records
+            if (str(rec.workload_key or ""), str(rec.target_kind or "")) == sig
+            and rec.sample_id in cached_candidate_masks
+        }
+
+        per_group_args.append((
+            workload_key,
+            target_kind,
+            recs,
+            record_param_data,
+            tokenizer_state,
+            registry_init_args,
+            existing_for_workload,
+            cache_path,
+            cached_id_to_token,
+            None,  # progress_queue, filled below
+            _CANDIDATE_MASK_CACHE_FLUSH_EVERY,
+        ))
+
+    import multiprocessing as _mp
+    from queue import Empty as _Empty
+
+    ctx = _mp.get_context("fork")
+    manager = ctx.Manager()
+    progress_queue = manager.Queue()
+    per_group_args = [
+        (*args[:9], progress_queue, args[10]) for args in per_group_args
+    ]
+
+    total_misses = sum(len(g[2]) for g in per_group_args)
+    pbar = tqdm(total=total_misses, desc="[dataset] candidate masks")
+    try:
+        with ctx.Pool(processes=n_workers) as pool:
+            futures = [
+                pool.apply_async(_precompute_masks_worker, (args,))
+                for args in per_group_args
+            ]
+            while True:
+                all_done = all(f.ready() for f in futures)
+                try:
+                    n = progress_queue.get(timeout=0.5)
+                    pbar.update(int(n))
+                    continue
+                except _Empty:
+                    pass
+                if all_done:
+                    while True:
+                        try:
+                            n = progress_queue.get_nowait()
+                            pbar.update(int(n))
+                        except _Empty:
+                            break
+                    break
+
+            for f in futures:
+                group_new_masks = f.get()
+                for sample_id, mask_np in group_new_masks.items():
+                    cached_candidate_masks[sample_id] = torch.from_numpy(mask_np)
+    finally:
+        pbar.close()
+
+    print(
+        f"[dataset] precompute done: "
+        f"new_masks={total_misses} groups={n_groups}"
+    )
 
 
 def _validate_record_group_consistency(
@@ -844,10 +1274,13 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     # always be computed; the cost_target transform is applied below. This
     # keeps ``task_min_costs`` available even when ``cost_target='neg_log'``,
     # which lets ``cost_target_regression`` pick a throughput variant.
-    records: List[JsonSampleRecord] = []
-    for path in raw_paths:
-        print(f"[dataset] loading {path}")
-        records.extend(load_json_samples(path, cost_target="norm_throughput"))
+    load_workers = getattr(config.data, "load_workers", None)
+    load_workers = int(load_workers) if load_workers is not None else 0
+    records: List[JsonSampleRecord] = _run_parallel_json_load(
+        raw_paths,
+        cost_target="norm_throughput",
+        requested_workers=load_workers,
+    )
     print(f"[dataset] loaded {len(records)} record(s)")
 
     task_min_costs = compute_task_min_costs(records)
@@ -874,9 +1307,24 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         f"unique_values={len(unique_shape_values)}"
     )
 
+    use_extent_tokens = extent_token_enabled(config)
+    # Populated lazily by the prepared_cache loop below (one entry per unique
+    # order_key, not per record) — extents are static loop bounds tied to
+    # (workload_key, target_kind, sketch_index, param_signature) so we can
+    # extract them once from the canonical generator and reuse across all
+    # records sharing that order_key.
+    extent_values_by_order_key: Dict[tuple, List[int]] = {}
+    canonical_extent_indices: List[int] = []
+    canonical_extent_labels: List[str] = []
+    unique_extent_values: Set[int] = set()
+
     prepared_cache: Dict[int, tuple[List[str], List[int]]] = {}
     order_cache: Dict[tuple, Dict[str, object]] = {}
     domain_values_by_name: Dict[str, Set[int]] = {}
+    # When extent_token is enabled we look up per-record extent values via
+    # the order_key; recording it once per record avoids rebuilding the tuple
+    # later.
+    record_order_key: Dict[int, tuple] = {}
     print("[dataset] building ordered parameter cache")
     for idx, record in enumerate(records, start=1):
         order_key = (
@@ -914,6 +1362,27 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                     if _step_idx is not None and _step_idx in _vec_step_indices:
                         continue
                 domain_values_by_name.setdefault(name, set()).update(int(v) for v in values)
+            # Capture SplitStep extents from this canonical generator. Static
+            # loop bounds depend only on (workload_key, target_kind,
+            # sketch_index) so reusing them across all records sharing the
+            # same order_key avoids per-record generator builds.
+            if use_extent_tokens:
+                sp_extents = dict(getattr(gen, "_sp_extents", {}))
+                sorted_indices = sorted(int(s) for s in sp_extents.keys())
+                if not canonical_extent_indices:
+                    canonical_extent_indices = list(sorted_indices)
+                    canonical_extent_labels = [
+                        f"sp_extent_{s}" for s in canonical_extent_indices
+                    ]
+                elif sorted_indices != canonical_extent_indices:
+                    raise ValueError(
+                        "SplitStep step-index layout differs across order_keys: "
+                        f"reference={canonical_extent_indices} got={sorted_indices} "
+                        f"on {record.sample_id}"
+                    )
+                extents = [int(sp_extents[s]) for s in canonical_extent_indices]
+                extent_values_by_order_key[order_key] = extents
+                unique_extent_values.update(extents)
         order = list(cached_meta["order"])
         budget_specs = list(cached_meta["budget_specs"])
         _apply_cached_order_metadata(record, order, budget_specs)
@@ -922,11 +1391,18 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             raise ValueError(f"{record.sample_id} is missing ordered params: {missing}")
         values = [int(record.params[name]) for name in order]
         prepared_cache[id(record)] = (order, values)
+        if use_extent_tokens:
+            record_order_key[id(record)] = order_key
         if idx == len(records):
             print(
                 f"[dataset] prepared {idx}/{len(records)} record(s); "
                 f"unique_orders={len(order_cache)}"
             )
+    if use_extent_tokens:
+        print(
+            f"[dataset] extent prefix: labels={canonical_extent_labels} "
+            f"unique_values={len(unique_extent_values)}"
+        )
 
     # Records in the loaded set must share the *same parameter order* (not
     # just the same count) so that a single decoder var-id layout applies to
@@ -992,16 +1468,20 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             train_orders.append(order)
             train_values.append(values)
 
-    # Register shape semantic labels as var-vocab entries and shape integer
-    # values as tokens. Shape values share the numeric token namespace with
-    # param values (``value_to_token`` returns str(int) for non-ur_ names).
-    if canonical_shape_labels:
-        all_orders = [list(canonical_shape_labels) + order for order in all_orders]
+    # Register shape (and extent) semantic labels as var-vocab entries and
+    # shape/extent integer values as tokens. Both share the numeric token
+    # namespace with param values (``value_to_token`` returns str(int) for
+    # non-ur_ names).
+    extra_var_labels: List[str] = list(canonical_shape_labels) + list(canonical_extent_labels)
+    if extra_var_labels:
+        all_orders = [list(extra_var_labels) + order for order in all_orders]
     domain_values_for_tokenizer = {
         name: sorted(values) for name, values in domain_values_by_name.items()
     }
     if unique_shape_values:
         domain_values_for_tokenizer["__shape__"] = sorted(int(v) for v in unique_shape_values)
+    if unique_extent_values:
+        domain_values_for_tokenizer["__extent__"] = sorted(int(v) for v in unique_extent_values)
 
     tokenizer = ParamTokenizer.build(
         train_ordered_names=train_orders,
@@ -1018,6 +1498,11 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     precompute_candidate_masks = bool(getattr(config.train, "precompute_candidate_masks", False))
     cached_candidate_masks: Dict[str, torch.Tensor] = {}
     cache_paths_by_workload: Dict[tuple[str, str], Path] = {}
+    # Workloads with masks computed since the last flush. Intermediate flushes
+    # only re-save these, avoiding the previous O(N_flush × N_workload)
+    # torch.save storm where every workload's pt file was rewritten on every
+    # flush tick.
+    dirty_workloads: Set[Tuple[str, str]] = set()
     # Precompute over ALL valid records (not just the current train+val split)
     # so the cache is seed-invariant: changing ``data.seed`` only reshuffles
     # which records land in train/val/test, never triggers recomputation.
@@ -1058,7 +1543,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 m = mask.to(dtype=torch.bool, device="cpu")
                 if needs_remap:
                     m = _remap_cached_mask_to_tokenizer(m, saved_id_to_token, tokenizer)
-                cached_candidate_masks[str(sample_id)] = m.clone()
+                cached_candidate_masks[str(sample_id)] = m
                 loaded_count += 1
             print(
                 f"[dataset] loaded cached masks for workload_key={workload_key} "
@@ -1074,6 +1559,43 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         shape_var_ids = [tokenizer.var_to_id[label] for label in shape_labels]
         return shape_token_ids, shape_var_ids
 
+    def _extent_ids_for_record(record: JsonSampleRecord) -> tuple[List[int], List[int]]:
+        if not use_extent_tokens or not canonical_extent_labels:
+            return [], []
+        order_key = record_order_key.get(id(record))
+        if order_key is None:
+            raise ValueError(
+                f"missing extent order_key for {record.sample_id}; "
+                "extent_token=True requires every record to be processed by "
+                "the prepared_cache loop"
+            )
+        extents = extent_values_by_order_key.get(order_key)
+        if extents is None:
+            raise ValueError(
+                f"missing extent values for order_key={order_key} "
+                f"(record {record.sample_id})"
+            )
+        extent_token_ids = [
+            tokenizer.token_to_id.get(str(int(v)), tokenizer.unk_id)
+            for v in extents
+        ]
+        extent_var_ids = [
+            tokenizer.var_to_id[label] for label in canonical_extent_labels
+        ]
+        return extent_token_ids, extent_var_ids
+
+    if precompute_candidate_masks:
+        _run_parallel_mask_precompute(
+            config=config,
+            precompute_records=precompute_records,
+            cached_candidate_masks=cached_candidate_masks,
+            cache_paths_by_workload=cache_paths_by_workload,
+            tokenizer=tokenizer,
+            prepared_cache=prepared_cache,
+            shape_ids_for_record=_shape_ids_for_record,
+            extent_ids_for_record=_extent_ids_for_record,
+        )
+
     def build_samples(
         subset: Sequence[JsonSampleRecord],
         include_candidate_masks: bool,
@@ -1085,6 +1607,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             for idx, record in enumerate(subset, start=1):
                 order, values = prepared_cache[id(record)]
                 shape_token_ids, shape_var_ids = _shape_ids_for_record(record)
+                extent_token_ids, extent_var_ids = _extent_ids_for_record(record)
                 items.append(
                     _build_prepared_sample(
                         record,
@@ -1095,6 +1618,8 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                         include_candidate_masks=False,
                         shape_token_ids=shape_token_ids,
                         shape_var_ids=shape_var_ids,
+                        extent_token_ids=extent_token_ids,
+                        extent_var_ids=extent_var_ids,
                     )
                 )
                 if idx % 1000 == 0 or idx == total:
@@ -1125,6 +1650,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             order, values = prepared_cache[id(record)]
             cached_mask = cached_candidate_masks.get(record.sample_id)
             shape_token_ids, shape_var_ids = _shape_ids_for_record(record)
+            extent_token_ids, extent_var_ids = _extent_ids_for_record(record)
             if cached_mask is not None:
                 sample = _build_prepared_sample(
                     record,
@@ -1135,8 +1661,10 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                     include_candidate_masks=False,
                     shape_token_ids=shape_token_ids,
                     shape_var_ids=shape_var_ids,
+                    extent_token_ids=extent_token_ids,
+                    extent_var_ids=extent_var_ids,
                 )
-                sample.candidate_masks = cached_mask.clone()
+                sample.candidate_masks = cached_mask
                 items_by_id[id(record)] = sample
                 current_group_key = None
                 current_oracle = None
@@ -1202,20 +1730,30 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 prefix_len=prefix_len,
                 shape_token_ids=shape_token_ids,
                 shape_var_ids=shape_var_ids,
+                extent_token_ids=extent_token_ids,
+                extent_var_ids=extent_var_ids,
             )
-            cached_candidate_masks[record.sample_id] = items_by_id[id(record)].candidate_masks.clone()
+            cached_candidate_masks[record.sample_id] = items_by_id[id(record)].candidate_masks
+            if record.workload_key and record.target_kind:
+                dirty_workloads.add((str(record.workload_key), str(record.target_kind)))
             current_order = list(order)
             current_values = list(values)
             computed_cache_count += 1
 
-            if persist_cache and (idx % _CANDIDATE_MASK_CACHE_FLUSH_EVERY == 0 or idx == total):
+            if (
+                persist_cache
+                and dirty_workloads
+                and (idx % _CANDIDATE_MASK_CACHE_FLUSH_EVERY == 0 or idx == total)
+            ):
                 _save_candidate_mask_cache_files(
                     config,
                     subset,
                     cached_candidate_masks,
                     cache_paths_by_workload,
                     tokenizer,
+                    restrict_to_workloads=set(dirty_workloads),
                 )
+                dirty_workloads.clear()
             if idx == total:
                 print(
                     f"[dataset] precomputed masks {idx}/{total} "

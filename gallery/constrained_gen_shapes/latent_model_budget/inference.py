@@ -155,7 +155,11 @@ def greedy_decode_sample(
     ordered_names = list(sample.ordered_param_names)
     full_var_ids = list(sample.encoder_var_ids)  # [shape_var | param_var]
 
-    decoder_input_ids: List[int] = list(sample.shape_token_ids) + [tokenizer.param_start_id]
+    decoder_input_ids: List[int] = (
+        list(sample.shape_token_ids)
+        + list(getattr(sample, "extent_token_ids", []))
+        + [tokenizer.param_start_id]
+    )
     decoded_values: List[int] = []
     decoded_token_ids: List[int] = []
 
@@ -236,40 +240,53 @@ def greedy_decode_batch(
         for sample in samples
     ]
     ordered_names = [list(sample.ordered_param_names) for sample in samples]
-    # ``encoder_var_ids`` = [shape_var_ids | param_var_ids]; reuse it so decoder
-    # var-id lookups at pos >= shape_len naturally pick the right param var.
+    # ``encoder_var_ids`` = [shape_var | extent_var | PARAM_START_VAR | param_var];
+    # reuse it so decoder var-id lookups at pos >= prefix_len naturally pick the
+    # right param var.
     ordered_var_ids = [list(sample.encoder_var_ids) for sample in samples]
-    shape_lens = [len(sample.shape_token_ids) for sample in samples]
+    prefix_token_ids_per_sample = [
+        list(sample.shape_token_ids) + list(getattr(sample, "extent_token_ids", []))
+        for sample in samples
+    ]
+    prefix_var_ids_per_sample = [
+        list(sample.shape_var_ids) + list(getattr(sample, "extent_var_ids", []))
+        for sample in samples
+    ]
+    prefix_lens = [len(p) for p in prefix_token_ids_per_sample]
     max_steps = max(len(names) for names in ordered_names)
-    max_shape_len = max(shape_lens) if shape_lens else 0
+    max_prefix_len = max(prefix_lens) if prefix_lens else 0
     batch_size = len(samples)
     decoder_input_ids = torch.full(
-        (batch_size, max_shape_len + max_steps + 1),
+        (batch_size, max_prefix_len + max_steps + 1),
         tokenizer.pad_id,
         dtype=torch.long,
         device=device,
     )
     decoder_var_ids = torch.full(
-        (batch_size, max_shape_len + max_steps + 1),
+        (batch_size, max_prefix_len + max_steps + 1),
         tokenizer.var_pad_id,
         dtype=torch.long,
         device=device,
     )
     current_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
     for sample_idx, sample in enumerate(samples):
-        shape_len = shape_lens[sample_idx]
-        if shape_len:
-            decoder_input_ids[sample_idx, :shape_len] = torch.tensor(
-                sample.shape_token_ids, dtype=torch.long, device=device
+        prefix_len = prefix_lens[sample_idx]
+        if prefix_len:
+            decoder_input_ids[sample_idx, :prefix_len] = torch.tensor(
+                prefix_token_ids_per_sample[sample_idx],
+                dtype=torch.long,
+                device=device,
             )
-            decoder_var_ids[sample_idx, :shape_len] = torch.tensor(
-                sample.shape_var_ids, dtype=torch.long, device=device
+            decoder_var_ids[sample_idx, :prefix_len] = torch.tensor(
+                prefix_var_ids_per_sample[sample_idx],
+                dtype=torch.long,
+                device=device,
             )
-        decoder_input_ids[sample_idx, shape_len] = tokenizer.param_start_id
-        # BOS position var = first param var (= ordered_var_ids[shape_len]).
-        if len(ordered_var_ids[sample_idx]) > shape_len:
-            decoder_var_ids[sample_idx, shape_len] = int(ordered_var_ids[sample_idx][shape_len])
-        current_lengths[sample_idx] = shape_len + 1
+        decoder_input_ids[sample_idx, prefix_len] = tokenizer.param_start_id
+        # BOS position var = first param var (= ordered_var_ids[prefix_len]).
+        if len(ordered_var_ids[sample_idx]) > prefix_len:
+            decoder_var_ids[sample_idx, prefix_len] = int(ordered_var_ids[sample_idx][prefix_len])
+        current_lengths[sample_idx] = prefix_len + 1
 
     decoded_values: List[List[int]] = [[] for _ in samples]
     decoded_token_ids: List[List[int]] = [[] for _ in samples]
