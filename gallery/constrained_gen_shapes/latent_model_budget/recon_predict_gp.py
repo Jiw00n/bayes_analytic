@@ -22,14 +22,29 @@ from .tokenizer import ParamTokenizer
 
 
 SymMapKey = Tuple[Tuple[str, int], ...]
+# Task-aware cache key: (workload_key, sym_map). Including workload_key in the
+# key prevents cross-task contamination of the measurement cache — distinct
+# tasks frequently produce overlapping sym_maps (e.g. small integer tile sizes)
+# and without the prefix a small workload's fast cost would leak into a larger
+# workload's walk via the sym_map-only lookup.
+TaskSymMapKey = Tuple[str, SymMapKey]
 
 
 def make_sym_map_key(sym_map: Dict[str, int]) -> SymMapKey:
     return tuple(sorted((str(k), int(v)) for k, v in sym_map.items()))
 
 
+def make_task_sym_map_key(
+    workload_key: Optional[str], sym_map: Dict[str, int]
+) -> TaskSymMapKey:
+    """Task-aware cache key. ``workload_key`` is normalized to ``""`` when
+    missing so the tuple shape is stable and comparable."""
+    return (str(workload_key or ""), make_sym_map_key(sym_map))
+
+
 class WalkSampleBuffer:
-    """Dedup buffer of (sym_map -> PreparedSample) collected from latent walks.
+    """Dedup buffer of (task_sym_map -> PreparedSample) collected from latent
+    walks.
 
     Each entry corresponds to a measured walk candidate whose cost is the
     measured ``mean_cost`` (already in negative-log scale, matching dataset
@@ -37,16 +52,16 @@ class WalkSampleBuffer:
     """
 
     def __init__(self) -> None:
-        self._samples: Dict[SymMapKey, PreparedSample] = {}
+        self._samples: Dict[TaskSymMapKey, PreparedSample] = {}
 
     def __len__(self) -> int:
         return len(self._samples)
 
-    def __contains__(self, key: SymMapKey) -> bool:
+    def __contains__(self, key: TaskSymMapKey) -> bool:
         return key in self._samples
 
-    def add(self, key: SymMapKey, sample: PreparedSample) -> None:
-        # latest walk wins for the same sym_map (cost may have refined)
+    def add(self, key: TaskSymMapKey, sample: PreparedSample) -> None:
+        # latest walk wins for the same (workload_key, sym_map)
         self._samples[key] = sample
 
     def samples(self) -> List[PreparedSample]:

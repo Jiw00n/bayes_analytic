@@ -10,6 +10,8 @@ try:
 except Exception:  # pragma: no cover
     tqdm = None
 
+from torch.utils.data import DataLoader
+
 from .adapter import GeneratorRegistry
 from .dataset import collate_prepared_samples
 from .inference import greedy_decode_batch
@@ -17,6 +19,32 @@ from .model import LatentParamVAE
 from .recon_predict_gp import fit_gp_recon_predictor
 from .recon_predict_lgbm import fit_lgbm_ranker_recon_predictor
 from .tokenizer import ParamTokenizer
+
+
+def _build_eval_loader(
+    dataset,
+    tokenizer: ParamTokenizer,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+) -> DataLoader:
+    """Background-worker DataLoader for read-only eval / ridge passes. Lets
+    the next batch's collation overlap with the current GPU step instead of
+    serializing on the main thread (the source of the 10–40% GPU utilization
+    during eval/ridge)."""
+    nw = max(0, int(num_workers))
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=nw,
+        collate_fn=lambda b: collate_prepared_samples(b, tokenizer),
+        pin_memory=bool(pin_memory),
+    )
+    if nw > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
+    return DataLoader(**kwargs)
 
 
 VALID_REENCODE_PREDICTOR_NAMES = (
@@ -101,8 +129,8 @@ def _build_reencode_predictor(
             dataset=bundle.train_dataset,
             tokenizer=tokenizer,
             device=device,
-            top_k=int(getattr(config.train, "latent_walk_predict_gp_top_k", 800)),
-            random_n=int(getattr(config.train, "latent_walk_predict_gp_random_n", 200)),
+            top_k=int(getattr(config.latent_walk, "predict_gp_top_k", 800)),
+            random_n=int(getattr(config.latent_walk, "predict_gp_random_n", 200)),
             batch_size=config.eval.batch_size,
             seed=int(getattr(config.data, "seed", 0)),
             walk_buffer=None,
@@ -113,8 +141,8 @@ def _build_reencode_predictor(
             dataset=bundle.train_dataset,
             tokenizer=tokenizer,
             device=device,
-            top_k=int(getattr(config.train, "latent_walk_predict_gp_top_k", 800)),
-            random_n=int(getattr(config.train, "latent_walk_predict_gp_random_n", 200)),
+            top_k=int(getattr(config.latent_walk, "predict_gp_top_k", 800)),
+            random_n=int(getattr(config.latent_walk, "predict_gp_random_n", 200)),
             batch_size=config.eval.batch_size,
             seed=int(getattr(config.data, "seed", 0)),
             walk_buffer=None,
@@ -205,19 +233,22 @@ def _teacher_forcing_accuracy_stats(
     targets: torch.Tensor,
     candidate_masks: torch.Tensor,
     pad_id: int,
-) -> tuple[int, int, int, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns 0-d device tensors so the caller can decide when to incur the
+    GPU→CPU sync. The previous version's per-call ``.item()`` quartet stalled
+    every training batch four extra times."""
+    if targets.dim() != 2:
+        raise ValueError("teacher forcing accuracy expects [batch, seq] targets")
     masked_logits = logits.masked_fill(~candidate_masks, float("-inf"))
     pred_ids = torch.argmax(masked_logits, dim=-1)
     singleton_mask = _build_singleton_position_mask(targets, candidate_masks, pad_id)
     valid_mask = targets.ne(int(pad_id)) & (~singleton_mask)
-    token_correct = int((pred_ids.eq(targets) & valid_mask).sum().item())
-    token_total = int(valid_mask.sum().item())
-    if targets.dim() != 2:
-        raise ValueError("teacher forcing accuracy expects [batch, seq] targets")
+    token_correct = (pred_ids.eq(targets) & valid_mask).sum()
+    token_total = valid_mask.sum()
     sample_valid = valid_mask.any(dim=-1)
     sample_all_correct = pred_ids.eq(targets) | (~valid_mask)
-    exact_count = int((sample_all_correct.all(dim=-1) & sample_valid).sum().item())
-    sample_total = int(sample_valid.sum().item())
+    exact_count = (sample_all_correct.all(dim=-1) & sample_valid).sum()
+    sample_total = sample_valid.sum()
     return token_correct, token_total, exact_count, sample_total
 
 
@@ -400,6 +431,7 @@ def _build_named_latent_cost_ridges(latent_cost_ridges: Sequence[dict] | None) -
 
 
 @torch.no_grad()
+@torch.no_grad()
 def evaluate_teacher_forcing(
     model: LatentParamVAE,
     dataset,
@@ -408,19 +440,26 @@ def evaluate_teacher_forcing(
     device: torch.device,
     batch_size: int = 64,
     use_compressed: bool = False,
+    num_workers: int = 0,
+    loader: DataLoader | None = None,
 ) -> Dict[str, float]:
     model.eval()
 
-    token_correct = 0
-    token_total = 0
-    exact_count = 0
-    sample_total = 0
-    samples = list(dataset.samples)
-    stride = max(int(batch_size), 1)
+    token_correct = torch.zeros((), device=device, dtype=torch.long)
+    token_total = torch.zeros((), device=device, dtype=torch.long)
+    exact_count = torch.zeros((), device=device, dtype=torch.long)
+    sample_total = torch.zeros((), device=device, dtype=torch.long)
 
-    for start in range(0, len(samples), stride):
-        batch_samples = samples[start:start + stride]
-        batch = collate_prepared_samples(batch_samples, tokenizer)
+    if loader is None:
+        loader = _build_eval_loader(
+            dataset,
+            tokenizer,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=device.type == "cuda",
+        )
+
+    for batch in loader:
         batch = _batch_to_device(batch, device)
         candidate_masks = _build_teacher_forcing_candidate_masks(
             batch,
@@ -455,14 +494,18 @@ def evaluate_teacher_forcing(
                 tokenizer.pad_id,
             )
         )
-        token_correct += int(batch_token_correct)
-        token_total += int(batch_token_total)
-        exact_count += int(batch_exact_count)
-        sample_total += int(batch_sample_total)
+        token_correct = token_correct + batch_token_correct.detach()
+        token_total = token_total + batch_token_total.detach()
+        exact_count = exact_count + batch_exact_count.detach()
+        sample_total = sample_total + batch_sample_total.detach()
 
+    token_correct_i = int(token_correct.item())
+    token_total_i = int(token_total.item())
+    exact_count_i = int(exact_count.item())
+    sample_total_i = int(sample_total.item())
     return {
-        "token_accuracy": token_correct / max(token_total, 1),
-        "full_sequence_exact_match": exact_count / max(sample_total, 1),
+        "token_accuracy": token_correct_i / max(token_total_i, 1),
+        "full_sequence_exact_match": exact_count_i / max(sample_total_i, 1),
     }
 
 
@@ -526,6 +569,9 @@ def evaluate_cost_ranking(
     batch_size: int = 64,
     latent_cost_ridge: dict | None = None,
     latent_cost_ridges: Dict[str, dict] | None = None,
+    num_workers: int = 0,
+    loader: DataLoader | None = None,
+    encoded: Dict[str, object] | None = None,
 ) -> Dict[str, float]:
     model.eval()
 
@@ -544,30 +590,50 @@ def evaluate_cost_ranking(
         )
         scored_by_source[source_name] = []
 
-    samples = list(dataset.samples)
-    stride = max(int(batch_size), 1)
+    if encoded is None:
+        encoded = encode_dataset(
+            model,
+            dataset,
+            tokenizer,
+            device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            loader=loader,
+        )
+    z_all = encoded["z"]
+    cost_all = encoded["cost"]
+    mask_all = encoded["cost_mask"]
+    sample_ids_all = list(encoded["sample_ids"])
+    if z_all.numel() == 0:
+        return {}
 
-    for start in range(0, len(samples), stride):
-        batch_samples = samples[start:start + stride]
-        batch = collate_prepared_samples(batch_samples, tokenizer)
-        enc_ids = batch["encoder_token_ids"].to(device, non_blocking=device.type == "cuda")
-        enc_var_ids = batch["encoder_var_ids"].to(device, non_blocking=device.type == "cuda")
-        enc_pad = enc_ids.eq(tokenizer.pad_id)
-        _, _, z, _ = model.encode(enc_ids, enc_var_ids, enc_pad, deterministic=True)
-        cost_head_pred = model.cost_head(z).squeeze(-1).detach().cpu().tolist()
-        vector_preds = {
-            source_name: (z @ weight + bias).detach().cpu().tolist()
-            for source_name, (weight, bias) in vector_weights.items()
-        }
+    # cost_head + ridge predictions for all samples in one batched call. Way
+    # cheaper than per-batch CPU scatter since we only run cost_head and a
+    # matmul over z (already on CPU); push to device only for cost_head.
+    z_dev = z_all.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
+    cost_head_pred_all = model.cost_head(z_dev).squeeze(-1).detach().cpu().tolist()
+    vector_preds_all: Dict[str, list] = {}
+    for source_name, (weight, bias) in vector_weights.items():
+        weight_cpu = weight.detach().to(device="cpu", dtype=torch.float32)
+        preds = (z_all @ weight_cpu + float(bias)).tolist()
+        vector_preds_all[source_name] = preds
 
-        for row_idx, sample in enumerate(batch_samples):
-            if sample.cost is None or not math.isfinite(float(sample.cost)):
-                continue
-            actual_cost = float(sample.cost)
-            sample_id = str(sample.sample_id)
-            scored_by_source["cost_head"].append((float(cost_head_pred[row_idx]), actual_cost, sample_id))
-            for source_name, pred_values in vector_preds.items():
-                scored_by_source[source_name].append((float(pred_values[row_idx]), actual_cost, sample_id))
+    cost_list = cost_all.tolist()
+    mask_list = mask_all.tolist()
+    for row_idx in range(len(sample_ids_all)):
+        if not bool(mask_list[row_idx]):
+            continue
+        actual_cost = float(cost_list[row_idx])
+        if not math.isfinite(actual_cost):
+            continue
+        sample_id = sample_ids_all[row_idx]
+        scored_by_source["cost_head"].append(
+            (float(cost_head_pred_all[row_idx]), actual_cost, sample_id)
+        )
+        for source_name, preds in vector_preds_all.items():
+            scored_by_source[source_name].append(
+                (float(preds[row_idx]), actual_cost, sample_id)
+            )
 
     if not any(scored_by_source.values()):
         return {}
@@ -605,6 +671,80 @@ def evaluate_cost_ranking(
 
 
 @torch.no_grad()
+def encode_dataset(
+    model: LatentParamVAE,
+    dataset,
+    tokenizer: ParamTokenizer,
+    device: torch.device,
+    *,
+    batch_size: int = 128,
+    num_workers: int = 0,
+    loader: DataLoader | None = None,
+) -> Dict[str, object]:
+    """Single forward pass over the encoder. Returns CPU tensors keyed by
+    ``z`` / ``cost`` / ``cost_mask`` plus a ``sample_ids`` list. ``cost`` is
+    in the loader's ``cost_target`` space (caller converts as needed).
+
+    Used by both ridge fit and cost-ranking evaluation so a per-epoch encode
+    happens exactly once even when both consumers (and val + train splits)
+    need the same z's.
+    """
+    model.eval()
+    if loader is None:
+        loader = _build_eval_loader(
+            dataset,
+            tokenizer,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=device.type == "cuda",
+        )
+    z_chunks: List[torch.Tensor] = []
+    cost_chunks: List[torch.Tensor] = []
+    mask_chunks: List[torch.Tensor] = []
+    sample_ids: List[str] = []
+    for batch in loader:
+        enc_ids = batch["encoder_token_ids"].to(device, non_blocking=device.type == "cuda")
+        enc_var_ids = batch["encoder_var_ids"].to(device, non_blocking=device.type == "cuda")
+        enc_pad = enc_ids.eq(tokenizer.pad_id)
+        _, _, z, _ = model.encode(enc_ids, enc_var_ids, enc_pad, deterministic=True)
+        z_chunks.append(z.detach().to(device="cpu", dtype=torch.float32))
+        cost_chunks.append(batch["costs"].detach().to(dtype=torch.float32))
+        mask_chunks.append(batch["cost_mask"].detach().to(dtype=torch.bool))
+        sample_ids.extend(str(x) for x in batch["sample_ids"])
+    if not z_chunks:
+        return {
+            "z": torch.zeros((0, 0), dtype=torch.float32),
+            "cost": torch.zeros((0,), dtype=torch.float32),
+            "cost_mask": torch.zeros((0,), dtype=torch.bool),
+            "sample_ids": [],
+        }
+    return {
+        "z": torch.cat(z_chunks, dim=0),
+        "cost": torch.cat(cost_chunks, dim=0),
+        "cost_mask": torch.cat(mask_chunks, dim=0),
+        "sample_ids": sample_ids,
+    }
+
+
+def _concat_encoded(parts: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    """Stack the per-dataset outputs of :func:`encode_dataset` into one."""
+    parts = [p for p in parts if p and len(p["sample_ids"]) > 0]
+    if not parts:
+        return {
+            "z": torch.zeros((0, 0), dtype=torch.float32),
+            "cost": torch.zeros((0,), dtype=torch.float32),
+            "cost_mask": torch.zeros((0,), dtype=torch.bool),
+            "sample_ids": [],
+        }
+    return {
+        "z": torch.cat([p["z"] for p in parts], dim=0),
+        "cost": torch.cat([p["cost"] for p in parts], dim=0),
+        "cost_mask": torch.cat([p["cost_mask"] for p in parts], dim=0),
+        "sample_ids": [sid for p in parts for sid in p["sample_ids"]],
+    }
+
+
+@torch.no_grad()
 def fit_latent_cost_ridge(
     model: LatentParamVAE,
     dataset,
@@ -617,49 +757,44 @@ def fit_latent_cost_ridge(
     cost_target: str = "neg_log",
     cost_target_regression: str | None = None,
     task_min_cost: float | None = None,
+    num_workers: int = 0,
+    loader: DataLoader | None = None,
+    encoded: Dict[str, object] | None = None,
 ) -> dict | None:
     model.eval()
 
     # Ridge is fit in ``cost_target_regression`` space (defaults to
     # ``cost_target``). ``batch["costs"]`` is in ``cost_target`` space, so we
-    # convert it once per batch before fitting.
+    # convert it once before fitting.
     fit_target = cost_target_regression or cost_target
     if fit_target != cost_target:
         from .train_epoch import _convert_cost_tensor_space
     else:
         _convert_cost_tensor_space = None  # type: ignore[assignment]
 
-    latent_batches: List[torch.Tensor] = []
-    cost_batches: List[torch.Tensor] = []
-    samples = list(dataset.samples)
-    stride = max(int(batch_size), 1)
-
-    for start in range(0, len(samples), stride):
-        batch_samples = samples[start:start + stride]
-        batch = collate_prepared_samples(batch_samples, tokenizer)
-        valid_mask = batch["cost_mask"]
-        if not bool(valid_mask.any()):
-            continue
-
-        enc_ids = batch["encoder_token_ids"].to(device, non_blocking=device.type == "cuda")
-        enc_var_ids = batch["encoder_var_ids"].to(device, non_blocking=device.type == "cuda")
-        enc_pad = enc_ids.eq(tokenizer.pad_id)
-        _, _, z, _ = model.encode(enc_ids, enc_var_ids, enc_pad, deterministic=True)
-
-        valid_mask_device = valid_mask.to(device=device, non_blocking=device.type == "cuda")
-        latent_batches.append(z[valid_mask_device].detach().cpu().to(dtype=torch.float64))
-        costs_for_fit = batch["costs"][valid_mask]
-        if _convert_cost_tensor_space is not None:
-            costs_for_fit = _convert_cost_tensor_space(
-                costs_for_fit, cost_target, fit_target, task_min_cost
-            )
-        cost_batches.append(costs_for_fit.detach().cpu().to(dtype=torch.float64))
-
-    if not latent_batches:
+    if encoded is None:
+        encoded = encode_dataset(
+            model,
+            dataset,
+            tokenizer,
+            device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            loader=loader,
+        )
+    z_all = encoded["z"]
+    cost_all = encoded["cost"]
+    mask_all = encoded["cost_mask"]
+    if int(mask_all.sum().item()) == 0:
         return None
-
-    x = torch.cat(latent_batches, dim=0)
-    y = torch.cat(cost_batches, dim=0)
+    z_valid = z_all[mask_all]
+    cost_valid = cost_all[mask_all]
+    if _convert_cost_tensor_space is not None:
+        cost_valid = _convert_cost_tensor_space(
+            cost_valid, cost_target, fit_target, task_min_cost
+        )
+    x = z_valid.to(dtype=torch.float64)
+    y = cost_valid.to(dtype=torch.float64)
     num_samples, latent_dim = x.shape
 
     ones = torch.ones((num_samples, 1), dtype=torch.float64)
@@ -731,7 +866,21 @@ def fit_latent_cost_ridges(
     cost_target: str = "neg_log",
     cost_target_regression: str | None = None,
     task_min_cost: float | None = None,
+    loader: DataLoader | None = None,
+    encoded: Dict[str, object] | None = None,
 ) -> List[dict]:
+    if encoded is None:
+        # Encode once even when fitting multiple alphas — the previous code
+        # ran a fresh forward per alpha, paying ``alphas × N_samples`` of
+        # encoder cost.
+        encoded = encode_dataset(
+            model,
+            dataset,
+            tokenizer,
+            device,
+            batch_size=batch_size,
+            loader=loader,
+        )
     fitted: List[dict] = []
     for alpha in alphas:
         payload = fit_latent_cost_ridge(
@@ -746,6 +895,8 @@ def fit_latent_cost_ridges(
             cost_target=cost_target,
             cost_target_regression=cost_target_regression,
             task_min_cost=task_min_cost,
+            loader=loader,
+            encoded=encoded,
         )
         if payload is not None:
             fitted.append(payload)

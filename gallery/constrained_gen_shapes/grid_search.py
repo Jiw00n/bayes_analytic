@@ -23,21 +23,20 @@ else:
 
 
 SEARCH_SPACE = {
+    "train.resume": [True],
     "wandb.project": ["shapes"],
     # "wandb.project": [None],
 
 
-    # 해볼 것
-    "model.vocab_align_to":  [None, None, 48  ],
     
     # "data.pad_vocab_to": [48],
     # "generator.hw_param": [{}, {"max_vthread_extent": 15}],
     # "generator.hw_param": [{"max_vthread_extent": 15}],
-    "data.seed": [42,0,1],
+    # "data.seed": [42,0,1],
     # "model.seed": [0],
 
     "train.beta_end": [0.003],
-    "train.beta_warmup_epochs": [10],
+    "train.beta_warmup_epochs": [5],
     "train.order_nce": [True],
     "train.nce_mu": [False],
     "model.adaln": [True],
@@ -51,21 +50,21 @@ SEARCH_SPACE = {
     # "model.nhead": [2, 4],
     # "model.latent_token_count": [4],
 
-    "train.latent_walk_every_n_epochs": [10],
-    "train.latent_walk_use_cost_head": [False],
+    "latent_walk.every_n_epochs": [2],
+    "latent_walk.use_cost_head": [False],
 
-    "train.num_epochs": [100],
-    "train.learning_rate": [5e-4],
+    "train.num_epochs": [20],
+    "train.learning_rate": [3e-4],
     "train.lambda_nce": [0.2],
     "train.tau_nce": [0.2],
-    "train.latent_walk_top_k": [3],
+    "latent_walk.top_k": [1],
 
     # "train.cobo_sample_weighting": [True],
     # "train.cobo_apply_to": [["cost", "nce"]],
     # "train.weight_quantile": [0.85],         # cobo, weighted_cost_Vec
     # "train.weight_sigma": [0.5],        # cobo, weighted_cost_Vec
 
-    "train.lambda_cost": [0.01],
+    "train.lambda_cost": [0.0005],
 
     "sampling.strategy": ["sampling"],
     "sampling.top_k": [2],
@@ -76,6 +75,7 @@ SEARCH_SPACE = {
 
     # "train.label_smoothing": [0.02, 0.05, 0.1, 0.2],
     # "train.lambda_recon": [1.0],
+    "latent_walk.task_indices": [(302, 392, 1270, 1490, 1530, 1609, 2040)],
 }
 
 # BEST_METRIC = "val_full_sequence_exact_match"

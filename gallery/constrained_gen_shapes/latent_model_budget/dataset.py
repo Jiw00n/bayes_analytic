@@ -69,6 +69,52 @@ def _remap_cached_mask_to_tokenizer(
     return new_mask
 
 
+def _build_remap_index(
+    saved_id_to_token: Sequence[str],
+    tokenizer: "ParamTokenizer",
+) -> Optional[torch.Tensor]:
+    """Build the ``(old_vocab,)`` long tensor mapping each old token id to its
+    new id under ``tokenizer``. Returns ``None`` if no remap is needed (vocab
+    identical) so the caller can skip the OR-aggregation entirely."""
+    saved_id_to_token = list(saved_id_to_token)
+    current_vocab = list(tokenizer.id_to_token)
+    if saved_id_to_token == current_vocab:
+        return None
+    unk_id = int(tokenizer.unk_id)
+    indices = torch.empty((len(saved_id_to_token),), dtype=torch.long)
+    token_to_id = tokenizer.token_to_id
+    for old_id, token in enumerate(saved_id_to_token):
+        new_id = token_to_id.get(token)
+        indices[old_id] = int(new_id) if new_id is not None else unk_id
+    return indices
+
+
+def _remap_stacked_masks(
+    masks: torch.Tensor,
+    remap_index: torch.Tensor,
+    new_vocab_size: int,
+) -> torch.Tensor:
+    """Vectorized remap of a stack of bool masks ``(N, seq_len, old_vocab)``
+    via ``remap_index: (old_vocab,)``. Replaces the per-sample / per-token
+    Python loop that previously dominated mask-cache load time. Multiple old
+    tokens can collapse into the same new id (e.g., absent tokens to
+    ``unk_id``); we OR-aggregate by summing int8 values and thresholding.
+    """
+    if masks.dim() != 3:
+        raise ValueError(f"expected (N, seq_len, old_vocab), got {tuple(masks.shape)}")
+    n, seq_len, old_vocab = masks.shape
+    if int(remap_index.shape[0]) != old_vocab:
+        # Truncate or pad — matches the legacy single-mask break-on-overflow.
+        usable = min(int(remap_index.shape[0]), old_vocab)
+        masks = masks[:, :, :usable]
+        remap_index = remap_index[:usable]
+        old_vocab = usable
+    masks_int = masks.to(dtype=torch.int8)
+    accum = torch.zeros((n, seq_len, new_vocab_size), dtype=torch.int8)
+    accum.index_add_(-1, remap_index.to(dtype=torch.long), masks_int)
+    return accum > 0
+
+
 @dataclass
 class PreparedSample:
     sample_id: str
@@ -447,10 +493,72 @@ def _expand_json_paths(entries: Sequence[str]) -> List[Path]:
     return raw_paths
 
 
+def _family_from_config(config) -> Optional[str]:
+    """Derive the dataset family (e.g.
+    ``nn_contrib_conv2d_winograd_without_weight_transform``) from the first
+    configured ``json_paths`` entry. The family is the second-to-last directory
+    on those paths
+    (``.../{family}/{target}/{N}_*.json``). Returns ``None`` when the path
+    layout is too shallow to identify it."""
+    paths = getattr(getattr(config, "data", None), "json_paths", None) or []
+    for p in paths:
+        if not p:
+            continue
+        parents = Path(p).parents
+        if len(parents) >= 2:
+            return parents[1].name
+    return None
+
+
 def _candidate_mask_cache_dir(config) -> Path:
-    cache_dir = Path(config.train.checkpoint_dir).expanduser().resolve() / "candidate_mask_cache"
+    cache_dir = Path(config.train.checkpoint_dir).expanduser().resolve()
+    family = _family_from_config(config)
+    if family and cache_dir.name != family:
+        cache_dir = cache_dir / family
+    cache_dir = cache_dir / "candidate_mask_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+def _dataset_cache_dir(config) -> Path:
+    """Disk cache for parsed records and ordered-parameter metadata. Sibling
+    of ``candidate_mask_cache`` so all per-family preprocessing artifacts live
+    next to each other."""
+    cache_dir = Path(config.train.checkpoint_dir).expanduser().resolve()
+    family = _family_from_config(config)
+    if family and cache_dir.name != family:
+        cache_dir = cache_dir / family
+    cache_dir = cache_dir / "dataset_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _records_cache_fingerprint(json_paths: Sequence[Path]) -> str:
+    """Hash over (path, size, mtime_ns). Renaming or rewriting any source
+    JSON yields a fresh fingerprint and invalidates the cache."""
+    payload: List[tuple] = []
+    for p in sorted(json_paths, key=str):
+        try:
+            st = Path(p).stat()
+            payload.append((str(p), int(st.st_size), int(st.st_mtime_ns)))
+        except OSError:
+            payload.append((str(p), -1, -1))
+    text = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def _order_cache_fingerprint(records_fingerprint: str, config) -> str:
+    """Order-cache contents are determined by which records exist (encoded
+    via ``records_fingerprint``) plus the generator settings and the
+    budget/extent flags driving how generators get built."""
+    payload = {
+        "records": records_fingerprint,
+        "generator": _generator_cache_suffix(config),
+        "budget": budget_enabled(config),
+        "extent": extent_token_enabled(config),
+    }
+    text = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def budget_enabled(config_or_payload=None) -> bool:
@@ -580,9 +688,14 @@ def _generator_cache_suffix(config) -> str:
     return "_" + "_".join(parts)
 
 
-def _candidate_mask_cache_path_for_workload(config, workload_key: str, target_kind: str) -> Path:
-    cache_dir = _candidate_mask_cache_dir(config)
-    stem = _sanitize_workload_key(workload_key, target_kind)
+def _candidate_mask_cache_tag(config) -> str:
+    """Compose the trailing tag (everything past the stem) that identifies a
+    cache variant: ``{cache_version}_{budget_tag}{compressed?}{extent?}{generator?}``.
+
+    This is what previously rode along on the filename as a suffix; promoting
+    it to a subdirectory keeps each variant's per-task ``.pt`` files grouped
+    so it's straightforward to delete/inspect/swap a whole variant at once.
+    """
     budget_tag = "with_budget" if budget_enabled(config) else "no_budget"
     compressed_tag = (
         "_compressed"
@@ -591,10 +704,19 @@ def _candidate_mask_cache_path_for_workload(config, workload_key: str, target_ki
     )
     generator_tag = _generator_cache_suffix(config)
     extent_tag = "_withExtent" if extent_token_enabled(config) else ""
-    return cache_dir / (
-        f"{stem}_{_CANDIDATE_MASK_CACHE_VERSION}_{budget_tag}"
-        f"{compressed_tag}{extent_tag}{generator_tag}.pt"
+    return (
+        f"{_CANDIDATE_MASK_CACHE_VERSION}_{budget_tag}"
+        f"{compressed_tag}{extent_tag}{generator_tag}"
     )
+
+
+def _candidate_mask_cache_path_for_workload(config, workload_key: str, target_kind: str) -> Path:
+    cache_dir = _candidate_mask_cache_dir(config)
+    stem = _sanitize_workload_key(workload_key, target_kind)
+    tag = _candidate_mask_cache_tag(config)
+    variant_dir = cache_dir / tag
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    return variant_dir / f"{stem}.pt"
 
 
 def _normalize_param_signature(signature: Sequence[str] | None) -> tuple[str, ...]:
@@ -1139,6 +1261,177 @@ def _run_parallel_mask_precompute(
     )
 
 
+def _order_cache_worker(args: tuple) -> Dict[str, object]:
+    """Build a single ScheduleGenerator for one ``order_key`` and extract the
+    metadata the order_cache loop needs. Module-level so it pickles cleanly
+    for ``multiprocessing.Pool``.
+
+    The worker rebuilds its own ``GeneratorRegistry`` so generator caches and
+    TVM C-extension state stay process-local. Returns plain Python types only
+    (lists / dicts of ints + strings) so the result IPC trivially.
+    """
+    (
+        order_key,
+        record_serialized,
+        registry_init_args,
+        include_budget,
+        use_extent_tokens,
+    ) = args
+
+    import pickle as _pickle
+
+    from .adapter import GeneratorRegistry
+
+    registry = GeneratorRegistry(**registry_init_args)
+    record = _pickle.loads(record_serialized)
+
+    gen = _get_generator_for_record(record, registry)
+    order = get_model_param_order(gen, include_budget=include_budget)
+    budget_specs = _extract_budget_specs(gen)
+    generator_domain_values = _collect_generator_domain_values(
+        gen, order, include_budget=include_budget
+    )
+    vec_step_indices = list(getattr(gen, "_vectorize_split_step_indices", set()))
+    sp_extents_dict: Dict[int, int] = {}
+    if use_extent_tokens:
+        sp_extents = dict(getattr(gen, "_sp_extents", {}))
+        sp_extents_dict = {int(k): int(v) for k, v in sp_extents.items()}
+
+    return {
+        "order_key": order_key,
+        "order": list(order),
+        "budget_specs": list(budget_specs),
+        "generator_domain_values": {
+            str(k): [int(x) for x in v]
+            for k, v in generator_domain_values.items()
+        },
+        "vec_step_indices": [int(i) for i in vec_step_indices],
+        "sp_extents": sp_extents_dict,
+    }
+
+
+def _run_parallel_order_cache_build(
+    *,
+    config,
+    records: Sequence[JsonSampleRecord],
+    include_budget: bool,
+    use_extent_tokens: bool,
+) -> Optional[tuple]:
+    """Pre-populate the order_cache by building one generator per unique
+    ``order_key`` across worker processes. Returns the populated
+    ``(order_cache, domain_values_by_name, extent_values_by_order_key,
+    canonical_extent_indices, canonical_extent_labels, unique_extent_values)``
+    tuple; falls back to ``None`` when fewer than 2 workers would be used so
+    the caller can run the existing sequential path.
+    """
+    import os as _os
+    import pickle as _pickle
+
+    sample_record_by_key: Dict[tuple, JsonSampleRecord] = {}
+    for record in records:
+        order_key = (
+            record.workload_key,
+            record.target_kind,
+            record.task_index,
+            record.sketch_index,
+            _normalize_param_signature(record.param_signature),
+        )
+        sample_record_by_key.setdefault(order_key, record)
+
+    n_unique = len(sample_record_by_key)
+    if n_unique == 0:
+        return None
+
+    requested = getattr(getattr(config, "train", None), "precompute_workers", None)
+    requested = int(requested) if requested is not None else 0
+    if requested <= 0:
+        n_workers = min(_os.cpu_count() or 1, n_unique)
+    else:
+        n_workers = min(requested, n_unique)
+    if n_workers < 2:
+        return None
+
+    print(
+        f"[dataset] launching parallel order-cache build: "
+        f"workers={n_workers} unique_orders={n_unique}"
+    )
+
+    registry_init_args = _build_registry_init_args(config)
+    per_group_args = [
+        (
+            order_key,
+            _pickle.dumps(record),
+            registry_init_args,
+            include_budget,
+            use_extent_tokens,
+        )
+        for order_key, record in sample_record_by_key.items()
+    ]
+
+    order_cache: Dict[tuple, Dict[str, object]] = {}
+    domain_values_by_name: Dict[str, Set[int]] = {}
+    extent_values_by_order_key: Dict[tuple, List[int]] = {}
+    canonical_extent_indices: List[int] = []
+    canonical_extent_labels: List[str] = []
+    unique_extent_values: Set[int] = set()
+
+    import multiprocessing as _mp
+
+    ctx = _mp.get_context("fork")
+    pbar = tqdm(total=n_unique, desc="[dataset] order cache")
+    try:
+        with ctx.Pool(processes=n_workers) as pool:
+            for result in pool.imap_unordered(_order_cache_worker, per_group_args):
+                order_key = tuple(result["order_key"])
+                order_cache[order_key] = {
+                    "order": list(result["order"]),
+                    "budget_specs": list(result["budget_specs"]),
+                }
+                vec_step_indices = set(result["vec_step_indices"])
+                # Same dynamic-extent SplitStep skip as the sequential loop:
+                # vectorize-attached splits have meaningless divisor-based
+                # initial domains.
+                for name, values in result["generator_domain_values"].items():
+                    if name.startswith("sp_"):
+                        try:
+                            step_idx = int(name.split("_")[1])
+                        except (ValueError, IndexError):
+                            step_idx = None
+                        if step_idx is not None and step_idx in vec_step_indices:
+                            continue
+                    domain_values_by_name.setdefault(name, set()).update(
+                        int(v) for v in values
+                    )
+                if use_extent_tokens:
+                    sp_extents = result["sp_extents"]
+                    sorted_indices = sorted(int(s) for s in sp_extents.keys())
+                    if not canonical_extent_indices:
+                        canonical_extent_indices = list(sorted_indices)
+                        canonical_extent_labels = [
+                            f"sp_extent_{s}" for s in canonical_extent_indices
+                        ]
+                    elif sorted_indices != canonical_extent_indices:
+                        raise ValueError(
+                            "SplitStep step-index layout differs across order_keys: "
+                            f"reference={canonical_extent_indices} got={sorted_indices}"
+                        )
+                    extents = [int(sp_extents[s]) for s in canonical_extent_indices]
+                    extent_values_by_order_key[order_key] = extents
+                    unique_extent_values.update(extents)
+                pbar.update(1)
+    finally:
+        pbar.close()
+
+    return (
+        order_cache,
+        domain_values_by_name,
+        extent_values_by_order_key,
+        canonical_extent_indices,
+        canonical_extent_labels,
+        unique_extent_values,
+    )
+
+
 def _validate_record_group_consistency(
     records: Sequence[JsonSampleRecord],
 ) -> None:
@@ -1276,19 +1569,52 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     # which lets ``cost_target_regression`` pick a throughput variant.
     load_workers = getattr(config.data, "load_workers", None)
     load_workers = int(load_workers) if load_workers is not None else 0
-    records: List[JsonSampleRecord] = _run_parallel_json_load(
-        raw_paths,
-        cost_target="norm_throughput",
-        requested_workers=load_workers,
-    )
-    print(f"[dataset] loaded {len(records)} record(s)")
+    records_fingerprint = _records_cache_fingerprint(raw_paths)
+    records_cache_path = _dataset_cache_dir(config) / f"records_{records_fingerprint}.pt"
+    records: Optional[List[JsonSampleRecord]] = None
+    if records_cache_path.exists():
+        try:
+            cached_records = torch.load(records_cache_path, map_location="cpu")
+        except Exception as err:  # pylint: disable=broad-except
+            print(
+                f"[dataset] records cache unreadable ({type(err).__name__}: "
+                f"{err}); will re-parse JSONs"
+            )
+            cached_records = None
+        if cached_records is not None:
+            records = list(cached_records)
+            print(
+                f"[dataset] loaded {len(records)} record(s) from cache "
+                f"{records_cache_path.name}"
+            )
+    if records is None:
+        records = _run_parallel_json_load(
+            raw_paths,
+            cost_target="norm_throughput",
+            requested_workers=load_workers,
+        )
+        print(f"[dataset] loaded {len(records)} record(s)")
+        # Drop the original JSON payload before persisting. ``raw`` is only
+        # consumed by ``GeneratorRegistry.get_generator_from_record`` when
+        # ``record.raw`` carries a TVM measure-record dict; the
+        # param_signature fallback handles the ``raw=None`` case.
+        for record in records:
+            record.raw = None
+        try:
+            torch.save(records, records_cache_path)
+            print(f"[dataset] saved records cache to {records_cache_path}")
+        except Exception as err:  # pylint: disable=broad-except
+            print(
+                f"[dataset] failed to save records cache ({type(err).__name__}: "
+                f"{err}); continuing without it"
+            )
 
     task_min_costs = compute_task_min_costs(records)
-    if task_min_costs:
-        print(
-            f"[dataset] task_min_costs="
-            f"{ {k: float(f'{v:.6g}') for k, v in task_min_costs.items()} }"
-        )
+    # if task_min_costs:
+    #     print(
+    #         f"[dataset] task_min_costs="
+    #         f"{ {k: float(f'{v:.6g}') for k, v in task_min_costs.items()} }"
+    #     )
 
     for record in records:
         if record.cost is None:
@@ -1325,6 +1651,68 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     # the order_key; recording it once per record avoids rebuilding the tuple
     # later.
     record_order_key: Dict[int, tuple] = {}
+
+    # Try loading the order-cache snapshot from disk. The per-record loop
+    # below short-circuits its slow ``_get_generator_for_record`` branch on
+    # every iteration when ``order_cache`` is already populated for the
+    # requested key, eliminating the 33+ TVM generator builds that dominate
+    # cold startup.
+    order_cache_fp = _order_cache_fingerprint(records_fingerprint, config)
+    order_cache_path = _dataset_cache_dir(config) / f"orders_{order_cache_fp}.pt"
+    order_cache_loaded = False
+    if order_cache_path.exists():
+        try:
+            cached = torch.load(order_cache_path, map_location="cpu")
+            order_cache = {
+                tuple(k): dict(v) for k, v in cached["order_cache"].items()
+            }
+            domain_values_by_name = {
+                str(k): set(int(x) for x in v)
+                for k, v in cached["domain_values_by_name"].items()
+            }
+            extent_values_by_order_key = {
+                tuple(k): list(v)
+                for k, v in cached["extent_values_by_order_key"].items()
+            }
+            canonical_extent_indices = list(cached["canonical_extent_indices"])
+            canonical_extent_labels = list(cached["canonical_extent_labels"])
+            unique_extent_values = set(int(x) for x in cached["unique_extent_values"])
+            order_cache_loaded = True
+            print(
+                f"[dataset] loaded order cache from {order_cache_path.name} "
+                f"(unique_orders={len(order_cache)})"
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            print(
+                f"[dataset] order cache unreadable ({type(err).__name__}: "
+                f"{err}); will rebuild"
+            )
+            order_cache = {}
+            domain_values_by_name = {}
+            extent_values_by_order_key = {}
+            canonical_extent_indices = []
+            canonical_extent_labels = []
+            unique_extent_values = set()
+    if not order_cache_loaded:
+        # Parallelize the slow ScheduleGenerator builds across worker processes
+        # before falling into the sequential loop. With the order_cache
+        # populated up-front the loop below never enters its
+        # ``_get_generator_for_record`` branch.
+        parallel_result = _run_parallel_order_cache_build(
+            config=config,
+            records=records,
+            include_budget=include_budget,
+            use_extent_tokens=use_extent_tokens,
+        )
+        if parallel_result is not None:
+            (
+                order_cache,
+                domain_values_by_name,
+                extent_values_by_order_key,
+                canonical_extent_indices,
+                canonical_extent_labels,
+                unique_extent_values,
+            ) = parallel_result
     print("[dataset] building ordered parameter cache")
     for idx, record in enumerate(records, start=1):
         order_key = (
@@ -1403,6 +1791,37 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             f"[dataset] extent prefix: labels={canonical_extent_labels} "
             f"unique_values={len(unique_extent_values)}"
         )
+
+    # Persist the order cache when it was newly built. ``Set[int]`` and tuple
+    # keys are normalized to lists so the snapshot survives torch.save's
+    # default pickling without depending on internal set ordering.
+    if not order_cache_loaded and order_cache:
+        try:
+            torch.save(
+                {
+                    "order_cache": {
+                        tuple(k): dict(v) for k, v in order_cache.items()
+                    },
+                    "domain_values_by_name": {
+                        str(k): sorted(int(x) for x in v)
+                        for k, v in domain_values_by_name.items()
+                    },
+                    "extent_values_by_order_key": {
+                        tuple(k): list(v)
+                        for k, v in extent_values_by_order_key.items()
+                    },
+                    "canonical_extent_indices": list(canonical_extent_indices),
+                    "canonical_extent_labels": list(canonical_extent_labels),
+                    "unique_extent_values": sorted(int(x) for x in unique_extent_values),
+                },
+                order_cache_path,
+            )
+            print(f"[dataset] saved order cache to {order_cache_path}")
+        except Exception as err:  # pylint: disable=broad-except
+            print(
+                f"[dataset] failed to save order cache "
+                f"({type(err).__name__}: {err}); continuing without it"
+            )
 
     # Records in the loaded set must share the *same parameter order* (not
     # just the same count) so that a single decoder var-id layout applies to
@@ -1503,6 +1922,11 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
     # torch.save storm where every workload's pt file was rewritten on every
     # flush tick.
     dirty_workloads: Set[Tuple[str, str]] = set()
+    # Union of every workload that ever became dirty across train+val+test
+    # build_samples passes. Drives the post-loop final save so a fully-cached
+    # startup performs zero ``torch.save`` calls instead of rewriting every
+    # workload's pt file.
+    ever_dirty_workloads: Set[Tuple[str, str]] = set()
     # Precompute over ALL valid records (not just the current train+val split)
     # so the cache is seed-invariant: changing ``data.seed`` only reshuffles
     # which records land in train/val/test, never triggers recomputation.
@@ -1516,39 +1940,61 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                 if record.workload_key and record.target_kind
             }
         )
-        for workload_key in precompute_workload_keys:
+        new_vocab_size = len(tokenizer.id_to_token)
+        n_loaded_workloads = 0
+        n_loaded_samples = 0
+        n_remapped_workloads = 0
+        progress = tqdm(
+            precompute_workload_keys,
+            desc="[dataset] mask cache",
+            total=len(precompute_workload_keys),
+        )
+        for workload_key in progress:
             cache_path = _candidate_mask_cache_path_for_workload(config, workload_key[0], workload_key[1])
             cache_paths_by_workload[workload_key] = cache_path
             if not cache_path.exists():
                 continue
-            print(f"[dataset] loading cached candidate masks from {cache_path}")
             payload = torch.load(cache_path, map_location="cpu")
             sample_masks = payload.get("sample_masks", {})
             saved_id_to_token = payload.get("id_to_token")
             if saved_id_to_token is None:
-                print(
+                progress.write(
                     f"[dataset] cache at {cache_path} lacks id_to_token; "
                     f"ignoring (rebuild required)"
                 )
                 continue
-            needs_remap = list(saved_id_to_token) != list(tokenizer.id_to_token)
-            if needs_remap:
-                print(
-                    f"[dataset] remapping cached masks to current tokenizer "
-                    f"(saved_vocab={len(saved_id_to_token)} "
-                    f"current_vocab={len(tokenizer.id_to_token)})"
+            if not sample_masks:
+                continue
+            remap_index = _build_remap_index(saved_id_to_token, tokenizer)
+            if remap_index is None:
+                # Identical vocab — drop straight in. No per-tensor work.
+                cached_candidate_masks.update(
+                    {str(k): v for k, v in sample_masks.items()}
                 )
-            loaded_count = 0
-            for sample_id, mask in sample_masks.items():
-                m = mask.to(dtype=torch.bool, device="cpu")
-                if needs_remap:
-                    m = _remap_cached_mask_to_tokenizer(m, saved_id_to_token, tokenizer)
-                cached_candidate_masks[str(sample_id)] = m
-                loaded_count += 1
-            print(
-                f"[dataset] loaded cached masks for workload_key={workload_key} "
-                f"count={loaded_count}"
+            else:
+                # Vectorized remap across all masks for this workload at once.
+                # Per-sample seq_len is identical (samples in a workload share
+                # the same generator / param order), so they stack cleanly.
+                sample_ids = list(sample_masks.keys())
+                stacked = torch.stack(
+                    [sample_masks[sid].to(dtype=torch.bool) for sid in sample_ids],
+                    dim=0,
+                )
+                remapped = _remap_stacked_masks(stacked, remap_index, new_vocab_size)
+                for i, sid in enumerate(sample_ids):
+                    cached_candidate_masks[str(sid)] = remapped[i]
+                n_remapped_workloads += 1
+            n_loaded_workloads += 1
+            n_loaded_samples += len(sample_masks)
+            progress.set_postfix(
+                workloads=n_loaded_workloads,
+                samples=n_loaded_samples,
+                remapped=n_remapped_workloads,
             )
+        print(
+            f"[dataset] loaded cached masks: workloads={n_loaded_workloads} "
+            f"samples={n_loaded_samples} remapped={n_remapped_workloads}"
+        )
 
     def _shape_ids_for_record(record: JsonSampleRecord) -> tuple[List[int], List[int]]:
         shape_values, shape_labels = shape_info_by_record[id(record)]
@@ -1735,7 +2181,9 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
             )
             cached_candidate_masks[record.sample_id] = items_by_id[id(record)].candidate_masks
             if record.workload_key and record.target_kind:
-                dirty_workloads.add((str(record.workload_key), str(record.target_kind)))
+                workload_sig = (str(record.workload_key), str(record.target_kind))
+                dirty_workloads.add(workload_sig)
+                ever_dirty_workloads.add(workload_sig)
             current_order = list(order)
             current_values = list(values)
             computed_cache_count += 1
@@ -1798,16 +2246,19 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         cost_target=cost_target,
         task_min_costs=dict(task_min_costs),
     )
-    if precompute_candidate_masks:
+    if precompute_candidate_masks and ever_dirty_workloads:
         _save_candidate_mask_cache_files(
             config,
             precompute_records,
             cached_candidate_masks,
             cache_paths_by_workload,
             tokenizer,
+            restrict_to_workloads=set(ever_dirty_workloads),
         )
-        for workload_sig in sorted(cache_paths_by_workload):
-            cache_path = cache_paths_by_workload[workload_sig]
+        for workload_sig in sorted(ever_dirty_workloads):
+            cache_path = cache_paths_by_workload.get(workload_sig)
+            if cache_path is None:
+                continue
             count = sum(
                 1
                 for record in precompute_records

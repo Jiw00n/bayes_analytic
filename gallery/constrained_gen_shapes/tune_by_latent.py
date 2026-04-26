@@ -34,6 +34,7 @@ if __package__ in (None, ""):
         flatten_labels,
         semantic_labels_for_task,
     )
+    from latent_model_budget.recon_predict_gp import make_task_sym_map_key
     from latent_model_budget.tokenizer import ParamTokenizer
     from modules.task_paths import clean_name, get_measure_record_filename
     from result_csv_utils import (
@@ -62,6 +63,7 @@ else:
         flatten_labels,
         semantic_labels_for_task,
     )
+    from .latent_model_budget.recon_predict_gp import make_task_sym_map_key
     from .latent_model_budget.tokenizer import ParamTokenizer
     from .modules.task_paths import clean_name, get_measure_record_filename
     from .result_csv_utils import (
@@ -115,8 +117,17 @@ def _make_measurer(task: Any, log_filename: str) -> Any:
     )
 
 
-def _build_measurement_session(task: Any, measure_output_dir: Optional[str] = None) -> MeasurementSession:
-    output_path = str(get_measure_record_filename(task, task.target, output_dir=measure_output_dir))
+def _build_measurement_session(
+    task: Any,
+    measure_output_dir: Optional[str] = None,
+    *,
+    output_path: Optional[str] = None,
+) -> MeasurementSession:
+    if output_path is None:
+        output_path = str(
+            get_measure_record_filename(task, task.target, output_dir=measure_output_dir)
+        )
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     return MeasurementSession(
         task=task,
         output_path=output_path,
@@ -357,6 +368,66 @@ def _resolve_measure_output_dir(output: Optional[str | Path]) -> Optional[str]:
     if output is None:
         return None
     return str(Path(output) / "measure_records")
+
+
+def _family_from_record(record: JsonSampleRecord) -> Optional[str]:
+    """Family is ``Path(record.json_path).parents[1].name`` when the dataset
+    directory layout is ``.../{family}/{target}/{task_index}_*.json``."""
+    json_path = getattr(record, "json_path", None)
+    if not json_path:
+        return None
+    p = Path(json_path)
+    if len(p.parents) < 2:
+        return None
+    return p.parents[1].name
+
+
+def _resolve_walk_measure_record_path(
+    *,
+    record: JsonSampleRecord,
+    task: Any,
+    output: Optional[str | Path],
+) -> Optional[str]:
+    """Compose the per-task measurement record path for latent walk:
+
+        ``{output}/{family}/measure_records/{task_index}_{clean_name}.json``
+
+    where ``output`` is the configured checkpoint dir (e.g.
+    ``checkpoints_all``). All tasks for the same family share the single
+    ``{family}/measure_records/`` directory, distinguished by the
+    ``{task_index}_`` filename prefix.
+
+    ``task_index`` falls back to the leading digits of the source JSON's
+    filename stem when ``record.task_index`` is missing (the common case for
+    JSON payloads that don't carry ``meta.task_index`` / ``task.task_index``).
+    """
+    if output is None:
+        return None
+    import re
+
+    target = getattr(task, "target", None)
+    target_kind = str(target.kind) if target is not None else ""
+    base_key = clean_name((task.workload_key, target_kind))
+    family = _family_from_record(record)
+    task_index: Optional[int] = getattr(record, "task_index", None)
+    if task_index is None:
+        json_path = getattr(record, "json_path", None)
+        if json_path:
+            m = re.match(r"^(\d+)", Path(json_path).stem)
+            if m:
+                try:
+                    task_index = int(m.group(1))
+                except ValueError:
+                    task_index = None
+    output_root = Path(output)
+    if family:
+        output_root = output_root / family
+    output_dir = output_root / "measure_records"
+    if task_index is not None:
+        filename = f"{int(task_index)}_{base_key}.json"
+    else:
+        filename = f"{base_key}.json"
+    return str(output_dir / clean_name(filename))
 
 
 def _select_record_from_path(
@@ -922,6 +993,149 @@ def greedy_decode_from_z(
 
 
 
+@torch.no_grad()
+def greedy_decode_from_zs_batch(
+    bundle: LoadedBundle,
+    oracles: List[LegalPrefixOracle],
+    ordered_names: List[str],
+    zs: torch.Tensor,
+    *,
+    sampling_options: Optional[SamplingOptions] = None,
+    rng: Optional[torch.Generator] = None,
+    shape_token_ids: Optional[List[int]] = None,
+    shape_var_ids: Optional[List[int]] = None,
+    extent_token_ids: Optional[List[int]] = None,
+    extent_var_ids: Optional[List[int]] = None,
+) -> List[DecodeRecord]:
+    """Decode a batch of latent vectors in a single forward pass per token
+    position.
+
+    Each ``z`` gets its own ``oracle`` (constraint state) and its own
+    candidate mask at every position, but all ``z``'s share the same
+    decoder-input prefix length at any given step (param order is fixed), so
+    we can batch the transformer ``decode`` call across z's. Per-z work that
+    can't be batched — oracle.candidate_values, mask construction, sampling,
+    oracle.assign — still happens in a Python loop, but the heavy transformer
+    forward is paid once per step instead of B times.
+    """
+    options = sampling_options or SamplingOptions()
+    model = bundle.model
+    tokenizer = bundle.tokenizer
+    device = bundle.device
+
+    batch_size = len(oracles)
+    if batch_size == 0:
+        return []
+    if zs.shape[0] != batch_size:
+        raise ValueError(
+            f"zs batch dim ({zs.shape[0]}) must match oracle count ({batch_size})"
+        )
+
+    zs = zs.to(device=device, dtype=torch.float32).reshape(batch_size, -1)
+    memory = model.latent_to_memory(zs).view(
+        batch_size, model.cfg.latent_token_count, model.cfg.d_model
+    )
+
+    shape_token_list = list(shape_token_ids or [])
+    shape_var_list = list(shape_var_ids or [])
+    if len(shape_token_list) != len(shape_var_list):
+        raise ValueError(
+            f"shape_token_ids ({len(shape_token_list)}) and shape_var_ids "
+            f"({len(shape_var_list)}) length mismatch"
+        )
+    extent_token_list = list(extent_token_ids or [])
+    extent_var_list = list(extent_var_ids or [])
+    if len(extent_token_list) != len(extent_var_list):
+        raise ValueError(
+            f"extent_token_ids ({len(extent_token_list)}) and extent_var_ids "
+            f"({len(extent_var_list)}) length mismatch"
+        )
+    prefix_token_list = shape_token_list + extent_token_list
+    prefix_var_list = shape_var_list + extent_var_list
+    param_var_ids = [tokenizer.var_to_id[name] for name in ordered_names]
+    full_var_ids = prefix_var_list + param_var_ids
+
+    base_decoder_ids: List[int] = list(prefix_token_list) + [tokenizer.param_start_id]
+    decoder_input_ids: List[List[int]] = [
+        list(base_decoder_ids) for _ in range(batch_size)
+    ]
+    decoded_params: List[Dict[str, int]] = [{} for _ in range(batch_size)]
+    failures: List[Optional[str]] = [None] * batch_size
+
+    for var_name in ordered_names:
+        candidate_values_per_b: List[Optional[List[int]]] = [None] * batch_size
+        token_masks: List[Optional[torch.Tensor]] = [None] * batch_size
+        for b in range(batch_size):
+            if failures[b] is not None:
+                continue
+            try:
+                candidate_values = list(oracles[b].candidate_values(var_name))
+                if not candidate_values:
+                    raise RuntimeError(f"No legal candidates for {var_name}")
+                tm = tokenizer.candidate_mask_from_values(
+                    var_name, candidate_values, device=device
+                )
+                if not bool(tm.any()):
+                    raise RuntimeError(
+                        f"vocab cannot represent any legal candidate for {var_name}"
+                    )
+                candidate_values_per_b[b] = candidate_values
+                token_masks[b] = tm
+            except Exception as err:  # pylint: disable=broad-except
+                failures[b] = f"{type(err).__name__}: {err}"
+
+        cur_len = len(decoder_input_ids[0])
+        step_input = torch.tensor(decoder_input_ids, dtype=torch.long, device=device)
+        var_id_row = full_var_ids[:cur_len]
+        step_var_ids = torch.tensor(
+            [var_id_row] * batch_size, dtype=torch.long, device=device
+        )
+        logits = model.decode(
+            step_input,
+            step_var_ids,
+            memory,
+            zs,
+            decoder_pad_mask=step_input.eq(tokenizer.pad_id),
+        )
+        last_logits = logits[:, -1, :]
+
+        for b in range(batch_size):
+            if failures[b] is not None:
+                # Keep tensor shapes aligned across the batch.
+                decoder_input_ids[b].append(tokenizer.pad_id)
+                continue
+            try:
+                pred_token_id = _sample_token_from_logits(
+                    last_logits[b], token_masks[b], options, rng
+                )
+                pred_value = _resolve_decoded_value(
+                    tokenizer, var_name, pred_token_id, candidate_values_per_b[b] or []
+                )
+                oracles[b].assign(var_name, pred_value)
+                decoded_params[b][var_name] = int(pred_value)
+                decoder_input_ids[b].append(int(pred_token_id))
+            except Exception as err:  # pylint: disable=broad-except
+                failures[b] = f"{type(err).__name__}: {err}"
+                decoder_input_ids[b].append(tokenizer.pad_id)
+
+    out: List[DecodeRecord] = []
+    for b in range(batch_size):
+        sym_map = dict(oracles[b].generator.s.sym_map)
+        for name, value in decoded_params[b].items():
+            sym_map[name] = int(value)
+        violations = list(oracles[b].final_violations())
+        if failures[b] is not None:
+            violations.append(failures[b])
+        out.append(
+            DecodeRecord(
+                params=dict(decoded_params[b]),
+                sym_map=sym_map,
+                final_violations=violations,
+            )
+        )
+    return out
+
+
 def make_shifted_zs(
     z0: torch.Tensor,
     direction: torch.Tensor,
@@ -1062,6 +1276,70 @@ def predict_reencode_score(
 predict_cost_head_from_reencode = predict_reencode_score
 
 
+# -----------------------------------------------------------------------------
+# Reference-best directory (for printing best-known cost per task)
+# -----------------------------------------------------------------------------
+
+_REFERENCE_BEST_CACHE: Dict[str, Dict[str, float]] = {}
+
+
+def _scan_reference_best_dir(reference_dir: str | Path) -> Dict[str, float]:
+    """Scan a directory of measure-record JSONs and return
+    ``workload_key → best (lowest) measured mean cost in seconds``.
+
+    Used during latent walk to print a "best known" reference for the task —
+    typically pointing to a sibling directory measured on different hardware
+    (e.g. ``a6000``) than the training data (``t4``). One scan per process per
+    distinct directory thanks to ``_REFERENCE_BEST_CACHE``.
+    """
+    out: Dict[str, float] = {}
+    p = Path(reference_dir)
+    if not p.is_dir():
+        return out
+    no_error = int(auto_scheduler.measure.MeasureErrorNo.NO_ERROR)
+    for json_file in sorted(p.glob("*.json")):
+        try:
+            inputs, results = auto_scheduler.RecordReader(str(json_file)).read_lines()
+            inputs = list(inputs)
+            results = list(results)
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if not inputs or len(inputs) != len(results):
+            continue
+        wkey = inputs[0].task.workload_key
+        best = float("inf")
+        for r in results:
+            if int(r.error_no) != no_error:
+                continue
+            costs = [float(c) for c in r.costs]
+            if not costs:
+                continue
+            mean_s = float(sum(costs) / len(costs))
+            if mean_s < best:
+                best = mean_s
+        if math.isfinite(best):
+            prev = out.get(wkey)
+            if prev is None or best < prev:
+                out[wkey] = best
+    return out
+
+
+def _get_reference_best_seconds(
+    reference_dir: Optional[str], workload_key: Optional[str]
+) -> Optional[float]:
+    """Cached lookup of the best raw-seconds cost for ``workload_key`` in
+    ``reference_dir``. Returns ``None`` when the dir is unset / empty / has
+    no record matching the workload."""
+    if not reference_dir or not workload_key:
+        return None
+    cache_key = str(Path(reference_dir).resolve())
+    cached = _REFERENCE_BEST_CACHE.get(cache_key)
+    if cached is None:
+        cached = _scan_reference_best_dir(reference_dir)
+        _REFERENCE_BEST_CACHE[cache_key] = cached
+    return cached.get(workload_key)
+
+
 @torch.no_grad()
 def predict_recon_score(
     bundle: LoadedBundle,
@@ -1137,6 +1415,8 @@ def build_walk_records(
     task_min_cost: Optional[float] = None,
     sort_by: str = "re_pred",
     show_neg_log: bool = False,
+    reference_best_seconds: Optional[float] = None,
+    reference_best_dir: Optional[str] = None,
 ) -> tuple[List[WalkRecord], StartZContext]:
     options = sampling_options or SamplingOptions()
     decode_rng: Optional[torch.Generator] = None
@@ -1153,8 +1433,12 @@ def build_walk_records(
     z0 = start_ctx.z0
     gen = start_ctx.generator
     ordered_names = start_ctx.ordered_names
-    measure_output_dir = _resolve_measure_output_dir(output)
     task_for_measure = gen._task
+    measure_record_path = _resolve_walk_measure_record_path(
+        record=record,
+        task=task_for_measure,
+        output=output,
+    )
     walk_direction = compute_walk_direction(bundle, z0)
     shifted_zs = make_shifted_zs(
         z0,
@@ -1177,31 +1461,50 @@ def build_walk_records(
         return all(int(sym_map[k]) == ref_params[k] for k in shared)
 
     results: List[WalkRecord] = []
-    pending_measure_indices_by_key: Dict[tuple[tuple[str, int], ...], List[int]] = {}
+    pending_measure_indices_by_key: Dict[Any, List[int]] = {}
     pending_measure_states: List[Any] = []
     pending_measure_metas: List[Dict[str, Any]] = []
-    pending_measure_keys: List[tuple[tuple[str, int], ...]] = []
+    pending_measure_keys: List[Any] = []
     shape_token_ids, shape_var_ids = shape_prefix_for_record(bundle, record)
     extent_token_ids, extent_var_ids = extent_prefix_for_record(bundle, record, gen=gen)
-    for step_index, alpha, z in shifted_zs:
-        oracle = bundle.registry.build_oracle_from_record(record)
-        decoded = greedy_decode_from_z(
-            bundle,
-            oracle,
-            ordered_names,
-            z,
-            sampling_options=options,
-            rng=decode_rng,
-            shape_token_ids=shape_token_ids,
-            shape_var_ids=shape_var_ids,
-            extent_token_ids=extent_token_ids,
-            extent_var_ids=extent_var_ids,
-        )
+
+    # Decode all walk steps in a single batched forward pass. The transformer
+    # work scales O(num_steps × num_params) per call; batching turns that
+    # into one call per param position with batch size = num_steps, which is
+    # the dominant speedup.
+    step_oracles = [
+        bundle.registry.build_oracle_from_record(record) for _ in shifted_zs
+    ]
+    zs_stack = torch.stack(
+        [z for _, _, z in shifted_zs], dim=0
+    ).to(device=bundle.device, dtype=torch.float32).reshape(len(shifted_zs), -1)
+    decoded_per_step = greedy_decode_from_zs_batch(
+        bundle,
+        step_oracles,
+        ordered_names,
+        zs_stack,
+        sampling_options=options,
+        rng=decode_rng,
+        shape_token_ids=shape_token_ids,
+        shape_var_ids=shape_var_ids,
+        extent_token_ids=extent_token_ids,
+        extent_var_ids=extent_var_ids,
+    )
+
+    for (step_index, alpha, z), decoded, oracle in zip(
+        shifted_zs, decoded_per_step, step_oracles
+    ):
 
         decoded_sym_map_int = {
             k: int(v) for k, v in decoded.sym_map.items() if isinstance(v, int)
         }
-        sym_key = make_sym_map_key(decoded_sym_map_int)
+        # Task-aware cache key prevents cross-workload contamination of the
+        # measurement cache. Two distinct workloads frequently produce
+        # overlapping sym_maps and a sym_map-only key would let a small task's
+        # fast cost leak into a large task's walk via the cache.
+        sym_key = make_task_sym_map_key(
+            getattr(record, "workload_key", None), decoded_sym_map_int
+        )
         is_reference_sym = _is_reference_sym_map(decoded_sym_map_int)
 
         state = None
@@ -1311,6 +1614,13 @@ def build_walk_records(
         f"{float(ref_raw_cost):.6g}s" if ref_raw_cost is not None else "<none>"
     )
     print(f"Reference cost: {ref_cost_str} (sample_id={record.sample_id})")
+    if reference_best_seconds is not None:
+        ref_label = (
+            Path(reference_best_dir).name
+            if reference_best_dir
+            else "reference"
+        )
+        print(f"{ref_label} measured best: {float(reference_best_seconds):.6g}s")
 
     _release_measurement_environment(bundle, generator=gen, keep_bundle=keep_bundle)
 
@@ -1329,7 +1639,9 @@ def build_walk_records(
                 torch.cuda.ipc_collect()
 
         try:
-            measurement_session = _build_measurement_session(task_for_measure, measure_output_dir)
+            measurement_session = _build_measurement_session(
+                task_for_measure, output_path=measure_record_path
+            )
             measured_results = measure_candidates_batch(
                 session=measurement_session,
                 task=task_for_measure,
@@ -1540,6 +1852,7 @@ def run_latent_walk(
     task_min_cost: Optional[float] = None,
     sort_by: str = "re_pred",
     show_neg_log: bool = False,
+    reference_best_dir: Optional[str] = None,
 ) -> List[WalkRecord]:
     walk_output_path, _ = _resolve_output_layout(
         checkpoint_path=checkpoint_path,
@@ -1560,6 +1873,9 @@ def run_latent_walk(
         record = preselected_record
     else:
         record = _select_record_from_path(record_json_path, best_cost=best_cost)
+    reference_best_seconds = _get_reference_best_seconds(
+        reference_best_dir, getattr(record, "workload_key", None)
+    )
     records, start_ctx = build_walk_records(
         bundle,
         record,
@@ -1579,9 +1895,11 @@ def run_latent_walk(
         task_min_cost=task_min_cost,
         sort_by=sort_by,
         show_neg_log=show_neg_log,
+        reference_best_seconds=reference_best_seconds,
+        reference_best_dir=reference_best_dir,
     )
-    if walk_output_path is not None:
-        save_walk_records(records, walk_output_path)
+    # if walk_output_path is not None:
+    #     save_walk_records(records, walk_output_path)
     csv_output_path = resolve_results_csv_path(
         __file__,
         "by_latent",
@@ -1670,6 +1988,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="How to order the printed walk results: measured raw cost (asc), "
              "reencode-predicted cost (desc), or walk alpha (asc)",
     )
+    p.add_argument(
+        "--reference-best-dir",
+        type=str,
+        default=None,
+        help="Optional directory of measure-record JSONs (e.g. a sibling "
+             "target like a6000) to print a 'best known cost' line per task. "
+             "Tasks not found in this dir simply skip the extra line.",
+    )
     return p
 
 
@@ -1726,6 +2052,7 @@ def main() -> List[WalkRecord]:
                     deterministic_start=bool(args.deterministic),
                     sampling_options=sampling_options,
                     sort_by=args.sort_by,
+                    reference_best_dir=args.reference_best_dir,
                     bundle=bundle,
                     keep_bundle=True,
                 )
@@ -1753,6 +2080,7 @@ def main() -> List[WalkRecord]:
         deterministic_start=bool(args.deterministic),
         sampling_options=sampling_options,
         sort_by=args.sort_by,
+        reference_best_dir=args.reference_best_dir,
     )
 
 

@@ -91,18 +91,22 @@ def train_one_epoch(
         getattr(cfg.data, "cost_target_regression", None) or cost_target
     )
     model.train()
-    total_loss = 0.0
-    total_recon = 0.0
-    total_kl = 0.0
-    total_cost = 0.0
-    total_nce = 0.0
-    total_latent_use = 0.0
-    total_latent_use_rank = 0.0
-    total_latent_use_top1_drop = 0.0
-    total_token_correct = 0
-    total_token_count = 0
-    total_exact_count = 0
-    total_sample_count = 0
+    # Accumulate scalar losses + accuracy counters as device tensors so the
+    # GPU never has to flush mid-epoch. Each ``.item()`` was a sync that
+    # serialized the loop; doing them once at the end keeps the train loop
+    # GPU-bound.
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    total_recon = torch.zeros((), device=device, dtype=torch.float32)
+    total_kl = torch.zeros((), device=device, dtype=torch.float32)
+    total_cost = torch.zeros((), device=device, dtype=torch.float32)
+    total_nce = torch.zeros((), device=device, dtype=torch.float32)
+    total_latent_use = torch.zeros((), device=device, dtype=torch.float32)
+    total_latent_use_rank = torch.zeros((), device=device, dtype=torch.float32)
+    total_latent_use_top1_drop = torch.zeros((), device=device, dtype=torch.float32)
+    total_token_correct = torch.zeros((), device=device, dtype=torch.long)
+    total_token_count = torch.zeros((), device=device, dtype=torch.long)
+    total_exact_count = torch.zeros((), device=device, dtype=torch.long)
+    total_sample_count = torch.zeros((), device=device, dtype=torch.long)
     total_batches = 0
 
     iterator = tqdm(loader, desc=f"train epoch {epoch}") if tqdm is not None else loader
@@ -257,30 +261,41 @@ def train_one_epoch(
             clip_grad_norm_(model.parameters(), cfg.train.grad_clip_norm)
             optimizer.step()
 
-        total_loss += float(loss.item())
-        total_recon += float(recon_loss.item())
-        total_kl += float(kl_loss.item())
-        total_cost += float(cost_loss.item())
-        total_nce += float(nce_loss.item())
-        total_latent_use += float(latent_use_loss.item())
-        total_latent_use_rank += float(latent_use_rank_loss.item())
-        total_latent_use_top1_drop += float(latent_use_top1_drop_loss.item())
-        total_token_correct += int(batch_token_correct)
-        total_token_count += int(batch_token_total)
-        total_exact_count += int(batch_exact_count)
-        total_sample_count += int(batch_sample_total)
+        total_loss = total_loss + loss.detach()
+        total_recon = total_recon + recon_loss.detach()
+        total_kl = total_kl + kl_loss.detach()
+        total_cost = total_cost + cost_loss.detach()
+        total_nce = total_nce + nce_loss.detach()
+        total_latent_use = total_latent_use + latent_use_loss.detach()
+        total_latent_use_rank = total_latent_use_rank + latent_use_rank_loss.detach()
+        total_latent_use_top1_drop = total_latent_use_top1_drop + latent_use_top1_drop_loss.detach()
+        total_token_correct = total_token_correct + batch_token_correct.detach()
+        total_token_count = total_token_count + batch_token_total.detach()
+        total_exact_count = total_exact_count + batch_exact_count.detach()
+        total_sample_count = total_sample_count + batch_sample_total.detach()
         total_batches += 1
 
     denom = max(total_batches, 1)
+    # Single end-of-epoch sync. ``.item()`` here pulls scalars in one CUDA
+    # stream flush instead of one per batch.
+    token_count_i = max(int(total_token_count.item()), 1)
+    sample_count_i = max(int(total_sample_count.item()), 1)
     return {
-        "loss": total_loss / denom,
-        "recon_loss": total_recon / denom,
-        "kl_loss": total_kl / denom,
-        "cost_loss": total_cost / denom,
-        "nce_loss": total_nce / denom,
-        "latent_use_loss": total_latent_use / denom,
-        "latent_use_rank_loss": total_latent_use_rank / denom,
-        "latent_use_top1_drop_loss": total_latent_use_top1_drop / denom,
+        "loss": float(total_loss.item()) / denom,
+        "recon_loss": float(total_recon.item()) / denom,
+        "kl_loss": float(total_kl.item()) / denom,
+        "cost_loss": float(total_cost.item()) / denom,
+        "nce_loss": float(total_nce.item()) / denom,
+        "latent_use_loss": float(total_latent_use.item()) / denom,
+        "latent_use_rank_loss": float(total_latent_use_rank.item()) / denom,
+        "latent_use_top1_drop_loss": float(total_latent_use_top1_drop.item()) / denom,
+        # Token / sequence accuracy collected during the train loop. With
+        # singleton positions excluded by ``_teacher_forcing_accuracy_stats``
+        # this matches the train-side ``evaluate_teacher_forcing`` output up
+        # to dropout noise, removing the need for a second forward pass over
+        # the train split.
+        "token_accuracy": float(total_token_correct.item()) / token_count_i,
+        "full_sequence_exact_match": float(total_exact_count.item()) / sample_count_i,
         "beta": beta,
         "early_param_weight_max": float(getattr(cfg.train, "early_param_weight_max", 1.0)),
         "early_param_weight_power": float(getattr(cfg.train, "early_param_weight_power", 1.0)),
