@@ -18,7 +18,12 @@ from typing import List, Optional, Sequence
 import numpy as np
 import torch
 
-import lightgbm as lgb
+try:
+    import lightgbm as lgb
+    _LGB_IMPORT_ERROR: Optional[Exception] = None
+except ImportError as _err:  # pragma: no cover
+    lgb = None  # type: ignore[assignment]
+    _LGB_IMPORT_ERROR = _err
 
 from .dataset import PreparedSample
 from .model import LatentParamVAE

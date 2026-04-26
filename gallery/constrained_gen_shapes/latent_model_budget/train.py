@@ -199,13 +199,35 @@ def train_main(config) -> Dict[str, float]:
     tasks_per_batch = getattr(config.train, "tasks_per_batch", None)
     train_batch_sampler = None
     if tasks_per_batch is not None:
-        train_batch_sampler = TaskBalancedBatchSampler(
-            task_indices=[s.task_index for s in bundle.train_dataset.samples],
-            batch_size=int(config.train.batch_size),
-            tasks_per_batch=int(tasks_per_batch),
-            shuffle=True,
-            seed=int(config.data.seed),
-        )
+        # Prefer the explicit ``task_index`` when JSONs carry it; otherwise
+        # fall back to grouping by (workload_key, target_kind) since that is
+        # the natural task identity for tenset-style measurement records,
+        # which omit the meta.task_index field.
+        samples = bundle.train_dataset.samples
+        if any(s.task_index is not None for s in samples):
+            sample_task_indices = [s.task_index for s in samples]
+        else:
+            key_to_id: Dict[tuple, int] = {}
+            sample_task_indices = []
+            for s in samples:
+                key = (s.workload_key or "", s.target_kind or "")
+                if key not in key_to_id:
+                    key_to_id[key] = len(key_to_id)
+                sample_task_indices.append(key_to_id[key])
+        n_distinct_tasks = len({-1 if t is None else int(t) for t in sample_task_indices})
+        if n_distinct_tasks < int(tasks_per_batch):
+            print(
+                f"[train] tasks_per_batch={tasks_per_batch} but dataset has only "
+                f"{n_distinct_tasks} distinct task(s); falling back to random shuffle"
+            )
+        else:
+            train_batch_sampler = TaskBalancedBatchSampler(
+                task_indices=sample_task_indices,
+                batch_size=int(config.train.batch_size),
+                tasks_per_batch=int(tasks_per_batch),
+                shuffle=True,
+                seed=int(config.data.seed),
+            )
     train_loader = prepare_loader(
         bundle.train_dataset,
         tokenizer,

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import copy
-import math
 
 import torch
 import torch.nn as nn
@@ -225,13 +224,6 @@ class LatentParamVAE(nn.Module):
         # self.cost_head = nn.Parameter(torch.randn(cfg.latent_dim))
 
         self.lm_head = nn.Linear(embed_dim, vocab_size)
-        if _deficit > 0:
-            # nn.Linear.reset_parameters: kaiming_uniform_(a=sqrt(5)) on weight
-            # with bound=1/sqrt(fan_in)=1/sqrt(embed_dim), and uniform_(-bound,bound)
-            # on bias (fan_in is still embed_dim for the bias calculation).
-            _bound = 1.0 / math.sqrt(embed_dim)
-            torch.empty(_deficit, embed_dim).uniform_(-_bound, _bound)
-            torch.empty(_deficit).uniform_(-_bound, _bound)
 
     def _positions(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
         return torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
