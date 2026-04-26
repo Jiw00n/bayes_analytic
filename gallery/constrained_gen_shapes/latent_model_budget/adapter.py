@@ -595,19 +595,14 @@ def compute_task_min_costs(
 # -----------------------------------------------------------------------------
 
 
-def split_records(
+def _split_one_pool(
     records: Sequence[JsonSampleRecord],
     train_ratio: float,
     val_ratio: float,
     test_ratio: float,
-    seed: int,
+    rng: random.Random,
 ) -> Tuple[List[JsonSampleRecord], List[JsonSampleRecord], List[JsonSampleRecord]]:
-    total = train_ratio + val_ratio + test_ratio
-    if abs(total - 1.0) > 1e-8:
-        raise ValueError(f"split ratios must sum to 1.0, got {total}")
-
     indices = list(range(len(records)))
-    rng = random.Random(seed)
     rng.shuffle(indices)
     shuffled = [records[i] for i in indices]
 
@@ -627,6 +622,51 @@ def split_records(
     if test_ratio > 0.0 and not test and len(train) > 1:
         test = [train.pop()]
     return train, val, test
+
+
+def split_records(
+    records: Sequence[JsonSampleRecord],
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+    mode: Optional[str] = None,
+) -> Tuple[List[JsonSampleRecord], List[JsonSampleRecord], List[JsonSampleRecord]]:
+    total = train_ratio + val_ratio + test_ratio
+    if abs(total - 1.0) > 1e-8:
+        raise ValueError(f"split ratios must sum to 1.0, got {total}")
+
+    if mode is None:
+        rng = random.Random(seed)
+        return _split_one_pool(records, train_ratio, val_ratio, test_ratio, rng)
+
+    if mode == "task_wise":
+        groups: Dict[int, List[JsonSampleRecord]] = {}
+        for record in records:
+            tid = -1 if record.task_index is None else int(record.task_index)
+            groups.setdefault(tid, []).append(record)
+        train: List[JsonSampleRecord] = []
+        val: List[JsonSampleRecord] = []
+        test: List[JsonSampleRecord] = []
+        rng = random.Random(seed)
+        for tid in sorted(groups.keys()):
+            tr, va, te = _split_one_pool(
+                groups[tid], train_ratio, val_ratio, test_ratio, rng
+            )
+            train.extend(tr)
+            val.extend(va)
+            test.extend(te)
+        return train, val, test
+
+    if mode == "unseen_task":
+        # TODO: implement entire-task holdout split. Skeleton only.
+        raise NotImplementedError(
+            "split_mode='unseen_task' is not implemented yet"
+        )
+
+    raise ValueError(
+        f"Unknown split_mode: {mode!r} (expected None, 'task_wise', or 'unseen_task')"
+    )
 
 
 # -----------------------------------------------------------------------------

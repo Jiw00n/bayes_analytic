@@ -23,19 +23,18 @@ else:
 
 
 SEARCH_SPACE = {
-    "train.resume": [True],
+    # "train.resume": [True],
     "wandb.project": ["shapes"],
     # "wandb.project": [None],
 
 
     
-    # "data.pad_vocab_to": [48],
-    # "generator.hw_param": [{}, {"max_vthread_extent": 15}],
+    "generator.hw_param": [{}, {"max_vthread_extent": 15}],
     # "generator.hw_param": [{"max_vthread_extent": 15}],
     # "data.seed": [42,0,1],
     # "model.seed": [0],
 
-    "train.beta_end": [0.003],
+    "train.beta_end": [0.005, 0.01],
     "train.beta_warmup_epochs": [5],
     "train.order_nce": [True],
     "train.nce_mu": [False],
@@ -43,7 +42,7 @@ SEARCH_SPACE = {
 
     # "model.num_encoder_layers": [3],
     # "model.num_decoder_layers": [3],
-    # "model.d_model": [128],
+    # "model.embed_dim": [128],
     # "model.dim_feedforward": [256, 384],
     # "model.latent_dim": [24, 32],
     # "model.cost_hidden_dim": [64],
@@ -55,6 +54,7 @@ SEARCH_SPACE = {
 
     "train.num_epochs": [20],
     "train.learning_rate": [3e-4],
+    "train.weight_decay": [1e-3, 5e-3],
     "train.lambda_nce": [0.2],
     "train.tau_nce": [0.2],
     "latent_walk.top_k": [1],
@@ -64,7 +64,8 @@ SEARCH_SPACE = {
     # "train.weight_quantile": [0.85],         # cobo, weighted_cost_Vec
     # "train.weight_sigma": [0.5],        # cobo, weighted_cost_Vec
 
-    "train.lambda_cost": [0.0005],
+    "train.lambda_cost": [0.001],
+    "train.tasks_per_batch": [8, 16],
 
     "sampling.strategy": ["sampling"],
     "sampling.top_k": [2],
@@ -75,7 +76,7 @@ SEARCH_SPACE = {
 
     # "train.label_smoothing": [0.02, 0.05, 0.1, 0.2],
     # "train.lambda_recon": [1.0],
-    "latent_walk.task_indices": [(302, 392, 1270, 1490, 1530, 1609, 2040)],
+    "latent_walk.task_indices": [(302, 392, 1270, 1490, 1609, 2040)],
 }
 
 # BEST_METRIC = "val_full_sequence_exact_match"

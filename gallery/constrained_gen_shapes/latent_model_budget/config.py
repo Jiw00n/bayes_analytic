@@ -24,14 +24,14 @@ class DataConfig:
     filter_invalid_records: bool = False
     budget: bool = False
     extent_token: bool = True
-    pad_vocab_to: Optional[int] = None
     cost_target: str = "norm_throughput"   # "neg_log" | "norm_throughput" | "log_norm_throughput"
     cost_target_regression: Optional[str] = "log_norm_throughput"
+    split_mode: Optional[str] = "task_wise"   # None | "task_wise" | "unseen_task"
 
 
 @dataclass
 class ModelConfig:
-    d_model: int = 192
+    embed_dim: int = 192
     nhead: int = 4
     num_encoder_layers: int = 4
     num_decoder_layers: int = 4
@@ -43,7 +43,7 @@ class ModelConfig:
     latent_token_count: int = 4
     adaln: bool = True
     seed: Optional[int] = 42
-    vocab_align_to: Optional[int] = None
+    pos_embedding_length: int = 64
 
 
 @dataclass
@@ -66,13 +66,15 @@ class TrainConfig:
     order_nce_pos_weight_by_percentile: bool = False
     order_nce_pos_weight_sigma: float = 0.2
     nce_mu: bool = False
+    nce_task_mask: bool = True
 
     label_smoothing: float = 0.0
 
 
     batch_size: int = 256
+    tasks_per_batch: Optional[int] = None
     num_epochs: int = 20
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-3
     grad_clip_norm: float = 1.0
     early_stop_patience: int = 1000
     early_stop_min_delta: float = 1e-4
@@ -104,21 +106,17 @@ class TrainConfig:
     # plateau_min_lr: float = 1e-5
 
 
-    lambda_latent_use: float = 0.0
-    latent_use_margin: float = 0.0
-    latent_wrong_top1_margin: float = 0.0
+    resume: bool = False
     use_amp: bool = False
     num_workers: int = 4
     pin_memory: bool = True
     persistent_workers: bool = True
     prefetch_factor: int = 4
     allow_tf32: bool = False
-    resume: bool = False
     resume_from: Optional[str] = None
     device: str = "cuda"
     debug_invalid_step: bool = False
-    use_compressed_teacher_forcing: bool = False
-    
+
 @dataclass
 class LatentWalkConfig:
     """Latent-walk options previously living on TrainConfig.
@@ -141,7 +139,6 @@ class LatentWalkConfig:
     predict_gp_random_n: int = 0
     predict_use_gp: bool = False
 
-    on_final: bool = False
     record_json: Optional[str] = None
     output_dir: Optional[str] = None
 
@@ -152,10 +149,7 @@ class LatentWalkConfig:
 
 @dataclass
 class EvalConfig:
-    greedy_decode: bool = True
-    beam_size: int = 1
     batch_size: int = 128
-    final_full_autoregressive: bool = False
 
 
 @dataclass

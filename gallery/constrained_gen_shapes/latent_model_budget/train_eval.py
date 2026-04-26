@@ -4,17 +4,10 @@ import math
 from typing import Dict, List, Sequence
 
 import torch
-
-try:
-    from tqdm import tqdm
-except Exception:  # pragma: no cover
-    tqdm = None
-
 from torch.utils.data import DataLoader
 
 from .adapter import GeneratorRegistry
-from .dataset import collate_prepared_samples
-from .inference import greedy_decode_batch
+from .dataset import LatentParamDataset, collate_prepared_samples
 from .model import LatentParamVAE
 from .recon_predict_gp import fit_gp_recon_predictor
 from .recon_predict_lgbm import fit_lgbm_ranker_recon_predictor
@@ -72,18 +65,12 @@ def _build_reencode_predictor(
     subset only — walk-buffer samples are NOT included here (intentionally
     different from the recon-predict GP which does include them).
 
-    - cost_head: returns None (tune_by_latent falls back to model.cost_head).
+    - cost_head: returns None (latent_walk falls back to model.cost_head).
     - cost_vec / cost_vec_weighted: wraps the corresponding ridge payload.
     - gp: fits a fresh GP on the training subset.
     - lightgbm_ranker: fits an LGBMRanker on the same selection as GP.
     """
-    import sys as _sys
-    from pathlib import Path as _Path
-
-    _here = _Path(__file__).resolve().parent.parent
-    if str(_here) not in _sys.path:
-        _sys.path.insert(0, str(_here))
-    from tune_by_latent import RidgeReEncodePredictor  # lazy import to avoid cycles
+    from .latent_walk import RidgeReEncodePredictor
 
     name = (name or "cost_head").lower()
     if name not in VALID_REENCODE_PREDICTOR_NAMES:
@@ -158,74 +145,6 @@ def _build_singleton_position_mask(
     valid_mask = targets.ne(int(pad_id))
     singleton_mask = candidate_masks.to(dtype=torch.bool).sum(dim=-1).eq(1)
     return singleton_mask & valid_mask
-
-
-def _compress_teacher_forcing_batch(
-    batch: Dict[str, object],
-    candidate_masks: torch.Tensor,
-    tokenizer: ParamTokenizer,
-) -> Dict[str, torch.Tensor]:
-    """Legacy compression: drop PAD and singleton positions per row, then
-    re-pad each row up to the batch's longest kept length with PAD.
-
-    Selectable via ``TrainConfig.use_compressed_teacher_forcing`` for parity
-    with pre-1964b7a behaviour. The default training path keeps singletons in
-    place and zeros their loss instead.
-    """
-    target_ids: torch.Tensor = batch["target_ids"]
-    decoder_input_ids: torch.Tensor = batch["decoder_input_ids"]
-    decoder_var_ids: torch.Tensor = batch["decoder_var_ids"]
-
-    keep_mask = target_ids.ne(tokenizer.pad_id) & (
-        ~_build_singleton_position_mask(target_ids, candidate_masks, tokenizer.pad_id)
-    )
-    seq_lens = keep_mask.sum(dim=-1)
-    batch_size = int(target_ids.shape[0])
-    vocab_size = int(candidate_masks.shape[-1])
-    max_len = max(int(seq_lens.max().item()), 1)
-
-    new_decoder_input_ids = torch.full(
-        (batch_size, max_len),
-        tokenizer.pad_id,
-        dtype=decoder_input_ids.dtype,
-        device=decoder_input_ids.device,
-    )
-    new_decoder_var_ids = torch.full(
-        (batch_size, max_len),
-        tokenizer.var_pad_id,
-        dtype=decoder_var_ids.dtype,
-        device=decoder_var_ids.device,
-    )
-    new_target_ids = torch.full(
-        (batch_size, max_len),
-        tokenizer.pad_id,
-        dtype=target_ids.dtype,
-        device=target_ids.device,
-    )
-    new_candidate_masks = torch.zeros(
-        (batch_size, max_len, vocab_size),
-        dtype=torch.bool,
-        device=candidate_masks.device,
-    )
-    new_candidate_masks[:, :, tokenizer.pad_id] = True
-
-    for row_idx in range(batch_size):
-        keep_indices = torch.nonzero(keep_mask[row_idx], as_tuple=False).flatten()
-        if int(keep_indices.numel()) <= 0:
-            continue
-        length = int(keep_indices.numel())
-        new_decoder_input_ids[row_idx, :length] = decoder_input_ids[row_idx, keep_indices]
-        new_decoder_var_ids[row_idx, :length] = decoder_var_ids[row_idx, keep_indices]
-        new_target_ids[row_idx, :length] = target_ids[row_idx, keep_indices]
-        new_candidate_masks[row_idx, :length] = candidate_masks[row_idx, keep_indices]
-
-    return {
-        "decoder_input_ids": new_decoder_input_ids,
-        "decoder_var_ids": new_decoder_var_ids,
-        "target_ids": new_target_ids,
-        "candidate_masks": new_candidate_masks,
-        "seq_lens": seq_lens.to(dtype=torch.long),
-    }
 
 
 def _teacher_forcing_accuracy_stats(
@@ -431,6 +350,88 @@ def _build_named_latent_cost_ridges(latent_cost_ridges: Sequence[dict] | None) -
 
 
 @torch.no_grad()
+def evaluate_teacher_forcing_with_encoded(
+    model: LatentParamVAE,
+    dataset,
+    registry: GeneratorRegistry,
+    tokenizer: ParamTokenizer,
+    device: torch.device,
+    *,
+    encoded: Dict[str, object],
+    batch_size: int = 64,
+    num_workers: int = 0,
+    loader: DataLoader | None = None,
+) -> Dict[str, float]:
+    """Decoder-only teacher-forcing eval that reuses ``z`` already produced
+    by :func:`encode_dataset`. Skips the redundant encoder pass over the
+    same dataset (~half the work of :func:`evaluate_teacher_forcing`).
+
+    Note: ``encode_dataset`` runs the encoder with ``deterministic=True``
+    (z = mu), so the metric here is computed on deterministic z's rather
+    than the sampled z's used by the full ``evaluate_teacher_forcing``.
+    """
+    model.eval()
+
+    z_all: torch.Tensor = encoded["z"]
+    if z_all.numel() == 0:
+        return {"token_accuracy": 0.0, "full_sequence_exact_match": 0.0}
+
+    sample_id_to_row: Dict[str, int] = {
+        str(sid): i for i, sid in enumerate(encoded["sample_ids"])
+    }
+
+    if loader is None:
+        loader = _build_eval_loader(
+            dataset,
+            tokenizer,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=device.type == "cuda",
+        )
+
+    token_correct = torch.zeros((), device=device, dtype=torch.long)
+    token_total = torch.zeros((), device=device, dtype=torch.long)
+    exact_count = torch.zeros((), device=device, dtype=torch.long)
+    sample_total = torch.zeros((), device=device, dtype=torch.long)
+
+    latent_token_count = int(model.cfg.latent_token_count)
+    embed_dim = int(model.cfg.embed_dim)
+
+    for batch in loader:
+        rows = [sample_id_to_row[str(sid)] for sid in batch["sample_ids"]]
+        z = z_all[rows].to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=device.type == "cuda",
+        )
+        memory = model.latent_to_memory(z).view(z.size(0), latent_token_count, embed_dim)
+
+        batch = _batch_to_device(batch, device)
+        candidate_masks = _build_teacher_forcing_candidate_masks(
+            batch, registry, tokenizer, device=device, debug_invalid_step=False,
+        )
+        decoder_input_ids = batch["decoder_input_ids"]
+        decoder_var_ids = batch["decoder_var_ids"]
+        target_ids = batch["target_ids"]
+        cand_masks_eval = candidate_masks
+
+        dec_pad = decoder_input_ids.eq(tokenizer.pad_id)
+        logits = model.decode(decoder_input_ids, decoder_var_ids, memory, z, dec_pad)
+
+        b_correct, b_total, b_exact, b_sample_total = _teacher_forcing_accuracy_stats(
+            logits, target_ids, cand_masks_eval, tokenizer.pad_id,
+        )
+        token_correct = token_correct + b_correct.detach()
+        token_total = token_total + b_total.detach()
+        exact_count = exact_count + b_exact.detach()
+        sample_total = sample_total + b_sample_total.detach()
+
+    return {
+        "token_accuracy": float(token_correct.item()) / max(int(token_total.item()), 1),
+        "full_sequence_exact_match": float(exact_count.item()) / max(int(sample_total.item()), 1),
+    }
+
+
 @torch.no_grad()
 def evaluate_teacher_forcing(
     model: LatentParamVAE,
@@ -439,7 +440,6 @@ def evaluate_teacher_forcing(
     tokenizer: ParamTokenizer,
     device: torch.device,
     batch_size: int = 64,
-    use_compressed: bool = False,
     num_workers: int = 0,
     loader: DataLoader | None = None,
 ) -> Dict[str, float]:
@@ -468,17 +468,10 @@ def evaluate_teacher_forcing(
             device=device,
             debug_invalid_step=False,
         )
-        if use_compressed:
-            compressed = _compress_teacher_forcing_batch(batch, candidate_masks, tokenizer)
-            decoder_input_ids = compressed["decoder_input_ids"]
-            decoder_var_ids = compressed["decoder_var_ids"]
-            target_ids = compressed["target_ids"]
-            cand_masks_eval = compressed["candidate_masks"]
-        else:
-            decoder_input_ids = batch["decoder_input_ids"]
-            decoder_var_ids = batch["decoder_var_ids"]
-            target_ids = batch["target_ids"]
-            cand_masks_eval = candidate_masks
+        decoder_input_ids = batch["decoder_input_ids"]
+        decoder_var_ids = batch["decoder_var_ids"]
+        target_ids = batch["target_ids"]
+        cand_masks_eval = candidate_masks
         out = model(
             batch["encoder_token_ids"],
             batch["encoder_var_ids"],
@@ -506,57 +499,6 @@ def evaluate_teacher_forcing(
     return {
         "token_accuracy": token_correct_i / max(token_total_i, 1),
         "full_sequence_exact_match": exact_count_i / max(sample_total_i, 1),
-    }
-
-
-@torch.no_grad()
-def evaluate_autoregressive(
-    model: LatentParamVAE,
-    dataset,
-    registry: GeneratorRegistry,
-    tokenizer: ParamTokenizer,
-    device: torch.device,
-    batch_size: int = 64,
-) -> Dict[str, float]:
-    model.eval()
-
-    token_correct = 0
-    token_total = 0
-    exact_match = 0
-    samples = list(dataset.samples)
-    stride = max(int(batch_size), 1)
-    total_batches = (len(samples) + stride - 1) // stride
-    print("[eval] validation batches")
-    for start in tqdm(range(0, len(samples), stride), desc="eval batches", total=total_batches):
-        batch_samples = samples[start:start + stride]
-        results = greedy_decode_batch(model, batch_samples, registry, tokenizer, device)
-        batch_token_correct = 0
-        batch_token_total = 0
-        batch_exact_match = 0
-        for sample, result in zip(batch_samples, results):
-            pred_values = [result.predicted_param_dict[name] for name in sample.ordered_param_names]
-            gold_values = list(sample.ordered_param_values)
-
-            for pred, gold in zip(pred_values, gold_values):
-                token_correct += int(pred == gold)
-                token_total += 1
-                batch_token_correct += int(pred == gold)
-                batch_token_total += 1
-
-            is_exact = pred_values == gold_values
-            exact_match += int(is_exact)
-            batch_exact_match += int(is_exact)
-
-        batch_tok_acc = batch_token_correct / max(batch_token_total, 1)
-        batch_exact = batch_exact_match / max(len(batch_samples), 1)
-        print(
-            f"[eval-batch {start // stride + 1}/{total_batches}] "
-            f"tok_acc={batch_tok_acc:.4f} exact={batch_exact:.4f}"
-        )
-
-    return {
-        "token_accuracy": token_correct / max(token_total, 1),
-        "full_sequence_exact_match": exact_match / max(len(dataset), 1),
     }
 
 
@@ -901,3 +843,157 @@ def fit_latent_cost_ridges(
         if payload is not None:
             fitted.append(payload)
     return fitted
+
+
+# ---------------------------------------------------------------------------
+# Per-epoch eval orchestration (formerly in train.py)
+# ---------------------------------------------------------------------------
+
+def _fit_epoch_ridges(
+    model, bundle, tokenizer, config, device,
+    *,
+    ridge_dataset=None,
+    ridge_loader=None,
+    encoded=None,
+):
+    if not bool(getattr(config.train, "cost_ridge_vec", False)):
+        return [], None, {}
+
+    if ridge_dataset is None:
+        include_val = bool(getattr(config.train, "cost_ridge_include_val", False))
+        if include_val and len(bundle.val_dataset.samples) > 0:
+            ridge_dataset = LatentParamDataset(
+                list(bundle.train_dataset.samples) + list(bundle.val_dataset.samples)
+            )
+        else:
+            ridge_dataset = bundle.train_dataset
+
+    ridge_alphas = _resolve_ridge_alphas(config)
+    _ridge_cost_target = str(getattr(config.data, "cost_target", "neg_log"))
+    _ridge_cost_target_regression = getattr(config.data, "cost_target_regression", None)
+    _ridge_mins = list(bundle.task_min_costs.values())
+    _ridge_task_min_cost = float(_ridge_mins[0]) if _ridge_mins else None
+    _ridge_fit_target = _ridge_cost_target_regression or _ridge_cost_target
+    print(
+        f"[ridge] fit_target={_ridge_fit_target!r} output_target={_ridge_cost_target!r} "
+        f"task_min_cost={_ridge_task_min_cost!r}"
+    )
+    latent_cost_ridges = fit_latent_cost_ridges(
+        model,
+        ridge_dataset,
+        tokenizer,
+        device,
+        alphas=ridge_alphas,
+        batch_size=config.eval.batch_size,
+        cost_target=_ridge_cost_target,
+        cost_target_regression=_ridge_cost_target_regression,
+        task_min_cost=_ridge_task_min_cost,
+        loader=ridge_loader,
+        encoded=encoded,
+    )
+    ridge_metrics: Dict[str, float] = {}
+    for ridge_payload in latent_cost_ridges:
+        alpha = float(ridge_payload["alpha"])
+        alpha_suffix = _alpha_metric_suffix(alpha)
+        if alpha == float(ridge_alphas[0]):
+            ridge_metrics["train_ridge_mse"] = float(ridge_payload["train_mse"])
+        ridge_metrics[f"train_ridge_alpha_{alpha_suffix}_mse"] = float(ridge_payload["train_mse"])
+
+    if bool(getattr(config.train, "cost_ridge_weighted", False)):
+        weighted_ridges = fit_latent_cost_ridges(
+            model,
+            ridge_dataset,
+            tokenizer,
+            device,
+            alphas=ridge_alphas,
+            batch_size=config.eval.batch_size,
+            sample_weight_quantile=float(getattr(config.train, "weight_quantile", 0.85)),
+            sample_weight_sigma=float(getattr(config.train, "weight_sigma", 0.25)),
+            cost_target=_ridge_cost_target,
+            cost_target_regression=_ridge_cost_target_regression,
+            task_min_cost=_ridge_task_min_cost,
+            loader=ridge_loader,
+            encoded=encoded,
+        )
+        for ridge_payload in weighted_ridges:
+            alpha = float(ridge_payload["alpha"])
+            alpha_suffix = _alpha_metric_suffix(alpha)
+            if alpha == float(ridge_alphas[0]):
+                ridge_metrics["train_ridge_weighted_mse"] = float(ridge_payload["train_mse"])
+            ridge_metrics[f"train_ridge_weighted_alpha_{alpha_suffix}_mse"] = float(
+                ridge_payload["train_mse"]
+            )
+        latent_cost_ridges = list(latent_cost_ridges) + list(weighted_ridges)
+
+    return latent_cost_ridges, ridge_metrics
+
+
+def _evaluate_validation_epoch(
+    model, bundle, registry, tokenizer, config, device, epoch, latent_cost_ridges,
+    *,
+    val_loader=None,
+    encoded_val=None,
+):
+    summary: Dict[str, float] = {}
+    if not bundle.val_dataset.samples:
+        return summary
+
+    val_tf_metrics = evaluate_teacher_forcing(
+        model,
+        bundle.val_dataset,
+        registry,
+        tokenizer,
+        device,
+        batch_size=config.eval.batch_size,
+        loader=val_loader,
+    )
+    summary.update({f"val_{k}": float(v) for k, v in val_tf_metrics.items()})
+    print(
+        f"[epoch {epoch}] val_tok_acc={summary['val_token_accuracy']:.4f} "
+        f"val_exact={summary['val_full_sequence_exact_match']:.4f}"
+    )
+
+    cost_metrics = evaluate_cost_ranking(
+        model,
+        bundle.val_dataset,
+        tokenizer,
+        device,
+        batch_size=config.eval.batch_size,
+        latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
+        loader=val_loader,
+        encoded=encoded_val,
+    )
+    summary.update({f"val_{k}": v for k, v in cost_metrics.items()})
+
+    if "cost_head_actual_top1_pred_rank" in cost_metrics:
+        print(
+            f"val_cost_head_actual_top1_pred_rank : {int(cost_metrics['cost_head_actual_top1_pred_rank'])}\n"
+            f"val_cost_head_pred_top1_actual_cost : {cost_metrics['cost_head_pred_top1_actual_cost']:.6f}\n"
+            f"val_cost_head_pred_top10_mean_actual_cost : {cost_metrics['cost_head_pred_top10_mean_actual_cost']:.6f}\n"
+        )
+    if "cost_vec_actual_top1_pred_rank" in cost_metrics:
+        print(
+            f"val_cost_vec_actual_top1_pred_rank : {int(cost_metrics['cost_vec_actual_top1_pred_rank'])}\n"
+            f"val_cost_vec_pred_top1_actual_cost : {cost_metrics['cost_vec_pred_top1_actual_cost']:.6f}\n"
+            f"val_cost_vec_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_pred_top10_mean_actual_cost']:.6f}\n"
+        )
+    if "cost_vec_weighted_actual_top1_pred_rank" in cost_metrics:
+        print(
+            f"val_cost_vec_weighted_actual_top1_pred_rank : {int(cost_metrics['cost_vec_weighted_actual_top1_pred_rank'])}\n"
+            f"val_cost_vec_weighted_pred_top1_actual_cost : {cost_metrics['cost_vec_weighted_pred_top1_actual_cost']:.6f}\n"
+            f"val_cost_vec_weighted_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_weighted_pred_top10_mean_actual_cost']:.6f}\n"
+        )
+    for key, value in sorted(cost_metrics.items()):
+        if key.startswith("cost_vec_alpha_") and key.endswith("_actual_top1_pred_rank"):
+            prefix = key[: -len("_actual_top1_pred_rank")]
+            top1_cost_key = f"{prefix}_pred_top1_actual_cost"
+            top10_key = f"{prefix}_pred_top10_mean_actual_cost"
+            top20_key = f"{prefix}_pred_top20_mean_actual_cost"
+            print(
+                f"{'val_' + key} : {int(value)}\n"
+                f"{'val_' + top1_cost_key} : {cost_metrics[top1_cost_key]:.6f}\n"
+                f"{'val_' + top10_key} : {cost_metrics[top10_key]:.6f}\n"
+                f"{'val_' + top20_key} : {cost_metrics[top20_key]:.6f}\n"
+            )
+
+    return summary

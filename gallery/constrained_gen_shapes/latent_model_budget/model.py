@@ -20,9 +20,9 @@ class ModelOutput:
 
 
 class AttentionMeanPool(nn.Module):
-    def __init__(self, d_model: int):
+    def __init__(self, embed_dim: int):
         super().__init__()
-        self.score = nn.Linear(d_model, 1)
+        self.score = nn.Linear(embed_dim, 1)
 
     def forward(self, x: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
         # x: [B, L, D], pad_mask: [B, L] where True means PAD
@@ -38,31 +38,31 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
 
 
 class AdaptiveDecoderLayer(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, latent_dim: int):
+    def __init__(self, embed_dim: int, nhead: int, dim_feedforward: int, dropout: float, latent_dim: int):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
+            embed_dim=embed_dim,
             num_heads=nhead,
             dropout=dropout,
             batch_first=True,
         )
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
+            embed_dim=embed_dim,
             num_heads=nhead,
             dropout=dropout,
             batch_first=True,
         )
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.linear1 = nn.Linear(embed_dim, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, embed_dim)
         self.dropout = nn.Dropout(dropout)
         self.dropout_ff = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.norm1 = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.norm3 = nn.LayerNorm(embed_dim, elementwise_affine=False)
         self.act = nn.GELU()
         self.ada_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(latent_dim, 9 * d_model),
+            nn.Linear(latent_dim, 9 * embed_dim),
         )
 
     def forward(
@@ -116,12 +116,12 @@ class AdaptiveDecoderLayer(nn.Module):
 
 
 class PerLayerCrossAttentionDecoder(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, num_layers: int, latent_dim: int):
+    def __init__(self, embed_dim: int, nhead: int, dim_feedforward: int, dropout: float, num_layers: int, latent_dim: int):
         super().__init__()
         self.layers = nn.ModuleList(
             [
                 AdaptiveDecoderLayer(
-                    d_model=d_model,
+                    embed_dim=embed_dim,
                     nhead=nhead,
                     dim_feedforward=dim_feedforward,
                     dropout=dropout,
@@ -130,7 +130,7 @@ class PerLayerCrossAttentionDecoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(
         self,
@@ -166,26 +166,15 @@ class LatentParamVAE(nn.Module):
         self.vocab_size = vocab_size
         self.num_vars = num_vars
 
-        d_model = cfg.d_model
-        # If vocab_align_to is set and larger than vocab_size, drain extra RNG
-        # after each vocab-dependent layer so the global torch RNG phase matches
-        # what a run with vocab=vocab_align_to would have. This lets A/B compare
-        # vocab sizes without confounding DataLoader shuffle / dropout RNG shift.
-        _align_to = getattr(cfg, "vocab_align_to", None)
-        _deficit = (int(_align_to) - int(vocab_size)) if _align_to is not None else 0
-        if _deficit < 0:
-            _deficit = 0
+        embed_dim = cfg.embed_dim
 
-        self.token_emb = nn.Embedding(vocab_size, d_model)
-        if _deficit > 0:
-            # nn.Embedding uses init.normal_(mean=0, std=1).
-            torch.empty(_deficit, d_model).normal_()
-        self.var_emb = nn.Embedding(num_vars, d_model)
-        self.pos_emb = nn.Embedding(2048, d_model)
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
+        self.var_emb = nn.Embedding(num_vars, embed_dim)
+        self.pos_emb = nn.Embedding(cfg.pos_embedding_length, embed_dim)
         self.dropout = nn.Dropout(cfg.dropout)
 
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
+            d_model=embed_dim,
             nhead=cfg.nhead,
             dim_feedforward=cfg.dim_feedforward,
             dropout=cfg.dropout,
@@ -196,7 +185,7 @@ class LatentParamVAE(nn.Module):
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=cfg.num_encoder_layers)
 
         self.decoder = PerLayerCrossAttentionDecoder(
-            d_model=d_model,
+            embed_dim=embed_dim,
             nhead=cfg.nhead,
             dim_feedforward=cfg.dim_feedforward,
             dropout=cfg.dropout,
@@ -205,8 +194,8 @@ class LatentParamVAE(nn.Module):
         )
 
         # replace masked mean with attention-weighted mean pooling
-        self.pool = AttentionMeanPool(d_model)
-        
+        self.pool = AttentionMeanPool(embed_dim)
+
         # mean pool
         # self.pool = lambda x, pad_mask: (
         #     (x * (~pad_mask).unsqueeze(-1).to(x.dtype)).sum(dim=1)
@@ -215,14 +204,14 @@ class LatentParamVAE(nn.Module):
 
 
         # # cls token pooling
-        # self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        # self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
-        self.to_mu = nn.Linear(d_model, cfg.latent_dim)
-        self.to_logvar = nn.Linear(d_model, cfg.latent_dim)
+        self.to_mu = nn.Linear(embed_dim, cfg.latent_dim)
+        self.to_logvar = nn.Linear(embed_dim, cfg.latent_dim)
         self.latent_to_memory = nn.Sequential(
-            nn.Linear(cfg.latent_dim, d_model * cfg.latent_token_count),
+            nn.Linear(cfg.latent_dim, embed_dim * cfg.latent_token_count),
             # nn.GELU(),
-            # nn.Linear(d_model * cfg.latent_token_count, d_model * cfg.latent_token_count),
+            # nn.Linear(embed_dim * cfg.latent_token_count, embed_dim * cfg.latent_token_count),
         )
 
         self.cost_head = nn.Sequential(
@@ -235,13 +224,13 @@ class LatentParamVAE(nn.Module):
         # self.cost_head = self.cost_predict
         # self.cost_head = nn.Parameter(torch.randn(cfg.latent_dim))
 
-        self.lm_head = nn.Linear(d_model, vocab_size)
+        self.lm_head = nn.Linear(embed_dim, vocab_size)
         if _deficit > 0:
             # nn.Linear.reset_parameters: kaiming_uniform_(a=sqrt(5)) on weight
-            # with bound=1/sqrt(fan_in)=1/sqrt(d_model), and uniform_(-bound,bound)
-            # on bias (fan_in is still d_model for the bias calculation).
-            _bound = 1.0 / math.sqrt(d_model)
-            torch.empty(_deficit, d_model).uniform_(-_bound, _bound)
+            # with bound=1/sqrt(fan_in)=1/sqrt(embed_dim), and uniform_(-bound,bound)
+            # on bias (fan_in is still embed_dim for the bias calculation).
+            _bound = 1.0 / math.sqrt(embed_dim)
+            torch.empty(_deficit, embed_dim).uniform_(-_bound, _bound)
             torch.empty(_deficit).uniform_(-_bound, _bound)
 
     def _positions(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -279,7 +268,7 @@ class LatentParamVAE(nn.Module):
         mu = self.to_mu(pooled)
         logvar = self.to_logvar(pooled)
         z = mu if deterministic else self.reparameterize(mu, logvar)
-        memory = self.latent_to_memory(z).view(z.size(0), self.cfg.latent_token_count, self.cfg.d_model)
+        memory = self.latent_to_memory(z).view(z.size(0), self.cfg.latent_token_count, self.cfg.embed_dim)
         return mu, logvar, z, memory
 
     # cls token prepend + transformer pooling
@@ -317,7 +306,7 @@ class LatentParamVAE(nn.Module):
     #     mu = self.to_mu(pooled)
     #     logvar = self.to_logvar(pooled)
     #     z = mu if deterministic else self.reparameterize(mu, logvar)
-    #     memory = self.latent_to_memory(z).view(z.size(0), self.cfg.latent_token_count, self.cfg.d_model)
+    #     memory = self.latent_to_memory(z).view(z.size(0), self.cfg.latent_token_count, self.cfg.embed_dim)
     #     return mu, logvar, z, memory
 
 

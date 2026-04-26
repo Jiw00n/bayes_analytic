@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
-import sys
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -13,30 +11,24 @@ try:
 except Exception:  # pragma: no cover
     wandb = None
 
-import copy
-import dataclasses
 import math
 
-from .adapter import (
-    GeneratorRegistry,
-    JsonSampleRecord,
-    cost_label_to_raw,
-    cost_raw_to_label,
-    load_json_samples,
-)
+from .adapter import GeneratorRegistry, JsonSampleRecord
 from .dataset import (
-    DatasetBundle,
     LatentParamDataset,
-    _build_prepared_sample,
-    _generator_cache_suffix,
-    _get_generator_for_record,
-    budget_enabled,
     build_dataset_bundle,
-    get_model_param_order,
 )
-from .inference import SamplingOptions, greedy_decode_sample, pretty_print_reconstruction
+from .inference import SamplingOptions
 from .model import LatentParamVAE
 from .runtime_utils import (
+    TaskBalancedBatchSampler,
+    _build_wandb_project_name,
+    _build_wandb_run_name,
+    _config_for_resume_compare,
+    _family_from_json_path,
+    _remap_for_wandb,
+    _resolve_pt_dir,
+    _resolve_run_family_from_config,
     configure_runtime,
     load_checkpoint,
     prepare_loader,
@@ -48,628 +40,32 @@ from .runtime_utils import (
 from .recon_predict_gp import (
     WalkSampleBuffer,
     fit_gp_recon_predictor,
-    make_sym_map_key,
-    make_task_sym_map_key,
 )
-from .tokenizer import ParamTokenizer
 from .train_epoch import train_one_epoch
 from .train_eval import (
-    _alpha_metric_suffix,
     _build_named_latent_cost_ridges,
     _build_reencode_predictor,
     _concat_encoded,
-    _resolve_ridge_alphas,
+    _evaluate_validation_epoch,
+    _fit_epoch_ridges,
     encode_dataset,
-    evaluate_autoregressive,
     evaluate_cost_ranking,
-    evaluate_teacher_forcing,
-    fit_latent_cost_ridges,
+    evaluate_teacher_forcing_with_encoded,
 )
-
-
-def _wandb_section(key: str) -> str:
-    """Group metric keys into wandb sections (train/, val/, walk/, ...)."""
-    if "/" in key:
-        return key
-    if key == "epoch":
-        return key
-    section_prefixes = (
-        ("train_", "train/"),
-        ("val_", "val/"),
-        ("eval_val_", "eval_val/"),
-        ("eval_test_", "eval_test/"),
-        ("test_", "test/"),
-        ("final_", "final/"),
-    )
-    for old, new in section_prefixes:
-        if key.startswith(old):
-            return new + key[len(old):]
-    return f"train/{key}"
-
-
-def _remap_for_wandb(metrics: Dict) -> Dict:
-    return {_wandb_section(k): v for k, v in metrics.items()}
-
-
-def _resolve_walk_record_jsons(config) -> List[str]:
-    """Return the list of record JSONs to walk per epoch/final.
-
-    Order of resolution:
-    1. Explicit ``config.latent_walk.record_json``: a single file or a
-       directory (directory → all ``*.json`` inside, sorted).
-    2. Otherwise: every entry of ``config.data.json_paths`` (one task each).
-
-    If ``config.latent_walk.task_indices`` is set (tuple/list of ints), the
-    resolved list is filtered to keep only jsons whose leading-digit task
-    index (per ``_task_lookup_key_from_json``) is in the selection, AND the
-    output is reordered to match the order given in ``task_indices``.
-    """
-    explicit = getattr(config.latent_walk, "record_json", None)
-    if explicit:
-        p = Path(str(explicit))
-        if p.is_dir():
-            paths = [str(x) for x in sorted(p.glob("*.json"))]
-        else:
-            paths = [str(p)]
-    else:
-        json_paths = list(getattr(config.data, "json_paths", []) or [])
-        paths = [str(p) for p in json_paths]
-
-    task_indices = getattr(config.latent_walk, "task_indices", None)
-    if task_indices:
-        ordered_keys = [str(int(i)) for i in task_indices]
-        by_key: Dict[str, str] = {}
-        for p in paths:
-            k = _task_lookup_key_from_json(p)
-            by_key.setdefault(k, p)  # first match wins on duplicates
-        missing = [k for k in ordered_keys if k not in by_key]
-        if missing:
-            print(
-                f"[train] latent_walk.task_indices not found in resolved jsons: "
-                f"{missing}"
-            )
-        paths = [by_key[k] for k in ordered_keys if k in by_key]
-    return paths
-
-
-def _task_lookup_key_from_json(json_path: str | Path) -> str:
-    """Stable per-task identifier for naming the task's measurement_lookup
-    file. Mirrors the heuristic used elsewhere: leading digits of the json
-    filename (the task_index prefix) when present, otherwise the full stem.
-    """
-    import re
-
-    p = Path(json_path)
-    m = re.match(r"^(\d+)", p.stem)
-    return m.group(1) if m else p.stem
-
-
-def _probe_workload_key_from_json(json_path: str | Path) -> Optional[str]:
-    """Read the first sample of ``json_path`` and return its ``workload_key``.
-    Used to filter the in-memory walk_buffer when seeding a per-task cache so
-    only the task's own entries are folded in (and ultimately saved to its
-    own lookup file)."""
-    try:
-        probes = load_json_samples(json_path)
-    except Exception:  # pylint: disable=broad-except
-        return None
-    if not probes:
-        return None
-    return getattr(probes[0], "workload_key", None)
-
-
-def _resolve_walk_task_min_cost(
-    record_json_path: str,
-    *,
-    bundle: DatasetBundle,
-    fallback: Optional[float],
-) -> Optional[float]:
-    """Look up the per-task ``min_cost`` for the workload of the given record
-    JSON. Probes one record (the first) to read its ``(workload_key,
-    target_kind)`` and queries ``bundle.task_min_cost_for``. Falls back to
-    ``fallback`` (typically the bundle's first-task min_cost) if the lookup
-    fails — keeps single-task behavior unchanged.
-    """
-    try:
-        probes = load_json_samples(record_json_path)
-    except Exception:  # pylint: disable=broad-except
-        return fallback
-    if not probes:
-        return fallback
-    probe = probes[0]
-    found = bundle.task_min_cost_for(probe.workload_key, probe.target_kind)
-    return found if found is not None else fallback
-
-
-def _select_topk_records_from_path(
-    record_json_path: str | Path,
-    *,
-    k: int,
-) -> list[JsonSampleRecord]:
-    if k <= 0:
-        return []
-    records = load_json_samples(record_json_path)
-    if not records:
-        return []
-    records_with_cost = [
-        record for record in records
-        if record.cost is not None and torch.isfinite(torch.tensor(float(record.cost)))
-    ]
-    if not records_with_cost:
-        return []
-    records_with_cost.sort(key=lambda record: float(record.cost), reverse=True)
-    return records_with_cost[: int(k)]
-
-
-def _summarize_walk_records(
-    records,
-    *,
-    reference_params: Optional[Dict[str, int]] = None,
-    reference_best_seconds: Optional[float] = None,
-) -> Dict[str, float]:
-    summary: Dict[str, float] = {}
-    if not records:
-        return summary
-
-    ref = (
-        {str(k): int(v) for k, v in reference_params.items()}
-        if reference_params
-        else None
-    )
-
-    def _is_reference(params) -> bool:
-        if ref is None or not params:
-            return False
-        shared = set(ref) & set(params)
-        if not shared:
-            return False
-        return all(int(params[k]) == ref[k] for k in shared)
-
-    pred_costs = [float(r.predicted_score) for r in records]
-    summary["walk/num_steps"] = float(len(records))
-    if pred_costs:
-        summary["walk/best_predicted_cost"] = float(max(pred_costs))
-        summary["walk/mean_predicted_cost"] = float(sum(pred_costs) / len(pred_costs))
-
-    recon_records = [
-        r for r in records if getattr(r, "recon_predict_cost", None) is not None
-    ]
-    if recon_records:
-        recon_costs = [float(r.recon_predict_cost) for r in recon_records]
-        summary["walk/best_recon_predict_cost"] = float(max(recon_costs))
-        summary["walk/mean_recon_predict_cost"] = float(sum(recon_costs) / len(recon_costs))
-        best_recon_record = max(
-            recon_records, key=lambda r: float(r.recon_predict_cost)
-        )
-        best_std = getattr(best_recon_record, "recon_predict_std", None)
-        if best_std is not None:
-            summary["walk/best_recon_predict_std"] = float(best_std)
-
-    measured_novel: list[tuple[float, float]] = []
-    measured_novel_raw_seconds: list[float] = []
-    true_cost_at_alpha0: Optional[float] = None
-    for record in records:
-        meas = record.measurement or {}
-        if meas.get("ok") and meas.get("usable_measurement"):
-            is_novel = (
-                abs(float(record.alpha)) >= 1e-12
-                and not _is_reference(record.params)
-            )
-            mean_cost = meas.get("mean_cost")
-            if mean_cost is not None and is_novel:
-                measured_novel.append((float(record.alpha), float(mean_cost)))
-            if is_novel:
-                raw_costs = meas.get("costs") or []
-                if raw_costs:
-                    raw_mean = float(
-                        sum(float(c) for c in raw_costs) / len(raw_costs)
-                    )
-                    if math.isfinite(raw_mean) and raw_mean > 0:
-                        measured_novel_raw_seconds.append(raw_mean)
-        if abs(float(record.alpha)) < 1e-12:
-            true_mc = meas.get("true_mean_cost") if meas else None
-            if true_mc is not None:
-                true_cost_at_alpha0 = float(true_mc)
-
-    summary["walk/num_unique_sym_map"] = float(
-        len({frozenset((str(k), int(v)) for k, v in r.sym_map.items()) for r in records})
-    )
-    if measured_novel:
-        best_alpha, best_mc = max(measured_novel, key=lambda x: x[1])
-        summary["walk/best_measured_mean_cost"] = best_mc
-        summary["walk/alpha_at_best"] = best_alpha
-    if measured_novel_raw_seconds:
-        best_raw = min(measured_novel_raw_seconds)
-        summary["walk/best_measured_raw_seconds"] = best_raw
-        if (
-            reference_best_seconds is not None
-            and math.isfinite(float(reference_best_seconds))
-            and float(reference_best_seconds) > 0
-            and best_raw > 0
-        ):
-            summary["walk/reference_best_seconds"] = float(reference_best_seconds)
-            summary["walk/speedup_vs_reference"] = (
-                float(reference_best_seconds) / best_raw
-            )
-    if true_cost_at_alpha0 is not None:
-        summary["walk/true_cost_at_alpha0"] = true_cost_at_alpha0
-    return summary
-
-
-def _merge_walk_summaries(summaries: list[Dict[str, float]]) -> Dict[str, float]:
-    """Aggregate per-task walk summaries into the keys the wandb ``walk/``
-    section displays:
-
-    - ``walk/num_steps``: total decoded steps across tasks.
-    - ``walk/num_records``: number of tasks walked.
-    - ``walk/mean_measured_best_cost``: mean over tasks of each task's best
-      measured cost in this walk.
-
-    Per-task breakdowns (best/alpha/num_unique_sym_map/etc.) are emitted
-    separately by ``_augment_summary_with_per_task``.
-    """
-    merged: Dict[str, float] = {}
-    if not summaries:
-        return merged
-
-    num_records = 0
-    total_steps = 0.0
-    best_measured_per_task: list[float] = []
-    for summary in summaries:
-        if not summary:
-            continue
-        num_records += 1
-        total_steps += float(summary.get("walk/num_steps", 0.0))
-        bm = summary.get("walk/best_measured_mean_cost")
-        if bm is not None:
-            best_measured_per_task.append(float(bm))
-
-    merged["walk/num_records"] = float(num_records)
-    merged["walk/num_steps"] = total_steps
-    if best_measured_per_task:
-        merged["walk/mean_measured_best_cost"] = (
-            sum(best_measured_per_task) / len(best_measured_per_task)
-        )
-    return merged
-
-
-def _augment_summary_with_per_task(
-    summary_out: Dict[str, float],
-    per_task_summaries_keyed: list[tuple[str, Dict[str, float]]],
-    *,
-    epoch: int,
-    running_best: Dict[str, float],
-    running_best_epoch: Dict[str, int],
-    running_best_alpha: Dict[str, float],
-    key_prefix: str = "",
-    reference_label: Optional[str] = None,
-) -> None:
-    """Emit per-task wandb panels and update the all-time-best trackers.
-
-    Sections produced (each per task_index, suffixed by ``key_prefix`` when
-    needed for e.g. ``final_`` runs):
-
-    - ``walk_measured/{task}`` — best measured cost in *this* walk
-    - ``walk_num_unique_sym_map/{task}``
-    - ``walk_best_cost/{task}`` — running max across walks
-    - ``walk_best_epoch/{task}`` — epoch at which ``walk_best_cost`` improved
-    - ``walk_alpha_at_best/{task}`` — alpha at the all-time best
-
-    ``running_best*`` dicts are mutated in place so the running max persists
-    across walks.
-    """
-    for tkey, s in per_task_summaries_keyed:
-        if not s:
-            continue
-        bm = s.get("walk/best_measured_mean_cost")
-        if bm is not None:
-            summary_out[f"{key_prefix}walk_measured/{tkey}"] = float(bm)
-        nu = s.get("walk/num_unique_sym_map")
-        if nu is not None:
-            summary_out[f"{key_prefix}walk_num_unique_sym_map/{tkey}"] = float(nu)
-        if reference_label:
-            sp = s.get("walk/speedup_vs_reference")
-            if sp is not None:
-                summary_out[
-                    f"{key_prefix}walk_measured_{reference_label}/{tkey}"
-                ] = float(sp)
-        if bm is not None:
-            prev = running_best.get(tkey)
-            if prev is None or float(bm) > prev:
-                running_best[tkey] = float(bm)
-                running_best_epoch[tkey] = int(epoch)
-                aab = s.get("walk/alpha_at_best")
-                if aab is not None:
-                    running_best_alpha[tkey] = float(aab)
-                elif tkey in running_best_alpha:
-                    # Drop stale alpha when the new best lacks one.
-                    running_best_alpha.pop(tkey, None)
-        if tkey in running_best:
-            summary_out[f"{key_prefix}walk_best_cost/{tkey}"] = running_best[tkey]
-            summary_out[f"{key_prefix}walk_best_epoch/{tkey}"] = float(
-                running_best_epoch[tkey]
-            )
-            if tkey in running_best_alpha:
-                summary_out[f"{key_prefix}walk_alpha_at_best/{tkey}"] = (
-                    running_best_alpha[tkey]
-                )
-
-
-def _ingest_walk_records_into_buffer(
-    walk_buffer: WalkSampleBuffer,
-    *,
-    walk_records,
-    ref_record: JsonSampleRecord,
-    registry: GeneratorRegistry,
-    tokenizer: ParamTokenizer,
-    config,
-) -> None:
-    """Add measured walk records into the GP-augmentation buffer.
-
-    Each walk record contributes one entry keyed by its sym_map; entries are
-    PreparedSamples encoded with the same param order the dataset uses, with
-    `cost` set to the measured negative-log mean cost.
-    """
-    include_budget = budget_enabled(config)
-    try:
-        gen = _get_generator_for_record(ref_record, registry)
-        order = get_model_param_order(gen, include_budget=include_budget)
-    except Exception as err:  # pragma: no cover
-        print(f"[walk-buffer] cannot resolve param order: {type(err).__name__}: {err}")
-        return
-
-    added = 0
-    skipped_dup = 0
-    for record in walk_records:
-        if not getattr(record, "state_build_ok", False):
-            continue
-        meas = getattr(record, "measurement", None) or {}
-        if not (meas.get("ok") and meas.get("usable_measurement")):
-            continue
-        mean_cost = meas.get("mean_cost")
-        if mean_cost is None or not math.isfinite(float(mean_cost)):
-            continue
-
-        sym_key = make_task_sym_map_key(
-            getattr(ref_record, "workload_key", None),
-            {str(k): int(v) for k, v in record.sym_map.items() if isinstance(v, int)},
-        )
-        if sym_key in walk_buffer:
-            skipped_dup += 1
-            continue
-
-        try:
-            ordered_values = [int(record.params[name]) for name in order]
-        except KeyError:
-            continue
-
-        sample_id = f"{ref_record.sample_id}_walk_{abs(hash(sym_key)) & 0xFFFFFFFF:08x}"
-        synthesized = dataclasses.replace(
-            ref_record,
-            sample_id=sample_id,
-            params=dict(record.params),
-            cost=float(mean_cost),
-        )
-        try:
-            prepared = _build_prepared_sample(
-                synthesized,
-                order,
-                ordered_values,
-                tokenizer,
-                registry=registry,
-                include_candidate_masks=False,
-            )
-        except Exception as err:  # pragma: no cover
-            print(f"[walk-buffer] prepare failed: {type(err).__name__}: {err}")
-            continue
-        walk_buffer.add(sym_key, prepared)
-        added += 1
-
-    if added or skipped_dup:
-        print(
-            f"[walk-buffer] added={added} dup_skipped={skipped_dup} "
-            f"buffer_size={len(walk_buffer)}"
-        )
-
-
-def _run_periodic_latent_walk(
-    *,
-    model,
-    device,
-    checkpoint_path,
-    record_json_path: str,
-    walk_output_dir: str,
-    network_info_folder: Optional[str],
-    epoch_label: str,
-    config,
-    registry,
-    tokenizer,
-    latent_cost_ridge,
-    timestamp: Optional[str] = None,
-    top_k: int = 1,
-    num_steps: int = 8,
-    step_size: float = 0.25,
-    use_latent_gradient: bool = False,
-    include_recon_predict: bool = False,
-    include_measurement: bool = True,
-    recon_predictor=None,
-    reencode_predictor=None,
-    reencode_predictor_name: str = "cost_head",
-    walk_buffer: Optional[WalkSampleBuffer] = None,
-    walk_key_prefix: str = "",
-    measurement_cache: Optional[dict] = None,
-    sampling_options: Optional[SamplingOptions] = None,
-    cost_target: str = "neg_log",
-    task_min_cost: Optional[float] = None,
-    sort_by: str = "re_pred",
-    show_neg_log: bool = False,
-    reference_best_dir: Optional[str] = None,
-) -> Dict[str, float]:
-    here = Path(__file__).resolve().parent.parent
-    if str(here) not in sys.path:
-        sys.path.insert(0, str(here))
-    try:
-        from tune_by_latent import (
-            make_bundle,
-            run_latent_walk,
-            _get_reference_best_seconds,
-        )
-    except Exception as err:  # pragma: no cover
-        print(f"[train] latent walk unavailable: {type(err).__name__}: {err}")
-        return {}
-
-    ref_records = _select_topk_records_from_path(record_json_path, k=max(1, int(top_k)))
-    if not ref_records:
-        print(f"[train] no reference records available for latent walk: {record_json_path}")
-        return {}
-
-    print(
-        f"[train] latent walk ({epoch_label}) reusing in-memory model"
-    )
-
-    # Reuse in-memory model + cached registry to skip checkpoint round-trip
-    # and GeneratorRegistry rebuild on every walk. The model stays on the
-    # training device — no CPU/GPU shuffling.
-    was_training = model.training
-    model.eval()
-    bundle = make_bundle(
-        model=model,
-        tokenizer=tokenizer,
-        registry=registry,
-        config_payload=config.to_dict(),
-        latent_cost_ridge=latent_cost_ridge,
-        device=device,
-        use_latent_gradient=bool(use_latent_gradient),
-        timestamp=timestamp,
-        recon_predictor=recon_predictor,
-        reencode_predictor=reencode_predictor,
-        reencode_predictor_name=reencode_predictor_name,
-    )
-
-    per_rank_summaries: list[Dict[str, float]] = []
-    base_output_dir = Path(walk_output_dir)
-    try:
-        for rank, ref_record in enumerate(ref_records):
-            reference_params = {
-                str(k): int(v) for k, v in (ref_record.params or {}).items()
-            }
-            rank_output_dir = (
-                base_output_dir / f"rank{rank}" if len(ref_records) > 1 else base_output_dir
-            )
-            try:
-                walk_records = run_latent_walk(
-                    checkpoint_path=str(checkpoint_path),
-                    record_json_path=str(record_json_path),
-                    network_info_folder=network_info_folder,
-                    device=str(device),
-                    output=str(rank_output_dir),
-                    num_steps=int(num_steps),
-                    step_size=float(step_size),
-                    latent_gradient=bool(use_latent_gradient),
-                    deterministic_start=True,
-                    preselected_record=ref_record,
-                    include_recon_predict=bool(include_recon_predict),
-                    include_measurement=bool(include_measurement),
-                    bundle=bundle,
-                    keep_bundle=True,
-                    measurement_cache=measurement_cache,
-                    sampling_options=sampling_options,
-                    cost_target=cost_target,
-                    task_min_cost=task_min_cost,
-                    sort_by=sort_by,
-                    show_neg_log=show_neg_log,
-                    reference_best_dir=reference_best_dir,
-                ) or []
-            except Exception as err:  # pragma: no cover
-                print(f"[train] latent walk rank={rank} failed: {type(err).__name__}: {err}")
-                walk_records = []
-            ref_best_secs = _get_reference_best_seconds(
-                reference_best_dir, getattr(ref_record, "workload_key", None)
-            )
-            per_rank_summaries.append(
-                _summarize_walk_records(
-                    walk_records,
-                    reference_params=reference_params,
-                    reference_best_seconds=ref_best_secs,
-                )
-            )
-            if walk_buffer is not None and walk_records:
-                _ingest_walk_records_into_buffer(
-                    walk_buffer,
-                    walk_records=walk_records,
-                    ref_record=ref_record,
-                    registry=registry,
-                    tokenizer=tokenizer,
-                    config=config,
-                )
-    finally:
-        if was_training:
-            model.train()
-
-    combined: Dict[str, float] = {}
-    for rank, rank_summary in enumerate(per_rank_summaries):
-        if not rank_summary:
-            continue
-        prefix = f"top{rank + 1}_"
-        for key, value in rank_summary.items():
-            if key.startswith("walk/"):
-                new_key = prefix + key
-            else:
-                new_key = prefix + "walk/" + key
-            combined[new_key] = value
-    combined.update(_merge_walk_summaries(per_rank_summaries))
-    # Per-task aggregates across ranks. ``_augment_summary_with_per_task``
-    # reads these to emit the ``walk_measured/{task}`` /
-    # ``walk_alpha_at_best/{task}`` / ``walk_num_unique_sym_map/{task}`` panels;
-    # without them every lookup returned ``None`` and no per-task lines were
-    # logged to wandb.
-    best_measured: Optional[float] = None
-    best_alpha: Optional[float] = None
-    total_unique = 0.0
-    for rank_summary in per_rank_summaries:
-        if not rank_summary:
-            continue
-        bm = rank_summary.get("walk/best_measured_mean_cost")
-        if bm is not None and (best_measured is None or float(bm) > best_measured):
-            best_measured = float(bm)
-            alpha = rank_summary.get("walk/alpha_at_best")
-            best_alpha = float(alpha) if alpha is not None else None
-        nu = rank_summary.get("walk/num_unique_sym_map")
-        if nu is not None:
-            total_unique += float(nu)
-    if best_measured is not None:
-        combined["walk/best_measured_mean_cost"] = best_measured
-        if best_alpha is not None:
-            combined["walk/alpha_at_best"] = best_alpha
-    combined["walk/num_unique_sym_map"] = total_unique
-    best_speedup: Optional[float] = None
-    best_raw_secs: Optional[float] = None
-    ref_best_secs_value: Optional[float] = None
-    for rank_summary in per_rank_summaries:
-        if not rank_summary:
-            continue
-        sp = rank_summary.get("walk/speedup_vs_reference")
-        if sp is not None and (best_speedup is None or float(sp) > best_speedup):
-            best_speedup = float(sp)
-        raw_s = rank_summary.get("walk/best_measured_raw_seconds")
-        if raw_s is not None and (best_raw_secs is None or float(raw_s) < best_raw_secs):
-            best_raw_secs = float(raw_s)
-        ref_s = rank_summary.get("walk/reference_best_seconds")
-        if ref_s is not None and ref_best_secs_value is None:
-            ref_best_secs_value = float(ref_s)
-    if best_speedup is not None:
-        combined["walk/speedup_vs_reference"] = best_speedup
-    if best_raw_secs is not None:
-        combined["walk/best_measured_raw_seconds"] = best_raw_secs
-    if ref_best_secs_value is not None:
-        combined["walk/reference_best_seconds"] = ref_best_secs_value
-    if walk_key_prefix:
-        target = f"{walk_key_prefix}walk/"
-        combined = {
-            key.replace("walk/", target, 1) if "walk/" in key else key: value
-            for key, value in combined.items()
-        }
-    return combined
+from .walk_helpers import (
+    _augment_summary_with_per_task,
+    _iter_walk_ridges,
+    _load_measurement_lookup,
+    _merge_cache_into_lookup,
+    _merge_walk_summaries,
+    _probe_workload_key_from_json,
+    _resolve_walk_record_jsons,
+    _resolve_walk_task_min_cost,
+    _run_periodic_latent_walk,
+    _save_measurement_lookup,
+    _seed_measurement_cache_from_buffer,
+    _task_lookup_key_from_json,
+)
 
 
 def build_everything(config):
@@ -701,651 +97,6 @@ def build_everything(config):
         cfg=config.model,
     )
     return registry, bundle, tokenizer, model
-
-
-def _family_from_json_path(json_path: str | Path) -> str:
-    """Extract the dataset family name from a measure-record JSON path.
-
-    Layout: ``.../measure_tenset_filtered_family/{family}/{target}/{N}_*.json``
-    so the family is ``parents[1].name``. Returns "na" if the layout is too
-    shallow.
-    """
-    p = Path(json_path)
-    if len(p.parents) >= 2:
-        return p.parents[1].name
-    return "na"
-
-
-def _resolve_run_family(bundle: DatasetBundle) -> str:
-    """Family identifier for run-level naming (wandb / checkpoints).
-    Per-task / per-workload artifacts (e.g. the candidate_mask_cache) and the
-    measurement lookup file intentionally keep task-specific names and do
-    NOT use this helper.
-    """
-    all_records = (
-        list(bundle.train_records) + list(bundle.val_records) + list(bundle.test_records)
-    )
-    for record in all_records:
-        json_path = getattr(record, "json_path", None)
-        if not json_path:
-            continue
-        family = _family_from_json_path(json_path)
-        if family != "na":
-            return family
-    return "na"
-
-
-def _resolve_run_task_index(bundle: DatasetBundle) -> str:
-    """Task-index identifier kept for the measurement_lookup filename, where
-    measurements are inherently per-task and the file should not be shared
-    across tasks within the same family.
-    """
-    import re
-
-    all_records = (
-        list(bundle.train_records) + list(bundle.val_records) + list(bundle.test_records)
-    )
-    for record in all_records:
-        if record.task_index is not None:
-            return str(int(record.task_index))
-    for record in all_records:
-        json_path = getattr(record, "json_path", None)
-        if not json_path:
-            continue
-        m = re.match(r"^(\d+)", Path(json_path).stem)
-        if m:
-            return m.group(1)
-    return "na"
-
-
-def _resolve_run_family_from_config(config) -> str:
-    for p in getattr(config.data, "json_paths", []) or []:
-        family = _family_from_json_path(p)
-        if family != "na":
-            return family
-    return "na"
-
-
-def _build_wandb_project_name(config, bundle: DatasetBundle | None = None) -> str:
-    if bundle is not None:
-        family = _resolve_run_family(bundle)
-    else:
-        family = _resolve_run_family_from_config(config)
-    project_suffix = getattr(config.wandb, "project", None) or "single_v1"
-    return f"{family}_{project_suffix}"
-
-
-def _build_wandb_run_name(config, bundle: DatasetBundle | None = None) -> str:
-    name = ""
-
-    if config.model.num_encoder_layers != 4:
-        name += f"_enc{config.model.num_encoder_layers}"
-    if config.model.num_decoder_layers != 4:
-        name += f"_dec{config.model.num_decoder_layers}"
-    if config.model.nhead != 4:
-        name += f"_head{config.model.nhead}"
-    
-    if config.model.latent_dim != 64:
-        name += f"_zdim{config.model.latent_dim}"
-    if config.model.dim_feedforward != 384:
-        name += f"_fdim{config.model.dim_feedforward}"
-    if config.model.cost_hidden_dim != 128:
-        name += f"_cdim{config.model.cost_hidden_dim}"
-    if config.model.latent_token_count != 4:
-        name += f"_ztok{config.model.latent_token_count}"
-
-    if config.train.num_epochs != 100:
-        name += f"_ep{config.train.num_epochs}"
-    name += (
-        f"_lr{config.train.learning_rate}"
-        f"_nce{config.train.lambda_nce}"
-        f"_tau{config.train.tau_nce}"
-        f"_kl{config.train.beta_end}"
-        f"_bw{config.train.beta_warmup_epochs}"
-    )
-
-    if config.train.lambda_recon != 1.0:
-        name += f"_lamr{config.train.lambda_recon}"
-    if config.train.lambda_cost != 0.01:
-        name += f"_lamc{config.train.lambda_cost}"
-    if bool(config.train.order_nce):
-        name += "_order"
-    if bool(getattr(config.train, "nce_mu", False)):
-        name += "_nce_mu"
-    if bool(config.model.adaln):
-        name += "_adaln"
-    if bool(getattr(config.train, "cobo_sample_weighting", False)):
-        cobo_tag = getattr(config.train, "cobo_apply_to", [])
-        name += (
-            f"_cobo{float(config.train.weight_quantile):.1f}"
-            f"_{float(config.train.weight_sigma):.1f}"
-            f"_{cobo_tag}"
-        )
-    if bool(getattr(config.train, "cost_ridge_weighted", False)):
-        name += "_wridge"
-        if not bool(getattr(config.train, "cobo_sample_weighting", False)):
-            name += (
-                f"{float(config.train.weight_quantile):.1f}"
-                f"_{float(config.train.weight_sigma):.1f}"
-            )
-    if bool(getattr(config.train, "use_compressed_teacher_forcing", False)):
-        name += "_comp"
-    ls = float(getattr(config.train, "label_smoothing", 0.0))
-    if ls > 0.0:
-        name += f"_ls{ls}"
-    if bool(getattr(config.train, "order_nce_pos_weight_by_percentile", False)):
-        name += f"_pos{float(config.train.order_nce_pos_weight_sigma):.1f}"
-    if getattr(config.sampling, "strategy", "greedy") != "greedy":
-        name += f"_{config.sampling.strategy}"
-        if config.sampling.strategy == "sampling":
-            name += (
-                f"_t{config.sampling.temperature}"
-                f"_k{config.sampling.top_k}"
-            )
-            if config.sampling.top_p != 1.0:
-                name += f"_p{config.sampling.top_p}"
-            name += f"_sseed{config.sampling.seed}"
-    name += f"_dseed{config.data.seed}"
-    name += f"_mseed{config.model.seed}"
-            
-    name += _generator_cache_suffix(config)
-    if getattr(config.data, "pad_vocab_to", None) is not None:
-        name += f"_vocab{config.data.pad_vocab_to}"
-    if getattr(config.model, "vocab_align_to", None) is not None:
-        name += f"_vocab_align{config.model.vocab_align_to}"
-    return name
-
-
-def _seed_measurement_cache_from_buffer(
-    walk_buffer: Optional[WalkSampleBuffer],
-    disk_cache: Optional[dict] = None,
-    cost_target: str = "neg_log",
-    task_min_cost: Optional[float] = None,
-    workload_key_filter: Optional[str] = None,
-) -> dict:
-    """Pre-populate the measurement cache with prior measurements so that
-    sym_maps already measured in earlier epochs skip re-measurement.
-
-    If ``disk_cache`` is provided, its entries are merged in first (walk-buffer
-    entries from the current run take precedence on conflict).
-
-    ``sample.cost`` lives in ``cost_target`` label space; we also back-compute
-    the raw-seconds value and stash it in ``costs=[raw]`` so display paths
-    (log_grouped_candidate_result) can show ``measured=`` for buffer-hit
-    entries.
-
-    When ``workload_key_filter`` is given, walk_buffer entries whose
-    task-aware key (``(workload_key, sym_tuple)``) does not match the filter
-    are skipped. This keeps each task's cache (and its on-disk lookup file)
-    free of cross-task entries even though the buffer is shared."""
-    cache: dict = {}
-    if disk_cache:
-        for sym_key, entry in disk_cache.items():
-            cache[sym_key] = copy.deepcopy(entry)
-    if walk_buffer is None:
-        return cache
-    target_wk: Optional[str] = (
-        str(workload_key_filter) if workload_key_filter is not None else None
-    )
-    for sym_key, sample in walk_buffer.items():
-        if target_wk is not None:
-            if not (isinstance(sym_key, tuple) and len(sym_key) == 2):
-                continue
-            if sym_key[0] != target_wk:
-                continue
-        cost = getattr(sample, "cost", None)
-        if cost is None or not math.isfinite(float(cost)):
-            continue
-        entry = {
-            "ok": True,
-            "usable_measurement": True,
-            "mean_cost": float(cost),
-            "from_walk_buffer": True,
-        }
-        raw = cost_label_to_raw(cost, cost_target, task_min_cost=task_min_cost)
-        if raw is not None and math.isfinite(raw):
-            entry["costs"] = [float(raw)]
-        cache[sym_key] = entry
-    return cache
-
-
-def _load_measurement_lookup(
-    path: Path,
-    cost_target: str = "neg_log",
-    task_min_cost: Optional[float] = None,
-) -> dict:
-    """Load the persisted (workload_key, sym_map)→cost table into a
-    measurement_cache-compatible dict. Each JSONL line stores
-    ``{"workload_key": str, "sym_map": {name: int, ...}, "cost": float}``
-    where ``cost`` is the raw (seconds) mean cost; it is converted to the
-    in-memory ``mean_cost`` (``cost_target``-space) on load via
-    :func:`cost_raw_to_label`. Missing files return an empty dict.
-
-    Legacy entries without ``workload_key`` (older format that keyed by
-    ``sym_map`` only) are dropped: they conflated measurements across distinct
-    workloads and re-using them would re-introduce that contamination."""
-    cache: dict = {}
-    if not path.exists():
-        return cache
-    skipped_legacy = 0
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            workload_key = entry.get("workload_key")
-            if not workload_key:
-                skipped_legacy += 1
-                continue
-            sym_map = entry.get("sym_map") or {}
-            cost = entry.get("cost")
-            mean_cost = cost_raw_to_label(
-                cost, cost_target, task_min_cost=task_min_cost
-            )
-            if mean_cost is None:
-                continue
-            try:
-                normalized = {str(k): int(v) for k, v in sym_map.items()}
-            except (TypeError, ValueError):
-                continue
-            sym_key = make_task_sym_map_key(workload_key, normalized)
-            # Stash the raw (seconds) cost in ``costs`` too so display paths
-            # (e.g. log_grouped_candidate_result) can report raw-seconds
-            # ``measured=`` values for lookup-hit cache entries just like for
-            # freshly-measured ones.
-            cache[sym_key] = {
-                "ok": True,
-                "usable_measurement": True,
-                "mean_cost": mean_cost,
-                "costs": [float(cost)],
-                "from_lookup": True,
-            }
-    # if skipped_legacy:
-    #     print(
-    #         f"[train] measurement lookup: dropped {skipped_legacy} legacy "
-    #         f"entries without workload_key from {path}"
-    #     )
-    return cache
-
-
-def _save_measurement_lookup(
-    path: Path,
-    cache: dict,
-    cost_target: str = "neg_log",
-    task_min_cost: Optional[float] = None,
-) -> int:
-    """Persist all usable measurements in ``cache`` to ``path`` (JSONL, one
-    ``{"workload_key": str, "sym_map": ..., "cost": ...}`` per line). ``cost``
-    on disk is always the raw (seconds) mean cost, inverted from the in-memory
-    ``mean_cost`` (``cost_target``-space) via :func:`cost_label_to_raw`.
-    Returns the number of entries written. Non-usable or non-finite entries
-    are skipped, as are entries whose key lacks a workload_key (i.e. legacy
-    sym_map-only keys still in memory)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    written = 0
-    with tmp.open("w", encoding="utf-8") as f:
-        for sym_key, entry in cache.items():
-            if not entry.get("ok") or not entry.get("usable_measurement"):
-                continue
-            # Task-aware key shape: (workload_key, ((name, value), ...)).
-            if (
-                not isinstance(sym_key, tuple)
-                or len(sym_key) != 2
-                or not isinstance(sym_key[0], str)
-                or not sym_key[0]
-            ):
-                continue
-            workload_key, sym_tuple = sym_key
-            raw_cost = cost_label_to_raw(
-                entry.get("mean_cost"), cost_target, task_min_cost=task_min_cost
-            )
-            if raw_cost is None:
-                continue
-            sym_map = {str(name): int(value) for name, value in sym_tuple}
-            f.write(
-                json.dumps(
-                    {
-                        "workload_key": workload_key,
-                        "sym_map": sym_map,
-                        "cost": raw_cost,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-            written += 1
-    tmp.replace(path)
-    return written
-
-
-def _merge_cache_into_lookup(persistent: dict, shared: dict) -> int:
-    """Copy new successful measurements from ``shared`` into ``persistent``.
-    Existing persistent entries are not overwritten. Returns the count of
-    newly added entries."""
-    added = 0
-    for sym_key, entry in shared.items():
-        if sym_key in persistent:
-            continue
-        if not entry.get("ok") or not entry.get("usable_measurement"):
-            continue
-        cost = entry.get("mean_cost")
-        if cost is None:
-            continue
-        try:
-            cost_f = float(cost)
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(cost_f):
-            continue
-        new_entry = {
-            "ok": True,
-            "usable_measurement": True,
-            "mean_cost": cost_f,
-            "from_lookup": True,
-        }
-        raw_costs = entry.get("costs")
-        if raw_costs:
-            new_entry["costs"] = list(raw_costs)
-        persistent[sym_key] = new_entry
-        added += 1
-    return added
-
-
-def _iter_walk_ridges(latent_cost_ridges, config):
-    """Yield (ridge_payload, walk_key_prefix, use_cost_head_gradient) for each
-    walk to run. Order: cost_head (if enabled) → cost_vec → cost_vec_weighted."""
-    use_cost_head = bool(getattr(config.latent_walk, "use_cost_head", False))
-    if use_cost_head:
-        yield None, "cost_head_", True
-
-    if not latent_cost_ridges:
-        return
-    unweighted = next(
-        (p for p in latent_cost_ridges if not bool(p.get("weighted", False))),
-        None,
-    )
-    weighted = next(
-        (p for p in latent_cost_ridges if bool(p.get("weighted", False))),
-        None,
-    )
-    if unweighted is not None:
-        yield unweighted, "", False
-    if weighted is not None:
-        yield weighted, "w_ridge_", False
-
-
-def _fit_epoch_ridges(
-    model, bundle, tokenizer, config, device,
-    *,
-    ridge_dataset=None,
-    ridge_loader=None,
-    encoded=None,
-):
-    if not bool(getattr(config.train, "cost_ridge_vec", False)):
-        return [], None, {}
-
-    if ridge_dataset is None:
-        include_val = bool(getattr(config.train, "cost_ridge_include_val", False))
-        if include_val and len(bundle.val_dataset.samples) > 0:
-            ridge_dataset = LatentParamDataset(
-                list(bundle.train_dataset.samples) + list(bundle.val_dataset.samples)
-            )
-        else:
-            ridge_dataset = bundle.train_dataset
-
-    ridge_alphas = _resolve_ridge_alphas(config)
-    _ridge_cost_target = str(getattr(config.data, "cost_target", "neg_log"))
-    _ridge_cost_target_regression = getattr(config.data, "cost_target_regression", None)
-    _ridge_mins = list(bundle.task_min_costs.values())
-    _ridge_task_min_cost = float(_ridge_mins[0]) if _ridge_mins else None
-    _ridge_fit_target = _ridge_cost_target_regression or _ridge_cost_target
-    print(
-        f"[ridge] fit_target={_ridge_fit_target!r} output_target={_ridge_cost_target!r} "
-        f"task_min_cost={_ridge_task_min_cost!r}"
-    )
-    latent_cost_ridges = fit_latent_cost_ridges(
-        model,
-        ridge_dataset,
-        tokenizer,
-        device,
-        alphas=ridge_alphas,
-        batch_size=config.eval.batch_size,
-        cost_target=_ridge_cost_target,
-        cost_target_regression=_ridge_cost_target_regression,
-        task_min_cost=_ridge_task_min_cost,
-        loader=ridge_loader,
-        encoded=encoded,
-    )
-    ridge_metrics = {}
-    for ridge_payload in latent_cost_ridges:
-        alpha = float(ridge_payload["alpha"])
-        alpha_suffix = _alpha_metric_suffix(alpha)
-        if alpha == float(ridge_alphas[0]):
-            ridge_metrics["train_ridge_mse"] = float(ridge_payload["train_mse"])
-        ridge_metrics[f"train_ridge_alpha_{alpha_suffix}_mse"] = float(ridge_payload["train_mse"])
-
-    if bool(getattr(config.train, "cost_ridge_weighted", False)):
-        weighted_ridges = fit_latent_cost_ridges(
-            model,
-            ridge_dataset,
-            tokenizer,
-            device,
-            alphas=ridge_alphas,
-            batch_size=config.eval.batch_size,
-            sample_weight_quantile=float(getattr(config.train, "weight_quantile", 0.85)),
-            sample_weight_sigma=float(getattr(config.train, "weight_sigma", 0.25)),
-            cost_target=_ridge_cost_target,
-            cost_target_regression=_ridge_cost_target_regression,
-            task_min_cost=_ridge_task_min_cost,
-            loader=ridge_loader,
-            encoded=encoded,
-        )
-        for ridge_payload in weighted_ridges:
-            alpha = float(ridge_payload["alpha"])
-            alpha_suffix = _alpha_metric_suffix(alpha)
-            if alpha == float(ridge_alphas[0]):
-                ridge_metrics["train_ridge_weighted_mse"] = float(ridge_payload["train_mse"])
-            ridge_metrics[f"train_ridge_weighted_alpha_{alpha_suffix}_mse"] = float(
-                ridge_payload["train_mse"]
-            )
-        latent_cost_ridges = list(latent_cost_ridges) + list(weighted_ridges)
-
-    return latent_cost_ridges, ridge_metrics
-
-
-def _evaluate_validation_epoch(
-    model, bundle, registry, tokenizer, config, device, epoch, latent_cost_ridges,
-    *,
-    val_loader=None,
-    encoded_val=None,
-):
-    summary: Dict[str, float] = {}
-    if not bundle.val_dataset.samples:
-        return summary
-
-    # print(f"[train] evaluating validation split with teacher forcing after epoch {epoch}")
-    val_tf_metrics = evaluate_teacher_forcing(
-        model,
-        bundle.val_dataset,
-        registry,
-        tokenizer,
-        device,
-        batch_size=config.eval.batch_size,
-        use_compressed=bool(getattr(config.train, "use_compressed_teacher_forcing", False)),
-        loader=val_loader,
-    )
-    summary.update({f"val_{k}": float(v) for k, v in val_tf_metrics.items()})
-    print(
-        f"[epoch {epoch}] val_tok_acc={summary['val_token_accuracy']:.4f} "
-        f"val_exact={summary['val_full_sequence_exact_match']:.4f}"
-    )
-
-    # print("[train] evaluating validation cost ranking")
-    cost_metrics = evaluate_cost_ranking(
-        model,
-        bundle.val_dataset,
-        tokenizer,
-        device,
-        batch_size=config.eval.batch_size,
-        latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
-        loader=val_loader,
-        encoded=encoded_val,
-    )
-    summary.update({f"val_{k}": v for k, v in cost_metrics.items()})
-
-    if "cost_head_actual_top1_pred_rank" in cost_metrics:
-        print(
-            f"val_cost_head_actual_top1_pred_rank : {int(cost_metrics['cost_head_actual_top1_pred_rank'])}\n"
-            f"val_cost_head_pred_top1_actual_cost : {cost_metrics['cost_head_pred_top1_actual_cost']:.6f}\n"
-            f"val_cost_head_pred_top10_mean_actual_cost : {cost_metrics['cost_head_pred_top10_mean_actual_cost']:.6f}\n"
-            # f"val_cost_head_pred_top20_mean_actual_cost : {cost_metrics['cost_head_pred_top20_mean_actual_cost']:.6f}\n"
-        )
-    if "cost_vec_actual_top1_pred_rank" in cost_metrics:
-        print(
-            f"val_cost_vec_actual_top1_pred_rank : {int(cost_metrics['cost_vec_actual_top1_pred_rank'])}\n"
-            f"val_cost_vec_pred_top1_actual_cost : {cost_metrics['cost_vec_pred_top1_actual_cost']:.6f}\n"
-            f"val_cost_vec_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_pred_top10_mean_actual_cost']:.6f}\n"
-            # f"val_cost_vec_pred_top20_mean_actual_cost : {cost_metrics['cost_vec_pred_top20_mean_actual_cost']:.6f}\n"
-        )
-    if "cost_vec_weighted_actual_top1_pred_rank" in cost_metrics:
-        print(
-            f"val_cost_vec_weighted_actual_top1_pred_rank : {int(cost_metrics['cost_vec_weighted_actual_top1_pred_rank'])}\n"
-            f"val_cost_vec_weighted_pred_top1_actual_cost : {cost_metrics['cost_vec_weighted_pred_top1_actual_cost']:.6f}\n"
-            f"val_cost_vec_weighted_pred_top10_mean_actual_cost : {cost_metrics['cost_vec_weighted_pred_top10_mean_actual_cost']:.6f}\n"
-        )
-    for key, value in sorted(cost_metrics.items()):
-        if key.startswith("cost_vec_alpha_") and key.endswith("_actual_top1_pred_rank"):
-            prefix = key[: -len("_actual_top1_pred_rank")]
-            top1_cost_key = f"{prefix}_pred_top1_actual_cost"
-            top10_key = f"{prefix}_pred_top10_mean_actual_cost"
-            top20_key = f"{prefix}_pred_top20_mean_actual_cost"
-            print(
-                f"{'val_' + key} : {int(value)}\n"
-                f"{'val_' + top1_cost_key} : {cost_metrics[top1_cost_key]:.6f}\n"
-                f"{'val_' + top10_key} : {cost_metrics[top10_key]:.6f}\n"
-                f"{'val_' + top20_key} : {cost_metrics[top20_key]:.6f}\n"
-            )
-
-    return summary
-
-
-def _evaluate_final_checkpoint(model, bundle, registry, tokenizer, config, device, latent_cost_ridges):
-    summary: Dict[str, float] = {}
-    run_full_ar = bool(getattr(config.eval, "final_full_autoregressive", True))
-
-    if bundle.val_dataset.samples:
-        print("[train] evaluating best checkpoint on val split")
-        val_tf_metrics = evaluate_teacher_forcing(
-            model,
-            bundle.val_dataset,
-            registry,
-            tokenizer,
-            device,
-            batch_size=config.eval.batch_size,
-            use_compressed=bool(getattr(config.train, "use_compressed_teacher_forcing", False)),
-        )
-        summary.update({f"eval_val_{k}": float(v) for k, v in val_tf_metrics.items()})
-
-        val_cost_metrics = evaluate_cost_ranking(
-            model,
-            bundle.val_dataset,
-            tokenizer,
-            device,
-            batch_size=config.eval.batch_size,
-            latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
-        )
-        summary.update({f"eval_val_{k}": float(v) for k, v in val_cost_metrics.items()})
-
-        if run_full_ar:
-            val_ar_metrics = evaluate_autoregressive(
-                model,
-                bundle.val_dataset,
-                registry,
-                tokenizer,
-                device,
-                batch_size=config.eval.batch_size,
-            )
-            summary.update({f"val_autoregressive_{k}": float(v) for k, v in val_ar_metrics.items()})
-        else:
-            print("[train] skipping val full autoregressive eval (config.eval.final_full_autoregressive=False)")
-
-    if bundle.test_dataset.samples:
-        print("[train] evaluating best checkpoint on test split")
-        test_tf_metrics = evaluate_teacher_forcing(
-            model,
-            bundle.test_dataset,
-            registry,
-            tokenizer,
-            device,
-            batch_size=config.eval.batch_size,
-            use_compressed=bool(getattr(config.train, "use_compressed_teacher_forcing", False)),
-        )
-        summary.update({f"eval_test_{k}": float(v) for k, v in test_tf_metrics.items()})
-
-        test_cost_metrics = evaluate_cost_ranking(
-            model,
-            bundle.test_dataset,
-            tokenizer,
-            device,
-            batch_size=config.eval.batch_size,
-            latent_cost_ridges=_build_named_latent_cost_ridges(latent_cost_ridges),
-        )
-        summary.update({f"eval_test_{k}": float(v) for k, v in test_cost_metrics.items()})
-
-        if run_full_ar:
-            test_ar_metrics = evaluate_autoregressive(
-                model,
-                bundle.test_dataset,
-                registry,
-                tokenizer,
-                device,
-                batch_size=config.eval.batch_size,
-            )
-            summary.update({f"eval_test_autoregressive_{k}": float(v) for k, v in test_ar_metrics.items()})
-        else:
-            print("[train] skipping test full autoregressive eval (config.eval.final_full_autoregressive=False)")
-
-    return summary
-
-
-def _resolve_pt_dir(config) -> Path:
-    """Mirror of the inline ``pt_dir`` derivation that runs once early so we
-    can peek at ``last.pt`` (for resume) before ``wandb.init``. Uses the
-    config-only family resolver — equivalent to the bundle-based one because
-    bundle records originate from ``config.data.json_paths``.
-    """
-    base = Path(config.train.checkpoint_dir).expanduser().resolve()
-    family = _resolve_run_family_from_config(config)
-    if family and family != "na" and base.name != family:
-        base = base / family
-    base = base / "checkpoints"
-    project = getattr(config.wandb, "project", None)
-    if project:
-        base = base / str(project)
-    name = _build_wandb_run_name(config)
-    if name:
-        base = base / str(name)
-    return base
-
-
-def _config_for_resume_compare(payload: dict) -> dict:
-    """Strip resume-related infra fields before comparing two config dumps.
-    These are control flags that legitimately differ between original run
-    and resume; everything else must match exactly.
-    """
-    if not isinstance(payload, dict):
-        return payload
-    out = dict(payload)
-    train = dict(out.get("train") or {})
-    train.pop("resume", None)
-    train.pop("resume_from", None)
-    out["train"] = train
-    return out
 
 
 def train_main(config) -> Dict[str, float]:
@@ -1445,6 +196,16 @@ def train_main(config) -> Dict[str, float]:
         wandb_run.summary["model/trainable_params"] = trainable_params
 
 
+    tasks_per_batch = getattr(config.train, "tasks_per_batch", None)
+    train_batch_sampler = None
+    if tasks_per_batch is not None:
+        train_batch_sampler = TaskBalancedBatchSampler(
+            task_indices=[s.task_index for s in bundle.train_dataset.samples],
+            batch_size=int(config.train.batch_size),
+            tasks_per_batch=int(tasks_per_batch),
+            shuffle=True,
+            seed=int(config.data.seed),
+        )
     train_loader = prepare_loader(
         bundle.train_dataset,
         tokenizer,
@@ -1454,13 +215,23 @@ def train_main(config) -> Dict[str, float]:
         pin_memory=config.train.pin_memory and device.type == "cuda",
         persistent_workers=config.train.persistent_workers,
         prefetch_factor=config.train.prefetch_factor,
+        batch_sampler=train_batch_sampler,
     )
-    print(
-        f"[train] data loader ready: batches={len(train_loader)} "
-        f"batch_size={config.train.batch_size} "
-        f"num_workers={config.train.num_workers} "
-        f"pin_memory={bool(config.train.pin_memory and device.type == 'cuda')}"
-    )
+    if train_batch_sampler is not None:
+        print(
+            f"[train] task-balanced loader: batches={len(train_loader)} "
+            f"batch_size={config.train.batch_size} "
+            f"tasks_per_batch={tasks_per_batch} "
+            f"samples_per_task={config.train.batch_size // int(tasks_per_batch)} "
+            f"num_workers={config.train.num_workers}"
+        )
+    else:
+        print(
+            f"[train] data loader ready: batches={len(train_loader)} "
+            f"batch_size={config.train.batch_size} "
+            f"num_workers={config.train.num_workers} "
+            f"pin_memory={bool(config.train.pin_memory and device.type == 'cuda')}"
+        )
 
     # Persistent eval / ridge loaders. Building them once here (rather than
     # inside ``_evaluate_validation_epoch`` / ``_fit_epoch_ridges`` per epoch)
@@ -1636,7 +407,6 @@ def train_main(config) -> Dict[str, float]:
     walk_running_best_alpha: Dict[str, float] = {}
     timestamp = time.strftime("%m%d%H%M")
     latent_walk_every_n = int(getattr(config.latent_walk, "every_n_epochs", 0) or 0)
-    latent_walk_on_final = bool(getattr(config.latent_walk, "on_final", False))
     latent_walk_top_k = int(getattr(config.latent_walk, "top_k", 1) or 1)
     latent_walk_num_steps = int(getattr(config.latent_walk, "num_steps", 8) or 8)
     latent_walk_step_size = float(getattr(config.latent_walk, "step_size", 0.25) or 0.25)
@@ -1662,13 +432,12 @@ def train_main(config) -> Dict[str, float]:
             f"top_k={latent_walk_sampling_options.top_k} "
             f"top_p={latent_walk_sampling_options.top_p}"
         )
-    if (latent_walk_every_n > 0 or latent_walk_on_final) and not latent_walk_record_jsons:
+    if latent_walk_every_n > 0 and not latent_walk_record_jsons:
         print(
             "[train] latent walk requested but no record JSON resolvable from "
             "config.latent_walk.record_json or config.data.json_paths; disabling"
         )
         latent_walk_every_n = 0
-        latent_walk_on_final = False
     elif len(latent_walk_record_jsons) > 1:
         print(
             f"[train] latent walk will iterate {len(latent_walk_record_jsons)} "
@@ -1771,7 +540,6 @@ def train_main(config) -> Dict[str, float]:
 
     for epoch in range(start_epoch, config.train.num_epochs + 1):
         print(f"[train] starting epoch {epoch}/{config.train.num_epochs}")
-        _phase_t0 = time.time()
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -1784,27 +552,18 @@ def train_main(config) -> Dict[str, float]:
             epoch,
             task_min_cost=_lookup_task_min_cost,
         )
-        print(f"[timing] train={time.time() - _phase_t0:.1f}s")
 
-        # train_metrics already carries ``token_accuracy`` and
-        # ``full_sequence_exact_match`` collected during the training loop's
-        # forward passes — the previous ``evaluate_teacher_forcing`` call on
-        # ``bundle.train_dataset`` was a redundant 30+ s second forward over
-        # the same data and has been removed.
+        # train_metrics carries dropout-on accuracy collected during the train
+        # forward (kept for diagnostics under the ``train_loop_*`` keys); the
+        # canonical ``token_accuracy`` / ``full_sequence_exact_match`` are
+        # overwritten below with an eval-mode (dropout-off) decoder-only pass
+        # that reuses ``encoded_train["z"]`` — no extra encoder forward.
         summary = dict(train_metrics)
-        print(
-            f"[epoch {epoch}] "
-            f"loss={summary['loss']:.4f} recon={summary['recon_loss']:.4f} "
-            f"kl={summary['kl_loss']:.4f} "
-            f"tok_acc={summary['token_accuracy']:.4f} "
-            f"exact={summary['full_sequence_exact_match']:.4f}"
+        summary["train_loop_token_accuracy"] = float(summary.get("token_accuracy", 0.0))
+        summary["train_loop_full_sequence_exact_match"] = float(
+            summary.get("full_sequence_exact_match", 0.0)
         )
 
-        # Encode every cost-ranking / ridge consumer's data ONCE per epoch.
-        # Old order ran three encoder passes (ridge over train+val,
-        # cost_ranking on train, cost_ranking on val); now they all share
-        # ``encoded_train`` / ``encoded_val`` outputs.
-        _phase_t0 = time.time()
         encoded_train = encode_dataset(
             model,
             bundle.train_dataset,
@@ -1823,9 +582,29 @@ def train_main(config) -> Dict[str, float]:
                 batch_size=config.eval.batch_size,
                 loader=val_loader,
             )
-        print(f"[timing] encode={time.time() - _phase_t0:.1f}s")
 
-        _phase_t0 = time.time()
+        train_tf_metrics = evaluate_teacher_forcing_with_encoded(
+            model,
+            bundle.train_dataset,
+            registry,
+            tokenizer,
+            device,
+            encoded=encoded_train,
+            batch_size=config.eval.batch_size,
+            loader=train_eval_loader,
+        )
+        summary["token_accuracy"] = float(train_tf_metrics["token_accuracy"])
+        summary["full_sequence_exact_match"] = float(
+            train_tf_metrics["full_sequence_exact_match"]
+        )
+        print(
+            f"[epoch {epoch}] "
+            f"loss={summary['loss']:.4f} recon={summary['recon_loss']:.4f} "
+            f"kl={summary['kl_loss']:.4f} "
+            f"tok_acc={summary['token_accuracy']:.4f} "
+            f"exact={summary['full_sequence_exact_match']:.4f}"
+        )
+
         if (
             bool(getattr(config.train, "cost_ridge_include_val", False))
             and encoded_val is not None
@@ -1844,9 +623,7 @@ def train_main(config) -> Dict[str, float]:
             encoded=ridge_encoded,
         )
         summary.update(ridge_metrics)
-        print(f"[timing] ridge={time.time() - _phase_t0:.1f}s")
 
-        _phase_t0 = time.time()
         train_cost_metrics = evaluate_cost_ranking(
             model,
             bundle.train_dataset,
@@ -1858,9 +635,7 @@ def train_main(config) -> Dict[str, float]:
             encoded=encoded_train,
         )
         summary.update({f"train_{k}": float(v) for k, v in train_cost_metrics.items()})
-        print(f"[timing] train_cost={time.time() - _phase_t0:.1f}s")
 
-        _phase_t0 = time.time()
         summary.update(
             _evaluate_validation_epoch(
                 model,
@@ -1875,7 +650,6 @@ def train_main(config) -> Dict[str, float]:
                 encoded_val=encoded_val,
             )
         )
-        print(f"[timing] val={time.time() - _phase_t0:.1f}s")
 
         def _fmt(value) -> str:
             return f"{float(value):+.4f}" if value is not None and math.isfinite(float(value)) else "nan"
@@ -1956,6 +730,8 @@ def train_main(config) -> Dict[str, float]:
                 )
             walk_summary = {}
             ridge_walks = list(_iter_walk_ridges(latent_cost_ridges, config)) or [(None, "", False)]
+            _ref_dir = getattr(config.latent_walk, "reference_best_dir", None)
+            _ref_label = Path(_ref_dir).name if _ref_dir else None
             # One shared cache per task. Each task's cache is seeded from its
             # own on-disk lookup file plus the matching subset of the in-memory
             # walk_buffer (filtered by workload_key). The walk subsequently
@@ -2040,15 +816,26 @@ def train_main(config) -> Dict[str, float]:
                     )
                     if sub_summary:
                         per_task_summaries_keyed.append((tkey, sub_summary))
+                        if wandb_run is not None:
+                            partial: Dict[str, float] = {}
+                            _augment_summary_with_per_task(
+                                partial,
+                                [(tkey, sub_summary)],
+                                epoch=int(epoch),
+                                running_best=walk_running_best,
+                                running_best_epoch=walk_running_best_epoch,
+                                running_best_alpha=walk_running_best_alpha,
+                                reference_label=_ref_label,
+                            )
+                            if partial:
+                                wandb.log(
+                                    _remap_for_wandb(partial), step=int(epoch)
+                                )
                 merged = _merge_walk_summaries(
                     [s for _, s in per_task_summaries_keyed]
                 )
                 if merged:
                     walk_summary.update(merged)
-                _ref_dir = getattr(
-                    config.latent_walk, "reference_best_dir", None
-                )
-                _ref_label = Path(_ref_dir).name if _ref_dir else None
                 _augment_summary_with_per_task(
                     walk_summary,
                     per_task_summaries_keyed,
@@ -2172,192 +959,11 @@ def train_main(config) -> Dict[str, float]:
             )
             break
 
-    # Run a post-training walk *before* loading best.pt so the recorded
-    # metrics reflect the actual last-epoch model. The block below is then
-    # repeated after best.pt is loaded; the two calls are tagged with
-    # disjoint key prefixes (``last_`` and ``best_``) so the wandb panels
-    # don't collide.
-    def _do_post_training_walk(
-        *,
-        label_prefix: str,
-        ckpt_path: Path,
-        ridges,
-    ) -> Dict[str, float]:
-        """Run the full post-training walk pipeline once. ``label_prefix`` is
-        prepended to ``epoch_label`` for log lines and to every emitted key.
-        """
-        if not (latent_walk_on_final and latent_walk_record_jsons):
-            return {}
-        recon_predictor_local = None
-        if walk_recon_predict_enabled and walk_recon_predict_use_gp:
-            recon_predictor_local = fit_gp_recon_predictor(
-                model=model,
-                dataset=bundle.train_dataset,
-                tokenizer=tokenizer,
-                device=device,
-                top_k=walk_recon_predict_gp_top_k,
-                random_n=walk_recon_predict_gp_random_n,
-                batch_size=config.eval.batch_size,
-                seed=int(getattr(config.data, "seed", 0)),
-                walk_buffer=walk_sample_buffer,
-            )
-        ridge_walks_local = list(_iter_walk_ridges(ridges, config)) or [(None, "", False)]
-        cache_by_task_local: Dict[str, dict] = {}
-        for record_json_path in latent_walk_record_jsons:
-            tkey = _task_lookup_key_from_json(record_json_path)
-            cache_by_task_local[tkey] = _seed_measurement_cache_from_buffer(
-                walk_sample_buffer,
-                disk_cache=persistent_measurement_cache_by_task.get(tkey),
-                cost_target=bundle.cost_target,
-                task_min_cost=task_min_cost_by_task.get(tkey, _lookup_task_min_cost),
-                workload_key_filter=workload_key_by_task.get(tkey),
-            )
-        reencode_predictor_name_local = str(
-            getattr(config.train, "re_encode_predictor", "cost_head")
-        )
-        reencode_predictor_local = _build_reencode_predictor(
-            name=reencode_predictor_name_local,
-            model=model,
-            bundle=bundle,
-            tokenizer=tokenizer,
-            device=device,
-            latent_cost_ridges=ridges,
-            config=config,
-        )
-        walk_summary_local: Dict[str, float] = {}
-        for walk_ridge, walk_prefix, force_cost_head in ridge_walks_local:
-            keyed_summaries: List[tuple[str, Dict[str, float]]] = []
-            for record_json_path in latent_walk_record_jsons:
-                tkey = _task_lookup_key_from_json(record_json_path)
-                task_label = Path(record_json_path).stem
-                label = (
-                    label_prefix
-                    + (f" [{walk_prefix.rstrip('_')}]" if walk_prefix else "")
-                    + (f" task={task_label}" if len(latent_walk_record_jsons) > 1 else "")
-                )
-                per_task_min_cost = task_min_cost_by_task.get(
-                    tkey, _lookup_task_min_cost
-                )
-                sub_summary = _run_periodic_latent_walk(
-                    model=model,
-                    device=device,
-                    checkpoint_path=ckpt_path,
-                    record_json_path=record_json_path,
-                    walk_output_dir=latent_walk_output_dir,
-                    network_info_folder=latent_walk_network_info,
-                    epoch_label=label,
-                    config=config,
-                    registry=registry,
-                    tokenizer=tokenizer,
-                    latent_cost_ridge=walk_ridge,
-                    timestamp=timestamp,
-                    top_k=latent_walk_top_k,
-                    num_steps=latent_walk_num_steps,
-                    step_size=latent_walk_step_size,
-                    use_latent_gradient=force_cost_head or latent_walk_use_latent_gradient,
-                    include_recon_predict=walk_recon_predict_enabled,
-                    recon_predictor=recon_predictor_local,
-                    reencode_predictor=reencode_predictor_local,
-                    reencode_predictor_name=reencode_predictor_name_local,
-                    walk_buffer=walk_sample_buffer,
-                    walk_key_prefix=walk_prefix,
-                    measurement_cache=cache_by_task_local[tkey],
-                    sampling_options=latent_walk_sampling_options,
-                    cost_target=bundle.cost_target,
-                    task_min_cost=per_task_min_cost,
-                    sort_by=str(getattr(config.latent_walk, "sort_by", "re_pred")),
-                    show_neg_log=bool(getattr(config.latent_walk, "show_neg_log", False)),
-                    reference_best_dir=getattr(
-                        config.latent_walk, "reference_best_dir", None
-                    ),
-                )
-                if sub_summary:
-                    keyed_summaries.append((tkey, sub_summary))
-            merged = _merge_walk_summaries([s for _, s in keyed_summaries])
-            if merged:
-                walk_summary_local.update(merged)
-            _ref_dir_final = getattr(
-                config.latent_walk, "reference_best_dir", None
-            )
-            _ref_label_final = (
-                Path(_ref_dir_final).name if _ref_dir_final else None
-            )
-            _augment_summary_with_per_task(
-                walk_summary_local,
-                keyed_summaries,
-                epoch=int(config.train.num_epochs),
-                running_best=walk_running_best,
-                running_best_epoch=walk_running_best_epoch,
-                running_best_alpha=walk_running_best_alpha,
-                reference_label=_ref_label_final,
-            )
-        for record_json_path in latent_walk_record_jsons:
-            tkey = _task_lookup_key_from_json(record_json_path)
-            persistent = persistent_measurement_cache_by_task.setdefault(tkey, {})
-            shared = cache_by_task_local.get(tkey, {})
-            added = _merge_cache_into_lookup(persistent, shared)
-            if not added:
-                continue
-            lookup_path = measurement_lookup_paths_by_task[tkey]
-            _save_measurement_lookup(
-                lookup_path,
-                persistent,
-                cost_target=bundle.cost_target,
-                task_min_cost=task_min_cost_by_task.get(tkey, _lookup_task_min_cost),
-            )
-            # print(
-            #     f"[train] measurement lookup: +{added} new "
-            #     f"(total={len(persistent)}) → {lookup_path}"
-            # )
-        return walk_summary_local
-
-    # Post-training walk runs on the model's current (last-epoch) state.
-    # ``best.pt`` is kept on disk as an archival snapshot only — we don't
-    # reload it for evaluation here.
-    final_walk_summary = _do_post_training_walk(
-        label_prefix="final",
-        ckpt_path=last_checkpoint_path,
-        ridges=latent_cost_ridges,
-    )
-
-    final_metrics = dict(last_summary) if last_summary else {}
-    final_metrics.update(
-        _evaluate_final_checkpoint(
-            model,
-            bundle,
-            registry,
-            tokenizer,
-            config,
-            device,
-            latent_cost_ridges,
-        )
-    )
-    if final_walk_summary:
-        final_metrics.update(
-            {f"final_{k}": v for k, v in final_walk_summary.items()}
-        )
-
-    print("[final]", json.dumps(final_metrics, indent=2))
     print("[train] checkpoint dir:", pt_dir)
 
-    if bundle.val_dataset.samples:
-        sample = bundle.val_dataset.samples[0]
-        decoded = greedy_decode_sample(model, sample, registry, tokenizer, device)
-        print(pretty_print_reconstruction(sample, decoded))
-    elif bundle.test_dataset.samples:
-        sample = bundle.test_dataset.samples[0]
-        decoded = greedy_decode_sample(model, sample, registry, tokenizer, device)
-        print(pretty_print_reconstruction(sample, decoded))
-
     if wandb_run is not None:
-        final_log_metrics = {
-            key: value
-            for key, value in final_metrics.items()
-            if isinstance(value, (int, float))
-        }
-        if final_log_metrics:
-            wandb.log(_remap_for_wandb(final_log_metrics), step=epoch)
-        wandb_run.summary.update(_remap_for_wandb(final_metrics))
+        if last_summary:
+            wandb_run.summary.update(_remap_for_wandb(last_summary))
         wandb_run.finish()
 
-    return final_metrics
+    return dict(last_summary)

@@ -20,14 +20,12 @@ from .train_eval import (
     _build_early_param_position_weights,
     _build_singleton_position_mask,
     _build_teacher_forcing_candidate_masks,
-    _compress_teacher_forcing_batch,
     _teacher_forcing_accuracy_stats,
 )
 from .train_losses import (
     beta_by_epoch,
     compute_cobo_sample_weights,
     kl_divergence,
-    latent_use_margin_loss,
     masked_cross_entropy,
     ordered_infonce_loss,
     soft_infonce_loss,
@@ -100,9 +98,6 @@ def train_one_epoch(
     total_kl = torch.zeros((), device=device, dtype=torch.float32)
     total_cost = torch.zeros((), device=device, dtype=torch.float32)
     total_nce = torch.zeros((), device=device, dtype=torch.float32)
-    total_latent_use = torch.zeros((), device=device, dtype=torch.float32)
-    total_latent_use_rank = torch.zeros((), device=device, dtype=torch.float32)
-    total_latent_use_top1_drop = torch.zeros((), device=device, dtype=torch.float32)
     total_token_correct = torch.zeros((), device=device, dtype=torch.long)
     total_token_count = torch.zeros((), device=device, dtype=torch.long)
     total_exact_count = torch.zeros((), device=device, dtype=torch.long)
@@ -121,39 +116,24 @@ def train_one_epoch(
             device=device,
             debug_invalid_step=cfg.train.debug_invalid_step,
         )
-        use_compressed = bool(getattr(cfg.train, "use_compressed_teacher_forcing", False))
-        if use_compressed:
-            compressed = _compress_teacher_forcing_batch(batch, candidate_masks, tokenizer)
-            decoder_input_ids = compressed["decoder_input_ids"]
-            decoder_var_ids = compressed["decoder_var_ids"]
-            target_ids = compressed["target_ids"]
-            cand_masks_eff = compressed["candidate_masks"]
-            position_weights = _build_early_param_position_weights(
-                compressed["seq_lens"],
-                max_len=int(target_ids.shape[1]),
-                max_weight=float(getattr(cfg.train, "early_param_weight_max", 1.0)),
-                power=float(getattr(cfg.train, "early_param_weight_power", 1.0)),
-                device=device,
-            )
-        else:
-            decoder_input_ids = batch["decoder_input_ids"]
-            decoder_var_ids = batch["decoder_var_ids"]
-            target_ids = batch["target_ids"]
-            cand_masks_eff = candidate_masks
-            singleton_mask = _build_singleton_position_mask(
-                target_ids, cand_masks_eff, tokenizer.pad_id
-            )
-            position_weights = _build_early_param_position_weights(
-                batch["seq_lens"],
-                max_len=int(target_ids.shape[1]),
-                max_weight=float(getattr(cfg.train, "early_param_weight_max", 1.0)),
-                power=float(getattr(cfg.train, "early_param_weight_power", 1.0)),
-                device=device,
-            )
-            # Singleton positions are already determined by the oracle; keep them in
-            # the sequence so the decoder's causal context matches inference, but
-            # zero their loss contribution.
-            position_weights = position_weights * (~singleton_mask).to(position_weights.dtype)
+        decoder_input_ids = batch["decoder_input_ids"]
+        decoder_var_ids = batch["decoder_var_ids"]
+        target_ids = batch["target_ids"]
+        cand_masks_eff = candidate_masks
+        singleton_mask = _build_singleton_position_mask(
+            target_ids, cand_masks_eff, tokenizer.pad_id
+        )
+        position_weights = _build_early_param_position_weights(
+            batch["seq_lens"],
+            max_len=int(target_ids.shape[1]),
+            max_weight=float(getattr(cfg.train, "early_param_weight_max", 1.0)),
+            power=float(getattr(cfg.train, "early_param_weight_power", 1.0)),
+            device=device,
+        )
+        # Singleton positions are already determined by the oracle; keep them in
+        # the sequence so the decoder's causal context matches inference, but
+        # zero their loss contribution.
+        position_weights = position_weights * (~singleton_mask).to(position_weights.dtype)
 
         optimizer.zero_grad(set_to_none=True)
         use_amp = bool(cfg.train.use_amp and device.type == "cuda")
@@ -203,25 +183,19 @@ def train_one_epoch(
             else:
                 cost_regression_targets = batch["costs"]
             cost_loss = weighted_cost_loss(out.cost_pred, cost_regression_targets, batch["cost_mask"], sample_weights=cost_sw)
-            latent_use_loss, latent_use_rank_loss, latent_use_top1_drop_loss = latent_use_margin_loss(
-                model,
-                out.logits,
-                decoder_input_ids,
-                decoder_var_ids,
-                decoder_input_ids.eq(tokenizer.pad_id),
-                out.z,
-                out.memory,
-                target_ids,
-                cand_masks_eff,
-                tokenizer.pad_id,
-                position_weights,
-                margin=float(getattr(cfg.train, "latent_use_margin", 1.0)),
-                wrong_top1_margin=float(getattr(cfg.train, "latent_wrong_top1_margin", 0.0)),
-            )
             if getattr(cfg.train, "nce_mu", False):
                 nce_z = out.mu
             else:
                 nce_z = out.z
+            nce_task_ids = None
+            if bool(getattr(cfg.train, "nce_task_mask", False)):
+                raw_task_ids = batch.get("task_indices")
+                if raw_task_ids is not None:
+                    nce_task_ids = torch.tensor(
+                        [-1 if x is None else int(x) for x in raw_task_ids],
+                        dtype=torch.long,
+                        device=device,
+                    )
             if cfg.train.order_nce:
                 nce_loss = ordered_infonce_loss(
                     nce_z,
@@ -231,15 +205,22 @@ def train_one_epoch(
                     sample_weights=nce_sw,
                     pos_weight_by_percentile=bool(getattr(cfg.train, "order_nce_pos_weight_by_percentile", False)),
                     pos_weight_sigma=float(getattr(cfg.train, "order_nce_pos_weight_sigma", 0.2)),
+                    task_ids=nce_task_ids,
                 )
             else:
-                nce_loss = soft_infonce_loss(nce_z, batch["costs"], batch["cost_mask"], cfg.train.tau_nce, sample_weights=nce_sw)
+                nce_loss = soft_infonce_loss(
+                    nce_z,
+                    batch["costs"],
+                    batch["cost_mask"],
+                    cfg.train.tau_nce,
+                    sample_weights=nce_sw,
+                    task_ids=nce_task_ids,
+                )
             loss = (
                 float(getattr(cfg.train, "lambda_recon", 1.0)) * recon_loss
                 + beta * kl_loss
                 + float(cfg.train.lambda_cost) * cost_loss
                 + float(cfg.train.lambda_nce) * nce_loss
-                + float(getattr(cfg.train, "lambda_latent_use", 0.0)) * latent_use_loss
             )
             batch_token_correct, batch_token_total, batch_exact_count, batch_sample_total = (
                 _teacher_forcing_accuracy_stats(
@@ -266,9 +247,6 @@ def train_one_epoch(
         total_kl = total_kl + kl_loss.detach()
         total_cost = total_cost + cost_loss.detach()
         total_nce = total_nce + nce_loss.detach()
-        total_latent_use = total_latent_use + latent_use_loss.detach()
-        total_latent_use_rank = total_latent_use_rank + latent_use_rank_loss.detach()
-        total_latent_use_top1_drop = total_latent_use_top1_drop + latent_use_top1_drop_loss.detach()
         total_token_correct = total_token_correct + batch_token_correct.detach()
         total_token_count = total_token_count + batch_token_total.detach()
         total_exact_count = total_exact_count + batch_exact_count.detach()
@@ -286,9 +264,6 @@ def train_one_epoch(
         "kl_loss": float(total_kl.item()) / denom,
         "cost_loss": float(total_cost.item()) / denom,
         "nce_loss": float(total_nce.item()) / denom,
-        "latent_use_loss": float(total_latent_use.item()) / denom,
-        "latent_use_rank_loss": float(total_latent_use_rank.item()) / denom,
-        "latent_use_top1_drop_loss": float(total_latent_use_top1_drop.item()) / denom,
         # Token / sequence accuracy collected during the train loop. With
         # singleton positions excluded by ``_teacher_forcing_accuracy_stats``
         # this matches the train-side ``evaluate_teacher_forcing`` output up
@@ -299,7 +274,4 @@ def train_one_epoch(
         "beta": beta,
         "early_param_weight_max": float(getattr(cfg.train, "early_param_weight_max", 1.0)),
         "early_param_weight_power": float(getattr(cfg.train, "early_param_weight_power", 1.0)),
-        "lambda_latent_use": float(getattr(cfg.train, "lambda_latent_use", 0.0)),
-        "latent_use_margin": float(getattr(cfg.train, "latent_use_margin", 1.0)),
-        "latent_wrong_top1_margin": float(getattr(cfg.train, "latent_wrong_top1_margin", 0.0)),
     }

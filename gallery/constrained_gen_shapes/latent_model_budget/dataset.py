@@ -33,42 +33,6 @@ _CANDIDATE_MASK_CACHE_VERSION = "v12"
 _CANDIDATE_MASK_CACHE_FLUSH_EVERY = 100
 
 
-def _remap_cached_mask_to_tokenizer(
-    mask: torch.Tensor,
-    saved_id_to_token: Sequence[str],
-    tokenizer: "ParamTokenizer",
-) -> torch.Tensor:
-    """Remap a cached candidate mask from its build-time vocab to the current
-    tokenizer's vocab. Tokens absent from the current vocab are aggregated into
-    ``tokenizer.unk_id`` (mirroring ``candidate_mask_from_values(allow_unk=True)``).
-
-    The cached mask's last dim is indexed by token_id, which depends on the
-    training split (and therefore ``data.seed``). This remapping lets a cache
-    built under one seed be reused under another while keeping the tokenizer's
-    train-only build order (for backward compatibility with existing runs).
-    """
-    saved_id_to_token = list(saved_id_to_token)
-    current_vocab = list(tokenizer.id_to_token)
-    if saved_id_to_token == current_vocab:
-        return mask
-    mask = mask.to(dtype=torch.bool, device="cpu")
-    seq_len = int(mask.shape[0])
-    new_mask = torch.zeros((seq_len, len(current_vocab)), dtype=torch.bool)
-    unk_id = int(tokenizer.unk_id)
-    for old_id, token in enumerate(saved_id_to_token):
-        if old_id >= mask.shape[1]:
-            break
-        col = mask[:, old_id]
-        if not col.any():
-            continue
-        new_id = tokenizer.token_to_id.get(token)
-        if new_id is None:
-            new_mask[:, unk_id] |= col
-        else:
-            new_mask[:, int(new_id)] |= col
-    return new_mask
-
-
 def _build_remap_index(
     saved_id_to_token: Sequence[str],
     tokenizer: "ParamTokenizer",
@@ -204,46 +168,6 @@ def _get_generator_for_record(record: JsonSampleRecord, registry: GeneratorRegis
 # -----------------------------------------------------------------------------
 # Sample preparation
 # -----------------------------------------------------------------------------
-
-
-def _prepare_single_sample(
-    record: JsonSampleRecord,
-    registry: GeneratorRegistry,
-    tokenizer: ParamTokenizer | None,
-    include_budget: bool = True,
-    shape_tokens_and_vars: tuple[List[int], List[int]] | None = None,
-    extent_tokens_and_vars: tuple[List[int], List[int]] | None = None,
-) -> tuple[List[str], List[int], PreparedSample | None]:
-    gen = _get_generator_for_record(record, registry)
-    order = get_model_param_order(gen, include_budget=include_budget)
-
-    missing = [name for name in order if name not in record.params]
-    if missing:
-        raise ValueError(f"{record.sample_id} is missing ordered params: {missing}")
-
-    ordered_values = [int(record.params[name]) for name in order]
-
-    if tokenizer is None:
-        return order, ordered_values, None
-
-    shape_token_ids: List[int] = []
-    shape_var_ids: List[int] = []
-    if shape_tokens_and_vars is not None:
-        shape_token_ids, shape_var_ids = shape_tokens_and_vars
-    extent_token_ids: List[int] = []
-    extent_var_ids: List[int] = []
-    if extent_tokens_and_vars is not None:
-        extent_token_ids, extent_var_ids = extent_tokens_and_vars
-    return order, ordered_values, _build_prepared_sample(
-        record,
-        order,
-        ordered_values,
-        tokenizer,
-        shape_token_ids=shape_token_ids,
-        shape_var_ids=shape_var_ids,
-        extent_token_ids=extent_token_ids,
-        extent_var_ids=extent_var_ids,
-    )
 
 
 def _build_prepared_sample(
@@ -510,27 +434,35 @@ def _family_from_config(config) -> Optional[str]:
     return None
 
 
-def _candidate_mask_cache_dir(config) -> Path:
+def _per_family_cache_dir(config, leaf: str) -> Path:
+    """``{checkpoint_dir}/[{family}/]{leaf}/`` (mkdir -p). Shared base for
+    every per-family preprocessing artifact (mask cache, dataset cache, ...).
+    """
     cache_dir = Path(config.train.checkpoint_dir).expanduser().resolve()
     family = _family_from_config(config)
     if family and cache_dir.name != family:
         cache_dir = cache_dir / family
-    cache_dir = cache_dir / "candidate_mask_cache"
+    cache_dir = cache_dir / leaf
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+def _candidate_mask_cache_dir(config) -> Path:
+    return _per_family_cache_dir(config, "candidate_mask_cache")
 
 
 def _dataset_cache_dir(config) -> Path:
     """Disk cache for parsed records and ordered-parameter metadata. Sibling
     of ``candidate_mask_cache`` so all per-family preprocessing artifacts live
     next to each other."""
-    cache_dir = Path(config.train.checkpoint_dir).expanduser().resolve()
-    family = _family_from_config(config)
-    if family and cache_dir.name != family:
-        cache_dir = cache_dir / family
-    cache_dir = cache_dir / "dataset_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
+    return _per_family_cache_dir(config, "dataset_cache")
+
+
+def _short_hash(payload) -> str:
+    """16-hex-char SHA256 over a JSON-serializable payload, used as a stable
+    fingerprint for cache invalidation."""
+    text = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def _records_cache_fingerprint(json_paths: Sequence[Path]) -> str:
@@ -543,22 +475,19 @@ def _records_cache_fingerprint(json_paths: Sequence[Path]) -> str:
             payload.append((str(p), int(st.st_size), int(st.st_mtime_ns)))
         except OSError:
             payload.append((str(p), -1, -1))
-    text = json.dumps(payload, sort_keys=True)
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+    return _short_hash(payload)
 
 
 def _order_cache_fingerprint(records_fingerprint: str, config) -> str:
     """Order-cache contents are determined by which records exist (encoded
     via ``records_fingerprint``) plus the generator settings and the
     budget/extent flags driving how generators get built."""
-    payload = {
+    return _short_hash({
         "records": records_fingerprint,
         "generator": _generator_cache_suffix(config),
         "budget": budget_enabled(config),
         "extent": extent_token_enabled(config),
-    }
-    text = json.dumps(payload, sort_keys=True)
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+    })
 
 
 def budget_enabled(config_or_payload=None) -> bool:
@@ -697,16 +626,11 @@ def _candidate_mask_cache_tag(config) -> str:
     so it's straightforward to delete/inspect/swap a whole variant at once.
     """
     budget_tag = "with_budget" if budget_enabled(config) else "no_budget"
-    compressed_tag = (
-        "_compressed"
-        if bool(getattr(getattr(config, "train", None), "use_compressed_teacher_forcing", False))
-        else ""
-    )
     generator_tag = _generator_cache_suffix(config)
     extent_tag = "_withExtent" if extent_token_enabled(config) else ""
     return (
         f"{_CANDIDATE_MASK_CACHE_VERSION}_{budget_tag}"
-        f"{compressed_tag}{extent_tag}{generator_tag}"
+        f"{extent_tag}{generator_tag}"
     )
 
 
@@ -1039,6 +963,35 @@ def _precompute_masks_worker(args: tuple) -> Dict[str, torch.Tensor]:
     return {sid: mask.numpy() for sid, mask in new_masks.items()}
 
 
+def _resolve_pool_workers(requested: int | None, n_items: int) -> int:
+    """Clamp ``requested`` against ``cpu_count()`` and item count. ``requested
+    <= 0`` means "auto" (use all CPUs up to n_items)."""
+    import os as _os
+
+    req = int(requested) if requested is not None else 0
+    if n_items <= 0:
+        return 0
+    if req <= 0:
+        return min(_os.cpu_count() or 1, n_items)
+    return min(req, n_items)
+
+
+def _imap_unordered_pool(worker_fn, args_iter, *, n_workers: int, total: int, desc: str):
+    """Yield results of ``worker_fn`` over ``args_iter`` from a fork-context
+    Pool with a tqdm progress bar. Caller drives result reduction.
+    """
+    import multiprocessing as _mp
+
+    ctx = _mp.get_context("fork")
+    with ctx.Pool(processes=n_workers) as pool:
+        for result in tqdm(
+            pool.imap_unordered(worker_fn, args_iter),
+            total=total,
+            desc=desc,
+        ):
+            yield result
+
+
 def _load_json_worker(args: tuple) -> List[JsonSampleRecord]:
     """Module-level worker for parallel JSON loading.
 
@@ -1057,39 +1010,28 @@ def _run_parallel_json_load(
     requested_workers: int,
 ) -> List[JsonSampleRecord]:
     """Load N json files in parallel processes; falls back to sequential when
-    requested_workers <= 1 or there's only one file. Preserves order is *not*
-    guaranteed (we use ``imap_unordered`` for a smoother tqdm), but downstream
+    requested_workers <= 1 or there's only one file. Order is *not*
+    preserved (we use ``imap_unordered`` for a smoother tqdm), but downstream
     code does not depend on file order.
     """
-    import os as _os
-
-    if requested_workers <= 0:
-        n_workers = min(_os.cpu_count() or 1, len(raw_paths))
-    else:
-        n_workers = min(requested_workers, len(raw_paths))
-
+    n_workers = _resolve_pool_workers(requested_workers, len(raw_paths))
     if n_workers < 2 or len(raw_paths) < 2:
         records: List[JsonSampleRecord] = []
         for path in tqdm(raw_paths, desc="[dataset] loading json"):
             records.extend(load_json_samples(path, cost_target=cost_target))
         return records
 
-    print(
-        f"[dataset] launching json load: "
-        f"workers={n_workers} files={len(raw_paths)}"
-    )
-    import multiprocessing as _mp
-
-    ctx = _mp.get_context("fork")
+    print(f"[dataset] launching json load: workers={n_workers} files={len(raw_paths)}")
     args_iter = [(path, cost_target) for path in raw_paths]
     records: List[JsonSampleRecord] = []
-    with ctx.Pool(processes=n_workers) as pool:
-        for batch in tqdm(
-            pool.imap_unordered(_load_json_worker, args_iter),
-            total=len(raw_paths),
-            desc="[dataset] loading json",
-        ):
-            records.extend(batch)
+    for batch in _imap_unordered_pool(
+        _load_json_worker,
+        args_iter,
+        n_workers=n_workers,
+        total=len(raw_paths),
+        desc="[dataset] loading json",
+    ):
+        records.extend(batch)
     return records
 
 
@@ -1140,15 +1082,11 @@ def _run_parallel_mask_precompute(
     if not miss_by_workload:
         return
 
-    requested = getattr(getattr(config, "train", None), "precompute_workers", None)
-    requested = int(requested) if requested is not None else 0
     n_groups = len(miss_by_workload)
-    import os as _os
-    if requested <= 0:
-        n_workers = min(_os.cpu_count() or 1, n_groups)
-    else:
-        n_workers = min(requested, n_groups)
-
+    n_workers = _resolve_pool_workers(
+        getattr(getattr(config, "train", None), "precompute_workers", None),
+        n_groups,
+    )
     if n_workers < 2:
         # Caller's sequential build_samples path will compute these.
         return
@@ -1324,7 +1262,6 @@ def _run_parallel_order_cache_build(
     tuple; falls back to ``None`` when fewer than 2 workers would be used so
     the caller can run the existing sequential path.
     """
-    import os as _os
     import pickle as _pickle
 
     sample_record_by_key: Dict[tuple, JsonSampleRecord] = {}
@@ -1339,15 +1276,10 @@ def _run_parallel_order_cache_build(
         sample_record_by_key.setdefault(order_key, record)
 
     n_unique = len(sample_record_by_key)
-    if n_unique == 0:
-        return None
-
-    requested = getattr(getattr(config, "train", None), "precompute_workers", None)
-    requested = int(requested) if requested is not None else 0
-    if requested <= 0:
-        n_workers = min(_os.cpu_count() or 1, n_unique)
-    else:
-        n_workers = min(requested, n_unique)
+    n_workers = _resolve_pool_workers(
+        getattr(getattr(config, "train", None), "precompute_workers", None),
+        n_unique,
+    )
     if n_workers < 2:
         return None
 
@@ -1375,52 +1307,49 @@ def _run_parallel_order_cache_build(
     canonical_extent_labels: List[str] = []
     unique_extent_values: Set[int] = set()
 
-    import multiprocessing as _mp
-
-    ctx = _mp.get_context("fork")
-    pbar = tqdm(total=n_unique, desc="[dataset] order cache")
-    try:
-        with ctx.Pool(processes=n_workers) as pool:
-            for result in pool.imap_unordered(_order_cache_worker, per_group_args):
-                order_key = tuple(result["order_key"])
-                order_cache[order_key] = {
-                    "order": list(result["order"]),
-                    "budget_specs": list(result["budget_specs"]),
-                }
-                vec_step_indices = set(result["vec_step_indices"])
-                # Same dynamic-extent SplitStep skip as the sequential loop:
-                # vectorize-attached splits have meaningless divisor-based
-                # initial domains.
-                for name, values in result["generator_domain_values"].items():
-                    if name.startswith("sp_"):
-                        try:
-                            step_idx = int(name.split("_")[1])
-                        except (ValueError, IndexError):
-                            step_idx = None
-                        if step_idx is not None and step_idx in vec_step_indices:
-                            continue
-                    domain_values_by_name.setdefault(name, set()).update(
-                        int(v) for v in values
-                    )
-                if use_extent_tokens:
-                    sp_extents = result["sp_extents"]
-                    sorted_indices = sorted(int(s) for s in sp_extents.keys())
-                    if not canonical_extent_indices:
-                        canonical_extent_indices = list(sorted_indices)
-                        canonical_extent_labels = [
-                            f"sp_extent_{s}" for s in canonical_extent_indices
-                        ]
-                    elif sorted_indices != canonical_extent_indices:
-                        raise ValueError(
-                            "SplitStep step-index layout differs across order_keys: "
-                            f"reference={canonical_extent_indices} got={sorted_indices}"
-                        )
-                    extents = [int(sp_extents[s]) for s in canonical_extent_indices]
-                    extent_values_by_order_key[order_key] = extents
-                    unique_extent_values.update(extents)
-                pbar.update(1)
-    finally:
-        pbar.close()
+    for result in _imap_unordered_pool(
+        _order_cache_worker,
+        per_group_args,
+        n_workers=n_workers,
+        total=n_unique,
+        desc="[dataset] order cache",
+    ):
+        order_key = tuple(result["order_key"])
+        order_cache[order_key] = {
+            "order": list(result["order"]),
+            "budget_specs": list(result["budget_specs"]),
+        }
+        vec_step_indices = set(result["vec_step_indices"])
+        # Same dynamic-extent SplitStep skip as the sequential loop:
+        # vectorize-attached splits have meaningless divisor-based
+        # initial domains.
+        for name, values in result["generator_domain_values"].items():
+            if name.startswith("sp_"):
+                try:
+                    step_idx = int(name.split("_")[1])
+                except (ValueError, IndexError):
+                    step_idx = None
+                if step_idx is not None and step_idx in vec_step_indices:
+                    continue
+            domain_values_by_name.setdefault(name, set()).update(
+                int(v) for v in values
+            )
+        if use_extent_tokens:
+            sp_extents = result["sp_extents"]
+            sorted_indices = sorted(int(s) for s in sp_extents.keys())
+            if not canonical_extent_indices:
+                canonical_extent_indices = list(sorted_indices)
+                canonical_extent_labels = [
+                    f"sp_extent_{s}" for s in canonical_extent_indices
+                ]
+            elif sorted_indices != canonical_extent_indices:
+                raise ValueError(
+                    "SplitStep step-index layout differs across order_keys: "
+                    f"reference={canonical_extent_indices} got={sorted_indices}"
+                )
+            extents = [int(sp_extents[s]) for s in canonical_extent_indices]
+            extent_values_by_order_key[order_key] = extents
+            unique_extent_values.update(extents)
 
     return (
         order_cache,
@@ -1870,6 +1799,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         config.data.val_ratio,
         config.data.test_ratio,
         config.data.seed,
+        mode=getattr(config.data, "split_mode", None),
     )
 
     # Tokenizer build order is intentionally train-only (seed-dependent) to
@@ -1907,7 +1837,6 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
         train_ordered_values=train_values,
         all_ordered_names=all_orders,
         domain_values_by_name=domain_values_for_tokenizer,
-        pad_to_vocab_size=getattr(config.data, "pad_vocab_to", None),
     )
     print(
         f"[dataset] tokenizer built: vocab={len(tokenizer.id_to_token)} "

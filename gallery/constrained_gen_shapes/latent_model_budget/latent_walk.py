@@ -1,79 +1,47 @@
 from __future__ import annotations
 
-import argparse
 import gc
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import torch
 from tvm import auto_scheduler
 
-if __package__ in (None, ""):
-    _HERE = Path(__file__).resolve().parent
-    sys.path.insert(0, str(_HERE))
-    sys.path.insert(0, str(_HERE.parent))
-    from latent_model_budget.adapter import (
-        GeneratorRegistry,
-        JsonSampleRecord,
-        LegalPrefixOracle,
-        _parse_shapes_from_workload_key,
-        cost_label_to_raw,
-        cost_raw_to_label,
-        load_json_sample,
-        load_json_samples,
-    )
-    from latent_model_budget.dataset import budget_enabled, get_model_param_order
-    from latent_model_budget.inference import SamplingOptions, _sample_token_from_logits
-    from latent_model_budget.model import LatentParamVAE
-    from latent_model_budget.shape_semantics import (
-        flatten_labels,
-        semantic_labels_for_task,
-    )
-    from latent_model_budget.recon_predict_gp import make_task_sym_map_key
-    from latent_model_budget.tokenizer import ParamTokenizer
-    from modules.task_paths import clean_name, get_measure_record_filename
-    from result_csv_utils import (
-        append_result_rows,
-        extract_true_mean_cost,
-        load_existing_deterministic_sample_ids,
-        load_existing_random_seeds,
-        make_sym_map_key,
-        resolve_results_csv_path,
-    )
-else:
-    from .latent_model_budget.adapter import (
-        GeneratorRegistry,
-        JsonSampleRecord,
-        LegalPrefixOracle,
-        _parse_shapes_from_workload_key,
-        cost_label_to_raw,
-        cost_raw_to_label,
-        load_json_sample,
-        load_json_samples,
-    )
-    from .latent_model_budget.dataset import budget_enabled, get_model_param_order
-    from .latent_model_budget.inference import SamplingOptions, _sample_token_from_logits
-    from .latent_model_budget.model import LatentParamVAE
-    from .latent_model_budget.shape_semantics import (
-        flatten_labels,
-        semantic_labels_for_task,
-    )
-    from .latent_model_budget.recon_predict_gp import make_task_sym_map_key
-    from .latent_model_budget.tokenizer import ParamTokenizer
-    from .modules.task_paths import clean_name, get_measure_record_filename
-    from .result_csv_utils import (
-        append_result_rows,
-        extract_true_mean_cost,
-        load_existing_deterministic_sample_ids,
-        load_existing_random_seeds,
-        make_sym_map_key,
-        resolve_results_csv_path,
-    )
+from .adapter import (
+    GeneratorRegistry,
+    JsonSampleRecord,
+    LegalPrefixOracle,
+    _parse_shapes_from_workload_key,
+    cost_label_to_raw,
+    cost_raw_to_label,
+    load_json_sample,
+    load_json_samples,
+)
+from .dataset import (
+    budget_enabled,
+    get_model_param_order,
+)
+from .inference import SamplingOptions, _sample_token_from_logits
+from .model import LatentParamVAE
+from .shape_semantics import (
+    flatten_labels,
+    semantic_labels_for_task,
+)
+from .recon_predict_gp import make_task_sym_map_key
+from .tokenizer import ParamTokenizer
+from modules.task_paths import clean_name, get_measure_record_filename
+from result_csv_utils import (
+    append_result_rows,
+    extract_true_mean_cost,
+    load_existing_deterministic_sample_ids,
+    load_existing_random_seeds,
+    make_sym_map_key,
+    resolve_results_csv_path,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -227,56 +195,6 @@ def measure_candidates_batch(
     ]
 
 
-def log_candidate_result(result: Dict[str, Any]) -> None:
-    """사람이 읽기 쉬운 한 줄 진행 로그를 출력한다."""
-    step_index = result["step_index"]
-    alpha = result["alpha"]
-    predicted_score = result["predicted_score"]
-
-    if result["final_violations"]:
-        print(
-            f"[latent-walk] step={step_index} alpha={alpha:.4f} "
-            f"pred={predicted_score:.6f} status=violated "
-            f"violations={len(result['final_violations'])}"
-        )
-        return
-
-    if not result["state_build_ok"]:
-        print(
-            f"[latent-walk] step={step_index} alpha={alpha:.4f} "
-            f"pred={predicted_score:.6f} status=state_build_failed "
-            f"error={result['state_build_error']}"
-        )
-        return
-
-    measurement = result.get("measurement") or {}
-    if not measurement.get("ok"):
-        print(
-            f"[latent-walk] step={step_index} alpha={alpha:.4f} "
-            f"pred={predicted_score:.6f} status=measure_failed "
-            f"error={measurement.get('error')}"
-        )
-        return
-
-    if not measurement.get("usable_measurement"):
-        print(
-            f"[latent-walk] step={step_index} alpha={alpha:.4f} "
-            f"pred={predicted_score:.6f} status=measure_error "
-            f"error_no={measurement.get('error_no')} "
-            f"error_msg={measurement.get('error_msg')}"
-        )
-        return
-
-    mean_cost = measurement.get("mean_cost")
-    mean_cost_text = "n/a" if mean_cost is None else f"{mean_cost:.4f}"
-    print(
-        f"[latent-walk] mean_cost={mean_cost_text}\n"
-        f"step={step_index}, alpha={alpha:.4f}"
-        # f"pred={predicted_score:.6f} status=ok "
-        # f"log={measurement.get('measure_record_path')}"
-    )
-
-
 def log_grouped_candidate_result(
     grouped_record: Dict[str, Any],
     *,
@@ -337,37 +255,6 @@ def log_grouped_candidate_result(
     parts.append(f"{reencode_label}={reencode_text}")
     parts.append(alpha_text)
     print(", ".join(parts))
-
-
-def _default_walk_output_path(
-    checkpoint_path: str | Path,
-    record_json_path: str | Path,
-    output_dir: str | Path,
-) -> Path:
-    checkpoint_stem = clean_name(Path(checkpoint_path).stem)
-    record_stem = clean_name(Path(record_json_path).stem)
-    return Path(output_dir) / "walk_records" / f"{checkpoint_stem}__{record_stem}.jsonl"
-
-
-def _resolve_output_layout(
-    *,
-    checkpoint_path: str | Path,
-    record_json_path: str | Path,
-    output: Optional[str | Path],
-) -> tuple[Optional[Path], Optional[str]]:
-    if output is None:
-        return None, None
-
-    output_root = Path(output)
-    walk_output_path = _default_walk_output_path(checkpoint_path, record_json_path, output_root)
-    measure_output_dir = str(output_root / "measure_records")
-    return walk_output_path, measure_output_dir
-
-
-def _resolve_measure_output_dir(output: Optional[str | Path]) -> Optional[str]:
-    if output is None:
-        return None
-    return str(Path(output) / "measure_records")
 
 
 def _family_from_record(record: JsonSampleRecord) -> Optional[str]:
@@ -903,97 +790,6 @@ def _resolve_decoded_value(
 
 
 @torch.no_grad()
-def greedy_decode_from_z(
-    bundle: LoadedBundle,
-    oracle: LegalPrefixOracle,
-    ordered_names: List[str],
-    z: torch.Tensor,
-    *,
-    sampling_options: Optional[SamplingOptions] = None,
-    rng: Optional[torch.Generator] = None,
-    shape_token_ids: Optional[List[int]] = None,
-    shape_var_ids: Optional[List[int]] = None,
-    extent_token_ids: Optional[List[int]] = None,
-    extent_var_ids: Optional[List[int]] = None,
-) -> DecodeRecord:
-    options = sampling_options or SamplingOptions()
-    model = bundle.model
-    tokenizer = bundle.tokenizer
-    device = bundle.device
-
-    z = z.to(device=device, dtype=torch.float32).view(1, -1)
-    memory = model.latent_to_memory(z).view(1, model.cfg.latent_token_count, model.cfg.d_model)
-
-    shape_token_list = list(shape_token_ids or [])
-    shape_var_list = list(shape_var_ids or [])
-    if len(shape_token_list) != len(shape_var_list):
-        raise ValueError(
-            f"shape_token_ids ({len(shape_token_list)}) and shape_var_ids "
-            f"({len(shape_var_list)}) length mismatch"
-        )
-    extent_token_list = list(extent_token_ids or [])
-    extent_var_list = list(extent_var_ids or [])
-    if len(extent_token_list) != len(extent_var_list):
-        raise ValueError(
-            f"extent_token_ids ({len(extent_token_list)}) and extent_var_ids "
-            f"({len(extent_var_list)}) length mismatch"
-        )
-    prefix_token_list = shape_token_list + extent_token_list
-    prefix_var_list = shape_var_list + extent_var_list
-    param_var_ids = [tokenizer.var_to_id[name] for name in ordered_names]
-    full_var_ids = prefix_var_list + param_var_ids
-
-    decoder_input_ids: List[int] = list(prefix_token_list) + [tokenizer.param_start_id]
-    decoded_params: Dict[str, int] = {}
-
-    for step_idx, var_name in enumerate(ordered_names):
-        del step_idx
-        candidate_values = list(oracle.candidate_values(var_name))
-        if not candidate_values:
-            raise RuntimeError(f"No legal candidates returned for {var_name}")
-
-        token_mask = tokenizer.candidate_mask_from_values(var_name, candidate_values, device=device)
-        if not bool(token_mask.any()):
-            raise RuntimeError(
-                f"Token vocab cannot represent any legal candidate for {var_name}. "
-                f"candidates={candidate_values}"
-            )
-
-        step_input = torch.tensor([decoder_input_ids], dtype=torch.long, device=device)
-        step_var_ids = torch.tensor(
-            [full_var_ids[: len(decoder_input_ids)]],
-            dtype=torch.long,
-            device=device,
-        )
-        logits = model.decode(
-            step_input,
-            step_var_ids,
-            memory,
-            z,
-            decoder_pad_mask=step_input.eq(tokenizer.pad_id),
-        )
-        step_logits = logits[0, -1]
-        pred_token_id = _sample_token_from_logits(step_logits, token_mask, options, rng)
-        pred_value = _resolve_decoded_value(tokenizer, var_name, pred_token_id, candidate_values)
-
-        oracle.assign(var_name, pred_value)
-        decoded_params[var_name] = int(pred_value)
-        decoder_input_ids.append(pred_token_id)
-
-    sym_map = dict(oracle.generator.s.sym_map)
-    
-    for name, value in decoded_params.items():
-        sym_map[name] = int(value)
-
-    return DecodeRecord(
-        params=decoded_params,
-        sym_map=sym_map,
-        final_violations=list(oracle.final_violations()),
-    )
-
-
-
-@torch.no_grad()
 def greedy_decode_from_zs_batch(
     bundle: LoadedBundle,
     oracles: List[LegalPrefixOracle],
@@ -1033,7 +829,7 @@ def greedy_decode_from_zs_batch(
 
     zs = zs.to(device=device, dtype=torch.float32).reshape(batch_size, -1)
     memory = model.latent_to_memory(zs).view(
-        batch_size, model.cfg.latent_token_count, model.cfg.d_model
+        batch_size, model.cfg.latent_token_count, model.cfg.embed_dim
     )
 
     shape_token_list = list(shape_token_ids or [])
@@ -1709,14 +1505,6 @@ def build_walk_records(
 
 
 
-def save_walk_records(records: List[WalkRecord], output_path: str | Path) -> None:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        for rec in records:
-            f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
-
-
 def _group_walk_records_by_sym_map(records: List[WalkRecord]) -> List[Dict[str, Any]]:
     grouped: Dict[tuple[tuple[str, int], ...], Dict[str, Any]] = {}
     order: List[tuple[tuple[str, int], ...]] = []
@@ -1854,11 +1642,6 @@ def run_latent_walk(
     show_neg_log: bool = False,
     reference_best_dir: Optional[str] = None,
 ) -> List[WalkRecord]:
-    walk_output_path, _ = _resolve_output_layout(
-        checkpoint_path=checkpoint_path,
-        record_json_path=record_json_path,
-        output=output,
-    )
     if bundle is None:
         bundle = load_bundle(
             checkpoint_path,
@@ -1898,8 +1681,6 @@ def run_latent_walk(
         reference_best_seconds=reference_best_seconds,
         reference_best_dir=reference_best_dir,
     )
-    # if walk_output_path is not None:
-    #     save_walk_records(records, walk_output_path)
     csv_output_path = resolve_results_csv_path(
         __file__,
         "by_latent",
@@ -1920,169 +1701,3 @@ def run_latent_walk(
     )
     return records
 
-
-
-def _build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--record-json", required=True, type=str)
-    p.add_argument("--network-info-folder", type=str, default=None)
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--num-steps", type=int, default=30)
-    p.add_argument("--step-size", type=float, default=0.25)
-    p.add_argument("--no-normalize-direction", action="store_true")
-    p.add_argument(
-        "--random",
-        action="store_true",
-        help="Use a standard Gaussian sample as the starting latent z instead of encoding --record-json",
-    )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Random seed used when --random is enabled",
-    )
-    p.add_argument(
-        "--best-cost",
-        action="store_true",
-        help="If --record-json contains multiple records, start from the one with the best recorded cost",
-    )
-    p.add_argument("--output", type=str, default=None)
-    p.add_argument("--latent-gradient", action="store_true")
-    p.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="Use deterministic=True when encoding the starting latent z from --record-json",
-    )
-    p.add_argument(
-        "--decode-strategy",
-        type=str,
-        default="greedy",
-        choices=["greedy", "sampling"],
-        help="Token decoding strategy used when walking the latent space",
-    )
-    p.add_argument("--decode-temperature", type=float, default=1.0)
-    p.add_argument(
-        "--decode-top-k",
-        type=int,
-        default=0,
-        help="0 disables top-k truncation",
-    )
-    p.add_argument(
-        "--decode-top-p",
-        type=float,
-        default=1.0,
-        help="1.0 disables top-p truncation",
-    )
-    p.add_argument(
-        "--decode-seed",
-        type=int,
-        default=None,
-        help="Optional RNG seed for sampling decoding",
-    )
-    p.add_argument(
-        "--sort-by",
-        type=str,
-        default="measured",
-        choices=["measured", "re_pred", "alpha"],
-        help="How to order the printed walk results: measured raw cost (asc), "
-             "reencode-predicted cost (desc), or walk alpha (asc)",
-    )
-    p.add_argument(
-        "--reference-best-dir",
-        type=str,
-        default=None,
-        help="Optional directory of measure-record JSONs (e.g. a sibling "
-             "target like a6000) to print a 'best known cost' line per task. "
-             "Tasks not found in this dir simply skip the extra line.",
-    )
-    return p
-
-
-
-def main() -> List[WalkRecord]:
-    args = _build_argparser().parse_args()
-    sampling_options = SamplingOptions(
-        strategy=args.decode_strategy,
-        temperature=float(args.decode_temperature),
-        top_k=int(args.decode_top_k),
-        top_p=float(args.decode_top_p),
-        seed=args.decode_seed,
-    )
-
-    record_json = Path(args.record_json)
-    if record_json.is_dir():
-        # Directory mode: one task per JSON file. The directory is expected
-        # to look like ``.../{family}/{target}/`` and contain task JSONs
-        # named ``{task_index}_(...).json``. Each file gets exactly one walk
-        # (top-1 anchor when --best-cost). The bundle (model + registry +
-        # tokenizer) is loaded once and reused across files.
-        json_files = sorted(record_json.glob("*.json"))
-        if not json_files:
-            print(f"[latent-walk] no json files in {record_json}")
-            return []
-        print(
-            f"[latent-walk] directory mode: {len(json_files)} task(s) in {record_json}"
-        )
-        bundle = load_bundle(
-            args.checkpoint,
-            network_info_folder=args.network_info_folder,
-            device=args.device,
-            use_latent_gradient=args.latent_gradient,
-        )
-        all_records: List[WalkRecord] = []
-        for idx, json_file in enumerate(json_files, start=1):
-            print(
-                f"[latent-walk] [{idx}/{len(json_files)}] task json: {json_file.name}"
-            )
-            try:
-                records = run_latent_walk(
-                    checkpoint_path=args.checkpoint,
-                    record_json_path=str(json_file),
-                    network_info_folder=args.network_info_folder,
-                    device=args.device,
-                    num_steps=args.num_steps,
-                    step_size=args.step_size,
-                    normalize_direction=not args.no_normalize_direction,
-                    random_z=bool(args.random),
-                    seed=args.seed,
-                    best_cost=bool(args.best_cost),
-                    output=args.output,
-                    latent_gradient=args.latent_gradient,
-                    deterministic_start=bool(args.deterministic),
-                    sampling_options=sampling_options,
-                    sort_by=args.sort_by,
-                    reference_best_dir=args.reference_best_dir,
-                    bundle=bundle,
-                    keep_bundle=True,
-                )
-                all_records.extend(records)
-            except Exception as err:  # pylint: disable=broad-except
-                print(
-                    f"[latent-walk] failed on {json_file.name}: "
-                    f"{type(err).__name__}: {err}"
-                )
-        return all_records
-
-    return run_latent_walk(
-        checkpoint_path=args.checkpoint,
-        record_json_path=args.record_json,
-        network_info_folder=args.network_info_folder,
-        device=args.device,
-        num_steps=args.num_steps,
-        step_size=args.step_size,
-        normalize_direction=not args.no_normalize_direction,
-        random_z=bool(args.random),
-        seed=args.seed,
-        best_cost=bool(args.best_cost),
-        output=args.output,
-        latent_gradient=args.latent_gradient,
-        deterministic_start=bool(args.deterministic),
-        sampling_options=sampling_options,
-        sort_by=args.sort_by,
-        reference_best_dir=args.reference_best_dir,
-    )
-
-
-if __name__ == "__main__":
-    main()

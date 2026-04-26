@@ -118,113 +118,13 @@ def weighted_cost_loss(
     return F.mse_loss(cost_pred[cost_mask], costs[cost_mask])
 
 
-def _weighted_token_mean(losses: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    return (losses * weights).sum() / weights.sum().clamp_min(1.0)
-
-
-def latent_use_margin_loss(
-    model: LatentParamVAE,
-    true_logits: torch.Tensor,
-    decoder_input_ids: torch.Tensor,
-    decoder_var_ids: torch.Tensor,
-    decoder_pad_mask: torch.Tensor,
-    true_latent: torch.Tensor,
-    true_memory: torch.Tensor,
-    targets: torch.Tensor,
-    candidate_masks: torch.Tensor,
-    pad_id: int,
-    position_weights: torch.Tensor,
-    margin: float,
-    wrong_top1_margin: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size = int(true_latent.size(0))
-    if batch_size > 1:
-        perm = torch.roll(torch.arange(batch_size, device=true_latent.device), shifts=1)
-        wrong_latent = true_latent[perm].detach()
-        wrong_memory = true_memory[perm].detach()
-    else:
-        wrong_latent = torch.zeros_like(true_latent)
-        wrong_memory = torch.zeros_like(true_memory)
-    zero_latent = torch.zeros_like(true_latent)
-    zero_memory = torch.zeros_like(true_memory)
-
-    shuffled_logits = model.decode(
-        decoder_input_ids,
-        decoder_var_ids,
-        wrong_memory,
-        wrong_latent,
-        decoder_pad_mask=decoder_pad_mask,
-    )
-    zero_logits = model.decode(
-        decoder_input_ids,
-        decoder_var_ids,
-        zero_memory,
-        zero_latent,
-        decoder_pad_mask=decoder_pad_mask,
-    )
-
-    valid_mask = targets.ne(pad_id)
-    safe_targets = targets.masked_fill(~valid_mask, 0)
-    true_gold_logits = torch.gather(
-        true_logits,
-        dim=-1,
-        index=safe_targets.unsqueeze(-1),
-    ).squeeze(-1)
-    shuffled_gold_logits = torch.gather(
-        shuffled_logits,
-        dim=-1,
-        index=safe_targets.unsqueeze(-1),
-    ).squeeze(-1)
-    zero_gold_logits = torch.gather(
-        zero_logits,
-        dim=-1,
-        index=safe_targets.unsqueeze(-1),
-    ).squeeze(-1)
-
-    gold_valid_mask = torch.gather(
-        candidate_masks.to(dtype=torch.bool),
-        dim=-1,
-        index=safe_targets.unsqueeze(-1),
-    ).squeeze(-1)
-    valid_mask = valid_mask & gold_valid_mask
-    weighted_mask = position_weights * valid_mask.to(dtype=true_gold_logits.dtype)
-    shuffled_margin_loss = F.relu(float(margin) - (true_gold_logits - shuffled_gold_logits))
-    zero_margin_loss = F.relu(float(margin) - (true_gold_logits - zero_gold_logits))
-    rank_margin_loss = _weighted_token_mean(
-        0.5 * (shuffled_margin_loss + zero_margin_loss),
-        weighted_mask,
-    )
-
-    gold_one_hot = F.one_hot(safe_targets, num_classes=true_logits.size(-1)).to(dtype=torch.bool)
-    alt_candidate_masks = candidate_masks.to(dtype=torch.bool) & (~gold_one_hot)
-    alt_exists = alt_candidate_masks.any(dim=-1)
-    alt_weighted_mask = weighted_mask * alt_exists.to(dtype=weighted_mask.dtype)
-
-    shuffled_best_other_logits = shuffled_logits.masked_fill(~alt_candidate_masks, float("-inf")).amax(dim=-1)
-    zero_best_other_logits = zero_logits.masked_fill(~alt_candidate_masks, float("-inf")).amax(dim=-1)
-    shuffled_best_other_logits = torch.where(alt_exists, shuffled_best_other_logits, shuffled_gold_logits)
-    zero_best_other_logits = torch.where(alt_exists, zero_best_other_logits, zero_gold_logits)
-
-    shuffled_top1_drop_loss = F.relu(
-        float(wrong_top1_margin) - (shuffled_best_other_logits - shuffled_gold_logits)
-    )
-    zero_top1_drop_loss = F.relu(
-        float(wrong_top1_margin) - (zero_best_other_logits - zero_gold_logits)
-    )
-    top1_drop_loss = _weighted_token_mean(
-        0.5 * (shuffled_top1_drop_loss + zero_top1_drop_loss),
-        alt_weighted_mask,
-    )
-    total_loss = rank_margin_loss + top1_drop_loss
-    return total_loss, rank_margin_loss, top1_drop_loss
-
-
 def soft_infonce_loss(
     z: torch.Tensor,
     costs: torch.Tensor,
     cost_mask: torch.Tensor,
     tau: float,
     sample_weights: torch.Tensor | None = None,
+    task_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     valid_idx = torch.nonzero(cost_mask, as_tuple=False).flatten()
     if valid_idx.numel() < 2:
@@ -239,18 +139,29 @@ def soft_infonce_loss(
     sim = z @ z.t() / max(float(tau), 1e-6)
     eye = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
 
+    if task_ids is not None:
+        tid = task_ids[valid_idx]
+        same_task = (tid[:, None] == tid[None, :]) & (tid[:, None] >= 0)
+        pair_mask = same_task & (~eye)
+    else:
+        pair_mask = ~eye
+
     with torch.no_grad():
         dist = torch.abs(y[:, None] - y[None, :])
         weights = torch.exp(-dist / dist.mean().clamp_min(1e-6))
-        weights.fill_diagonal_(0.0)
+        weights = weights * pair_mask.to(weights.dtype)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-    log_probs = F.log_softmax(sim.masked_fill(eye, float("-inf")), dim=-1)
-    log_probs = log_probs.masked_fill(eye, 0.0)
+    log_probs = F.log_softmax(sim.masked_fill(~pair_mask, float("-inf")), dim=-1)
+    log_probs = log_probs.masked_fill(~pair_mask, 0.0)
     per_anchor = -(weights * log_probs).sum(dim=-1)
+    has_pair = pair_mask.any(dim=-1)
+    if not has_pair.any():
+        return z.sum() * 0.0
     if sw is not None:
-        return (per_anchor * sw).sum() / sw.sum().clamp_min(1e-8)
-    return per_anchor.mean()
+        sw_eff = sw * has_pair.to(sw.dtype)
+        return (per_anchor * sw_eff).sum() / sw_eff.sum().clamp_min(1e-8)
+    return per_anchor[has_pair].mean()
 
 
 def ordered_infonce_loss(
@@ -262,6 +173,7 @@ def ordered_infonce_loss(
     sample_weights: torch.Tensor | None = None,
     pos_weight_by_percentile: bool = False,
     pos_weight_sigma: float = 0.2,
+    task_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     valid_idx = torch.nonzero(cost_mask, as_tuple=False).flatten()
     if valid_idx.numel() < 2:
@@ -282,6 +194,12 @@ def ordered_infonce_loss(
 
     pos_mask = (c_j > c_i) & (~same)
     neg_mask = (c_j < c_i) & (~same)
+
+    if task_ids is not None:
+        tid = task_ids[valid_idx]
+        same_task = (tid[:, None] == tid[None, :]) & (tid[:, None] >= 0)
+        pos_mask = pos_mask & same_task
+        neg_mask = neg_mask & same_task
 
     scale = cost.std(unbiased=False).clamp_min(eps)
     delta = (c_i - c_j).clamp_min(0.0) / scale
