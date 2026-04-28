@@ -12,16 +12,17 @@ import pickle
 import tvm
 from tvm import auto_scheduler, relay
 from tvm.auto_scheduler.utils import to_str_round
-
+import os
 # -----------------------------------------------------------------------------
 # Path and task-loading helpers
 # -----------------------------------------------------------------------------
 
-NETWORK_INFO_FOLDER = '/root/work/tvm-ansor/gallery/dataset/network_info'
-TO_MEASURE_PROGRAM_FOLDER = '/root/work/tvm-ansor/gallery/dataset/to_measure_programs'
-TO_MEASURE_GEN_PROGRAM_FOLDER = '/root/work/tvm-ansor/gallery/dataset/to_measure_gen_programs'
-TO_MEASURE_NETWORK_FOLDER = '/root/work/tvm-ansor/gallery/dataset/to_measure_networks'
-MEASURED_FOLDER = '/root/work/tvm-ansor/gallery/dataset/measured_gen_programs'
+TVM_HOME = os.getenv("TVM_HOME")
+NETWORK_INFO_FOLDER = f"{TVM_HOME}/gallery/dataset/network_info"
+TO_MEASURE_PROGRAM_FOLDER = f"{TVM_HOME}/gallery/dataset/to_measure_programs"
+TO_MEASURE_GEN_PROGRAM_FOLDER = f"{TVM_HOME}/gallery/dataset/to_measure_gen_programs"
+TO_MEASURE_NETWORK_FOLDER = f"{TVM_HOME}/gallery/dataset/to_measure_networks"
+MEASURED_FOLDER = f"{TVM_HOME}/gallery/dataset/measured_gen_programs"
 
 
 def clean_name(x):

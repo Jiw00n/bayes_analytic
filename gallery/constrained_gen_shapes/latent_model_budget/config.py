@@ -6,12 +6,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from glob import glob
+import os
 
+TVM_HOME = os.getenv("TVM_HOME")
+GPU_INFO = os.getenv("GPU_INFO", "unknown_gpu")
+# DEFAULT_JSON_PATHS = glob(f"{TVM_HOME}/gallery/constrained_gen/data/measured_*/*.json")
+DEFAULT_JSON_PATHS = glob(f"{TVM_HOME}/gallery/dataset/measure_tenset_filtered_family/nn_contrib_conv2d_winograd_without_weight_transform/t4/*.json")
+DEFAULT_NETWORK_INFO_FOLDER = f"{TVM_HOME}/gallery/dataset/network_info_all"
+DEFAULT_CHECKPOINT_DIR = f"{TVM_HOME}/gallery/constrained_gen_shapes/saves"
 
-# DEFAULT_JSON_PATHS = glob("/workspace/tvm_gits/tvm-ansor/gallery/constrained_gen/data/measured_*/*.json")
-DEFAULT_JSON_PATHS = glob("/workspace/tvm_gits/tvm-ansor/gallery/dataset/measure_tenset_filtered_family/nn_contrib_conv2d_winograd_without_weight_transform/t4/*.json")
-DEFAULT_NETWORK_INFO_FOLDER = "/workspace/tvm_gits/tvm-ansor/gallery/dataset/network_info_all"
-DEFAULT_CHECKPOINT_DIR = "/workspace/tvm_gits/tvm-ansor/gallery/constrained_gen_shapes/saves"
 
 @dataclass
 class DataConfig:
@@ -142,7 +145,7 @@ class LatentWalkConfig:
     record_json: Optional[str] = None
     output_dir: Optional[str] = None
 
-    reference_best_dir: Optional[str] = "/workspace/tvm_gits/tvm-ansor/gallery/dataset/measure_tenset_filtered_family/nn_contrib_conv2d_winograd_without_weight_transform/a6000"
+    reference_best_dir: Optional[str] = f"/workspace/tvm_gits/tvm-ansor/gallery/dataset/measure_tenset_filtered_family/nn_contrib_conv2d_winograd_without_weight_transform/{GPU_INFO}"
     task_indices: Optional[List[int]] = None
 
 
