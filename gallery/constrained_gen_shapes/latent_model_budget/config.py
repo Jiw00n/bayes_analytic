@@ -95,7 +95,7 @@ class TrainConfig:
     cost_ridge_weighted: bool = False
 
     # "cost_head" | "cost_vec" | "cost_vec_weighted" | "gp" | "lightgbm_ranker"
-    re_encode_predictor: str = "cost_vec"
+    re_encode_predictor: str = "cost_head"
 
 
     # scheduler_milestones: List[int] = field(default_factory=lambda: [30, 50])

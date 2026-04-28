@@ -341,12 +341,12 @@ def _build_wandb_run_name(config, bundle: Optional["DatasetBundle"] = None) -> s
     if config.data.cost_target_regression:
         if config.data.cost_target_regression == "log_norm_throughput":
             name += "_reglognorm"
-    if bool(getattr(config.train, "order_nce", False)):
+    if not bool(getattr(config.train, "order_nce", False)):
         name += "_softnce"
     if bool(getattr(config.train, "nce_mu", False)):
         name += "_nce_mu"
-    if bool(getattr(config.model, "adaln", False)):
-        name += "_adaln"
+    if not bool(getattr(config.model, "adaln", False)):
+        name += "_no_adaln"
     if bool(getattr(config.train, "cobo_sample_weighting", False)):
         cobo_tag = getattr(config.train, "cobo_apply_to", [])
         name += (
@@ -378,6 +378,7 @@ def _build_wandb_run_name(config, bundle: Optional["DatasetBundle"] = None) -> s
             name += f"_sseed{config.sampling.seed}"
     name += f"_dseed{config.data.seed}"
     name += f"_mseed{config.model.seed}"
+    name += f"_taskbatch{config.train.tasks_per_batch}"
 
     name += _generator_cache_suffix(config)
     return name

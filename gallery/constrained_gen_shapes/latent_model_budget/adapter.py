@@ -84,6 +84,26 @@ def _extract_param_dict(payload: dict) -> Dict[str, int]:
     return params
 
 
+def _task_index_from_filename(path: Path) -> Optional[int]:
+    """Extract leading integer from filenames like ``1270_([...]...).json``.
+
+    Source datasets under ``measure_tenset_filtered_family/.../<task_id>_(...)`` use
+    the file stem prefix as the global TVM task index. JSON metadata for those
+    files does not carry ``task_index``, so we recover it from the filename.
+    """
+    stem = path.stem
+    sep = stem.find("_")
+    if sep <= 0:
+        return None
+    head = stem[:sep]
+    if not head.isdigit():
+        return None
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
 def _extract_task_signature(payload: dict) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str]]:
     meta = payload.get("meta", {}) or {}
     task = payload.get("task", {}) or {}
@@ -435,6 +455,8 @@ def _load_custom_json_sample(
     cost_target: str = "neg_log",
 ) -> JsonSampleRecord:
     task_index, workload_key, target_kind, target_model, task_desc = _extract_task_signature(payload)
+    if task_index is None:
+        task_index = _task_index_from_filename(path)
     sketch_index = _maybe_int((payload.get("meta", {}) or {}).get("sketch_index"))
     if sketch_index is None:
         sketch_index = 0
@@ -492,13 +514,14 @@ def _load_measure_record_sample(
         workload_key, target_kind, target_model, task_desc = _extract_search_task_signature(inp.task)
         cost = _extract_measure_cost(res, cost_target=cost_target)
 
+    fallback_task_index = _task_index_from_filename(path)
     return JsonSampleRecord(
         sample_id=_build_sample_id(
             path,
             workload_key,
             target_kind,
             0,
-            task_index=None,
+            task_index=fallback_task_index,
             record_index=record_index,
         ),
         json_path=str(path),
@@ -510,7 +533,7 @@ def _load_measure_record_sample(
         target_kind=target_kind,
         target_model=target_model,
         task_desc=task_desc,
-        task_index=None,
+        task_index=fallback_task_index,
         record_index=record_index,
         param_signature=param_signature,
         shapes=_parse_shapes_from_workload_key(workload_key),

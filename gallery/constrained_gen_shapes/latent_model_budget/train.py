@@ -424,9 +424,13 @@ def train_main(config) -> Dict[str, float]:
     walk_sample_buffer = WalkSampleBuffer()
     # Running maxima per task across all walks (periodic + final). Power the
     # ``walk_best_cost`` / ``walk_best_epoch`` / ``walk_alpha_at_best`` panels.
-    walk_running_best: Dict[str, float] = {}
-    walk_running_best_epoch: Dict[str, int] = {}
-    walk_running_best_alpha: Dict[str, float] = {}
+    # Nested by walk_key_prefix ("" for cost_vec walk, "cost_head_" for
+    # cost_head-gradient walk, "w_ridge_" for weighted-ridge walk) so each
+    # walk tracks its own best independently — without this separation, the
+    # second walk overwrote the first walk's running max in shared dicts.
+    walk_running_best: Dict[str, Dict[str, float]] = {}
+    walk_running_best_epoch: Dict[str, Dict[str, int]] = {}
+    walk_running_best_alpha: Dict[str, Dict[str, float]] = {}
     timestamp = time.strftime("%m%d%H%M")
     latent_walk_every_n = int(getattr(config.latent_walk, "every_n_epochs", 0) or 0)
     latent_walk_top_k = int(getattr(config.latent_walk, "top_k", 1) or 1)
@@ -575,16 +579,10 @@ def train_main(config) -> Dict[str, float]:
             task_min_cost=_lookup_task_min_cost,
         )
 
-        # train_metrics carries dropout-on accuracy collected during the train
-        # forward (kept for diagnostics under the ``train_loop_*`` keys); the
-        # canonical ``token_accuracy`` / ``full_sequence_exact_match`` are
-        # overwritten below with an eval-mode (dropout-off) decoder-only pass
-        # that reuses ``encoded_train["z"]`` — no extra encoder forward.
+        # ``token_accuracy`` / ``full_sequence_exact_match`` are overwritten
+        # below with an eval-mode (dropout-off) decoder-only pass that reuses
+        # ``encoded_train["z"]`` — no extra encoder forward.
         summary = dict(train_metrics)
-        summary["train_loop_token_accuracy"] = float(summary.get("token_accuracy", 0.0))
-        summary["train_loop_full_sequence_exact_match"] = float(
-            summary.get("full_sequence_exact_match", 0.0)
-        )
 
         encoded_train = encode_dataset(
             model,
@@ -844,17 +842,19 @@ def train_main(config) -> Dict[str, float]:
                                 partial,
                                 [(tkey, sub_summary)],
                                 epoch=int(epoch),
-                                running_best=walk_running_best,
-                                running_best_epoch=walk_running_best_epoch,
-                                running_best_alpha=walk_running_best_alpha,
+                                running_best=walk_running_best.setdefault(walk_prefix, {}),
+                                running_best_epoch=walk_running_best_epoch.setdefault(walk_prefix, {}),
+                                running_best_alpha=walk_running_best_alpha.setdefault(walk_prefix, {}),
                                 reference_label=_ref_label,
+                                walk_key_prefix=walk_prefix,
                             )
                             if partial:
                                 wandb.log(
                                     _remap_for_wandb(partial), step=int(epoch)
                                 )
                 merged = _merge_walk_summaries(
-                    [s for _, s in per_task_summaries_keyed]
+                    [s for _, s in per_task_summaries_keyed],
+                    walk_key_prefix=walk_prefix,
                 )
                 if merged:
                     walk_summary.update(merged)
@@ -862,10 +862,11 @@ def train_main(config) -> Dict[str, float]:
                     walk_summary,
                     per_task_summaries_keyed,
                     epoch=int(epoch),
-                    running_best=walk_running_best,
-                    running_best_epoch=walk_running_best_epoch,
-                    running_best_alpha=walk_running_best_alpha,
+                    running_best=walk_running_best.setdefault(walk_prefix, {}),
+                    running_best_epoch=walk_running_best_epoch.setdefault(walk_prefix, {}),
+                    running_best_alpha=walk_running_best_alpha.setdefault(walk_prefix, {}),
                     reference_label=_ref_label,
+                    walk_key_prefix=walk_prefix,
                 )
             if walk_summary:
                 summary.update(walk_summary)

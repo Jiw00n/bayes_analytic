@@ -283,9 +283,14 @@ def greedy_decode_batch(
                 device=device,
             )
         decoder_input_ids[sample_idx, prefix_len] = tokenizer.param_start_id
-        # BOS position var = first param var (= ordered_var_ids[prefix_len]).
-        if len(ordered_var_ids[sample_idx]) > prefix_len:
-            decoder_var_ids[sample_idx, prefix_len] = int(ordered_var_ids[sample_idx][prefix_len])
+        # Training convention: decoder_var_ids[k] = var of the token PREDICTED at
+        # position k (not the var of the input token). encoder_var_ids layout is
+        # [prefix | PARAM_START_VAR | param_vars], so the var predicted at decoder
+        # position k corresponds to encoder_var_ids[k + 1] for k >= prefix_len.
+        if len(ordered_var_ids[sample_idx]) > prefix_len + 1:
+            decoder_var_ids[sample_idx, prefix_len] = int(
+                ordered_var_ids[sample_idx][prefix_len + 1]
+            )
         current_lengths[sample_idx] = prefix_len + 1
 
     decoded_values: List[List[int]] = [[] for _ in samples]
@@ -308,8 +313,8 @@ def greedy_decode_batch(
 
                 pos = int(current_lengths[sample_idx].item())
                 decoder_input_ids[sample_idx, pos] = pred_token_id
-                if pos < len(ordered_var_ids[sample_idx]):
-                    decoder_var_ids[sample_idx, pos] = ordered_var_ids[sample_idx][pos]
+                if pos + 1 < len(ordered_var_ids[sample_idx]):
+                    decoder_var_ids[sample_idx, pos] = ordered_var_ids[sample_idx][pos + 1]
                 current_lengths[sample_idx] = pos + 1
                 continue
 
@@ -367,8 +372,8 @@ def greedy_decode_batch(
 
             pos = int(current_lengths[sample_idx].item())
             decoder_input_ids[sample_idx, pos] = pred_token_id
-            if pos < len(ordered_var_ids[sample_idx]):
-                decoder_var_ids[sample_idx, pos] = ordered_var_ids[sample_idx][pos]
+            if pos + 1 < len(ordered_var_ids[sample_idx]):
+                decoder_var_ids[sample_idx, pos] = ordered_var_ids[sample_idx][pos + 1]
             current_lengths[sample_idx] = pos + 1
 
     results: List[DecodeResult] = []

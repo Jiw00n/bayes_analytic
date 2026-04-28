@@ -254,7 +254,11 @@ def _summarize_walk_records(
     return summary
 
 
-def _merge_walk_summaries(summaries: list[Dict[str, float]]) -> Dict[str, float]:
+def _merge_walk_summaries(
+    summaries: list[Dict[str, float]],
+    *,
+    walk_key_prefix: str = "",
+) -> Dict[str, float]:
     """Aggregate per-task walk summaries into the keys the wandb ``walk/``
     section displays:
 
@@ -265,10 +269,19 @@ def _merge_walk_summaries(summaries: list[Dict[str, float]]) -> Dict[str, float]
 
     Per-task breakdowns (best/alpha/num_unique_sym_map/etc.) are emitted
     separately by ``_augment_summary_with_per_task``.
+
+    When ``walk_key_prefix`` is non-empty (e.g. ``"cost_head_"``), the
+    per-task summaries are read with that prefix on the ``walk/`` keys (since
+    :func:`_run_periodic_latent_walk` rewrites ``walk/X`` to
+    ``{walk_key_prefix}walk/X`` for prefixed walks) and only the prefixed
+    aggregate ``walk/{walk_key_prefix}mean_measured_best_cost`` is emitted.
     """
     merged: Dict[str, float] = {}
     if not summaries:
         return merged
+
+    bm_key = f"{walk_key_prefix}walk/best_measured_mean_cost"
+    steps_key = f"{walk_key_prefix}walk/num_steps"
 
     num_records = 0
     total_steps = 0.0
@@ -277,10 +290,21 @@ def _merge_walk_summaries(summaries: list[Dict[str, float]]) -> Dict[str, float]
         if not summary:
             continue
         num_records += 1
-        total_steps += float(summary.get("walk/num_steps", 0.0))
-        bm = summary.get("walk/best_measured_mean_cost")
+        total_steps += float(summary.get(steps_key, 0.0))
+        bm = summary.get(bm_key)
         if bm is not None:
             best_measured_per_task.append(float(bm))
+
+    if walk_key_prefix:
+        # Minimal aggregate for prefixed walks: only the per-task mean (this
+        # is what the user is comparing across walks). The unprefixed walk
+        # already emits walk/num_records / walk/num_steps so we don't
+        # duplicate them with a prefix.
+        if best_measured_per_task:
+            merged[f"walk/{walk_key_prefix}mean_measured_best_cost"] = (
+                sum(best_measured_per_task) / len(best_measured_per_task)
+            )
+        return merged
 
     merged["walk/num_records"] = float(num_records)
     merged["walk/num_steps"] = total_steps
@@ -301,6 +325,7 @@ def _augment_summary_with_per_task(
     running_best_alpha: Dict[str, float],
     key_prefix: str = "",
     reference_label: Optional[str] = None,
+    walk_key_prefix: str = "",
 ) -> None:
     """Emit per-task wandb panels and update the all-time-best trackers.
 
@@ -314,43 +339,61 @@ def _augment_summary_with_per_task(
     - ``walk_alpha_at_best/{task}`` — alpha at the all-time best
 
     ``running_best*`` dicts are mutated in place so the running max persists
-    across walks.
+    across walks. Callers should pass a *separate* dict triple per
+    ``walk_key_prefix`` so that cost_head walk's running best does not
+    pollute cost_vec walk's tracking and vice versa.
+
+    When ``walk_key_prefix`` is non-empty (e.g. ``"cost_head_"``), the
+    per-task summaries are read with that prefix on the ``walk/`` keys and
+    only the prefixed ``{walk_key_prefix}walk_measured_{reference_label}/{task}``
+    and ``{walk_key_prefix}walk_alpha_at_best/{task}`` panels are emitted —
+    the other panels (walk_measured / walk_best_cost / walk_best_epoch /
+    walk_num_unique_sym_map) are intentionally skipped to keep the wandb
+    dashboard focused on the two metrics the user wanted for prefixed walks.
     """
+    bm_key = f"{walk_key_prefix}walk/best_measured_mean_cost"
+    nu_key = f"{walk_key_prefix}walk/num_unique_sym_map"
+    sp_key = f"{walk_key_prefix}walk/speedup_vs_reference"
+    alpha_key = f"{walk_key_prefix}walk/alpha_at_best"
+    is_prefixed = bool(walk_key_prefix)
+
     for tkey, s in per_task_summaries_keyed:
         if not s:
             continue
-        bm = s.get("walk/best_measured_mean_cost")
-        if bm is not None:
+        bm = s.get(bm_key)
+        if not is_prefixed and bm is not None:
             summary_out[f"{key_prefix}walk_measured/{tkey}"] = float(bm)
-        nu = s.get("walk/num_unique_sym_map")
-        if nu is not None:
-            summary_out[f"{key_prefix}walk_num_unique_sym_map/{tkey}"] = float(nu)
+        if not is_prefixed:
+            nu = s.get(nu_key)
+            if nu is not None:
+                summary_out[f"{key_prefix}walk_num_unique_sym_map/{tkey}"] = float(nu)
         if reference_label:
-            sp = s.get("walk/speedup_vs_reference")
+            sp = s.get(sp_key)
             if sp is not None:
                 summary_out[
-                    f"{key_prefix}walk_measured_{reference_label}/{tkey}"
+                    f"{key_prefix}{walk_key_prefix}walk_measured_{reference_label}/{tkey}"
                 ] = float(sp)
         if bm is not None:
             prev = running_best.get(tkey)
             if prev is None or float(bm) > prev:
                 running_best[tkey] = float(bm)
                 running_best_epoch[tkey] = int(epoch)
-                aab = s.get("walk/alpha_at_best")
+                aab = s.get(alpha_key)
                 if aab is not None:
                     running_best_alpha[tkey] = float(aab)
                 elif tkey in running_best_alpha:
                     # Drop stale alpha when the new best lacks one.
                     running_best_alpha.pop(tkey, None)
         if tkey in running_best:
-            summary_out[f"{key_prefix}walk_best_cost/{tkey}"] = running_best[tkey]
-            summary_out[f"{key_prefix}walk_best_epoch/{tkey}"] = float(
-                running_best_epoch[tkey]
-            )
-            if tkey in running_best_alpha:
-                summary_out[f"{key_prefix}walk_alpha_at_best/{tkey}"] = (
-                    running_best_alpha[tkey]
+            if not is_prefixed:
+                summary_out[f"{key_prefix}walk_best_cost/{tkey}"] = running_best[tkey]
+                summary_out[f"{key_prefix}walk_best_epoch/{tkey}"] = float(
+                    running_best_epoch[tkey]
                 )
+            if tkey in running_best_alpha:
+                summary_out[
+                    f"{key_prefix}{walk_key_prefix}walk_alpha_at_best/{tkey}"
+                ] = running_best_alpha[tkey]
 
 
 def _ingest_walk_records_into_buffer(
@@ -495,6 +538,9 @@ def _run_periodic_latent_walk(
     base_output_dir = Path(walk_output_dir)
     try:
         for rank, ref_record in enumerate(ref_records):
+            # ``ref_record`` is the *training-data* record that anchors this
+            # walk; the sibling-hardware (e.g. a6000) best is used downstream
+            # only as a comparison value in ``walk/speedup_vs_reference``.
             reference_params = {
                 str(k): int(v) for k, v in (ref_record.params or {}).items()
             }
@@ -529,7 +575,8 @@ def _run_periodic_latent_walk(
                 print(f"[train] latent walk rank={rank} failed: {type(err).__name__}: {err}")
                 walk_records = []
             ref_best_secs = _get_reference_best_seconds(
-                reference_best_dir, getattr(ref_record, "workload_key", None)
+                reference_best_dir,
+                getattr(ref_record, "workload_key", None),
             )
             per_rank_summaries.append(
                 _summarize_walk_records(

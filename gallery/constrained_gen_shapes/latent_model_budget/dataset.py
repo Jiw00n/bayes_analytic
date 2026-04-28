@@ -465,10 +465,17 @@ def _short_hash(payload) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
+_RECORDS_CACHE_SCHEMA_VERSION = "2"  # bump when JsonSampleRecord schema/parsing changes
+
+
 def _records_cache_fingerprint(json_paths: Sequence[Path]) -> str:
-    """Hash over (path, size, mtime_ns). Renaming or rewriting any source
-    JSON yields a fresh fingerprint and invalidates the cache."""
-    payload: List[tuple] = []
+    """Hash over (path, size, mtime_ns) plus a parsing-schema version token.
+
+    Renaming or rewriting any source JSON yields a fresh fingerprint. Bump
+    ``_RECORDS_CACHE_SCHEMA_VERSION`` whenever record-construction logic
+    changes (e.g. new task_index fallback) so existing caches invalidate.
+    """
+    payload: List[tuple] = [("__schema__", _RECORDS_CACHE_SCHEMA_VERSION)]
     for p in sorted(json_paths, key=str):
         try:
             st = Path(p).stat()
@@ -1997,7 +2004,7 @@ def build_dataset_bundle(config, registry: GeneratorRegistry) -> DatasetBundle:
                         extent_var_ids=extent_var_ids,
                     )
                 )
-                if idx % 1000 == 0 or idx == total:
+                if idx % 4000 == 0 or idx == total:
                     print(f"[dataset] prepared samples {idx}/{total}")
             return items
 

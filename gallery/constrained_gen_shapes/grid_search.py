@@ -29,12 +29,12 @@ SEARCH_SPACE = {
 
 
     
-    "generator.hw_param": [{}, {"max_vthread_extent": 15}],
+    "generator.hw_param": [{"max_vthread_extent": 15}],
     # "generator.hw_param": [{"max_vthread_extent": 15}],
     # "data.seed": [42,0,1],
     # "model.seed": [0],
 
-    "train.beta_end": [0.005, 0.01],
+    "train.beta_end": [0.005],
     "train.beta_warmup_epochs": [5],
     "train.order_nce": [True],
     "train.nce_mu": [False],
@@ -50,21 +50,21 @@ SEARCH_SPACE = {
     # "model.latent_token_count": [4],
 
     "latent_walk.every_n_epochs": [2],
-    "latent_walk.use_cost_head": [False],
+    "latent_walk.use_cost_head": [True],
 
     "train.num_epochs": [20],
     "train.learning_rate": [3e-4],
-    "train.weight_decay": [1e-3, 5e-3],
+    # "train.weight_decay": [1e-3, 5e-3],
     "train.lambda_nce": [0.2],
     "train.tau_nce": [0.2],
     "latent_walk.top_k": [1],
 
-    # "train.cobo_sample_weighting": [True],
-    # "train.cobo_apply_to": [["cost", "nce"]],
-    # "train.weight_quantile": [0.85],         # cobo, weighted_cost_Vec
-    # "train.weight_sigma": [0.5],        # cobo, weighted_cost_Vec
+    "train.cobo_sample_weighting": [True],
+    "train.cobo_apply_to": [["cost"], ["cost", "nce"]],
+    "train.weight_quantile": [0.95, 0.85],         # cobo, weighted_cost_Vec
+    "train.weight_sigma": [0.25],        # cobo, weighted_cost_Vec
 
-    "train.lambda_cost": [0.001],
+    "train.lambda_cost": [0.01],
     "train.tasks_per_batch": [8, 16],
 
     "sampling.strategy": ["sampling"],

@@ -1073,67 +1073,99 @@ predict_cost_head_from_reencode = predict_reencode_score
 
 
 # -----------------------------------------------------------------------------
-# Reference-best directory (for printing best-known cost per task)
+# Reference-best directory (for printing best-known cost per task and for
+# anchoring the latent walk on the sibling-hardware best record)
 # -----------------------------------------------------------------------------
 
-_REFERENCE_BEST_CACHE: Dict[str, Dict[str, float]] = {}
+_REFERENCE_BEST_RECORDS_CACHE: Dict[str, Dict[str, JsonSampleRecord]] = {}
 
 
-def _scan_reference_best_dir(reference_dir: str | Path) -> Dict[str, float]:
-    """Scan a directory of measure-record JSONs and return
-    ``workload_key → best (lowest) measured mean cost in seconds``.
+# Reference scan loads raw measure-record JSONs purely to extract per-task
+# best raw seconds for comparison printing ("a6000 measured best: …s") and
+# the ``walk/speedup_vs_reference`` summary key. Forcing ``"neg_log"`` here
+# means ``cost_label_to_raw`` can recover seconds without per-task
+# ``task_min_cost`` (which ``norm_throughput`` / ``log_norm_throughput``
+# would silently require). The training-time ``cost_target`` is irrelevant
+# at this layer — we just need raw seconds back from the JSON.
+_REFERENCE_SCAN_COST_TARGET = "neg_log"
 
-    Used during latent walk to print a "best known" reference for the task —
-    typically pointing to a sibling directory measured on different hardware
-    (e.g. ``a6000``) than the training data (``t4``). One scan per process per
-    distinct directory thanks to ``_REFERENCE_BEST_CACHE``.
+
+def _scan_reference_best_records(
+    reference_dir: str | Path,
+) -> Dict[str, JsonSampleRecord]:
+    """Scan a directory of measure-record JSONs and return ``workload_key →
+    JsonSampleRecord with the lowest measured mean (raw seconds) cost``.
+
+    The reference dir typically points to a sibling-hardware measurement
+    (e.g. ``a6000``) than the training data (``t4``); the resulting record
+    is used only for comparison printing and the ``walk/speedup_vs_reference``
+    summary. One scan per ``reference_dir`` per process thanks to
+    ``_REFERENCE_BEST_RECORDS_CACHE``.
     """
-    out: Dict[str, float] = {}
+    out: Dict[str, JsonSampleRecord] = {}
+    out_seconds: Dict[str, float] = {}
     p = Path(reference_dir)
     if not p.is_dir():
         return out
-    no_error = int(auto_scheduler.measure.MeasureErrorNo.NO_ERROR)
     for json_file in sorted(p.glob("*.json")):
         try:
-            inputs, results = auto_scheduler.RecordReader(str(json_file)).read_lines()
-            inputs = list(inputs)
-            results = list(results)
+            samples = load_json_samples(
+                json_file, cost_target=_REFERENCE_SCAN_COST_TARGET
+            )
         except Exception:  # pylint: disable=broad-except
             continue
-        if not inputs or len(inputs) != len(results):
-            continue
-        wkey = inputs[0].task.workload_key
-        best = float("inf")
-        for r in results:
-            if int(r.error_no) != no_error:
+        for sample in samples:
+            wkey = sample.workload_key
+            if wkey is None or sample.cost is None:
                 continue
-            costs = [float(c) for c in r.costs]
-            if not costs:
+            try:
+                cost_val = float(sample.cost)
+            except (TypeError, ValueError):
                 continue
-            mean_s = float(sum(costs) / len(costs))
-            if mean_s < best:
-                best = mean_s
-        if math.isfinite(best):
-            prev = out.get(wkey)
-            if prev is None or best < prev:
-                out[wkey] = best
+            if not math.isfinite(cost_val):
+                continue
+            seconds = cost_label_to_raw(cost_val, _REFERENCE_SCAN_COST_TARGET)
+            if seconds is None or not math.isfinite(seconds) or seconds <= 0.0:
+                continue
+            prev = out_seconds.get(wkey)
+            if prev is None or seconds < prev:
+                out_seconds[wkey] = seconds
+                out[wkey] = sample
     return out
 
 
-def _get_reference_best_seconds(
-    reference_dir: Optional[str], workload_key: Optional[str]
-) -> Optional[float]:
-    """Cached lookup of the best raw-seconds cost for ``workload_key`` in
-    ``reference_dir``. Returns ``None`` when the dir is unset / empty / has
-    no record matching the workload."""
+def _get_reference_best_record(
+    reference_dir: Optional[str],
+    workload_key: Optional[str],
+) -> Optional[JsonSampleRecord]:
+    """Cached lookup of the best (lowest raw-seconds) measure record for
+    ``workload_key`` under ``reference_dir``. Returns ``None`` when the dir
+    is unset / empty / has no record matching the workload."""
     if not reference_dir or not workload_key:
         return None
     cache_key = str(Path(reference_dir).resolve())
-    cached = _REFERENCE_BEST_CACHE.get(cache_key)
+    cached = _REFERENCE_BEST_RECORDS_CACHE.get(cache_key)
     if cached is None:
-        cached = _scan_reference_best_dir(reference_dir)
-        _REFERENCE_BEST_CACHE[cache_key] = cached
+        cached = _scan_reference_best_records(reference_dir)
+        _REFERENCE_BEST_RECORDS_CACHE[cache_key] = cached
     return cached.get(workload_key)
+
+
+def _get_reference_best_seconds(
+    reference_dir: Optional[str],
+    workload_key: Optional[str],
+) -> Optional[float]:
+    """Cached lookup of the best raw-seconds cost for ``workload_key`` in
+    ``reference_dir``. Derived from :func:`_get_reference_best_record` so the
+    "best known" seconds and the comparison printout stay consistent.
+    """
+    record = _get_reference_best_record(reference_dir, workload_key)
+    if record is None or record.cost is None:
+        return None
+    seconds = cost_label_to_raw(float(record.cost), _REFERENCE_SCAN_COST_TARGET)
+    if seconds is None or not math.isfinite(seconds):
+        return None
+    return float(seconds)
 
 
 @torch.no_grad()
@@ -1656,6 +1688,10 @@ def run_latent_walk(
         record = preselected_record
     else:
         record = _select_record_from_path(record_json_path, best_cost=best_cost)
+    # Reference (e.g. a6000) seconds is a *comparison value only* — used to
+    # print "{ref_label} measured best: ..." and to set
+    # ``walk/speedup_vs_reference`` in the per-walk summary. The walk itself
+    # still anchors z0/params on ``record`` (the training-data record).
     reference_best_seconds = _get_reference_best_seconds(
         reference_best_dir, getattr(record, "workload_key", None)
     )
